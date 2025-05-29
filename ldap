@@ -8,22 +8,12 @@ groupUIDNameMapping:
   "CN=ROLE_ocp4_prod,ou=users,dc=acme,dc=com": ocp4-prod-users
   "CN=ROLE_ocp4_prodadmin,ou=users,dc=acme,dc=com": ocp4-prod-admins
 activeDirectory:
-  groupsQuery:
-    baseDN: "ou=users,dc=acme,dc=com"
-    scope: sub
-    derefAliases: never
-    pageSize: 0
-    filter: "(objectClass=group)"
-    groupUIDAttribute: dn
-    groupNameAttributes: [ cn ]
+  activeDirectory:
   usersQuery:
     baseDN: "ou=users,dc=acme,dc=com"
     scope: sub
     derefAliases: never
     pageSize: 0
     filter: "(objectClass=person)"
-    userUIDAttribute: dn
     userNameAttributes: [ sAMAccountName ]
     groupMembershipAttributes: [ memberOf ]
-  tolerateMemberNotFoundErrors: true
-  tolerateMemberOutOfScopeErrors: true
