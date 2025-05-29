@@ -20,4 +20,4 @@ augmentedActiveDirectory:
     filter: (objectclass=person)
     pageSize: 0
     userNameAttributes: [ sAMAccountName ]
-    groupMembershipAttributes: [ "memberOf:1.2.840.113556.1.4.1941:" ]
+    groupMembershipAttributes: [ "memberOf" ]
