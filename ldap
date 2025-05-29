@@ -1,0 +1,23 @@
+kind: LDAPSyncConfig
+apiVersion: v1
+url: ldaps://ldaps.example.com
+bindDN: "cn=admin,dc=acme,dc=com"
+bindPassword: "your_bind_password"
+insecure: false
+groupUIDNameMapping:
+  "CN=ROLE_ocp4_prod,ou=users,dc=acme,dc=com": ocp4-prod-users
+  "CN=ROLE_ocp4_prodadmin,ou=users,dc=acme,dc=com": ocp4-prod-admins
+augmentedActiveDirectory:
+  groupsQuery:
+    derefAliases: never
+    pageSize: 0
+    groupUIDAttribute: dn
+    groupNameAttributes: [ cn ]
+  usersQuery:
+    baseDN: "ou=users,dc=acme,dc=com"
+    scope: sub
+    derefAliases: never
+    filter: (objectclass=person)
+    pageSize: 0
+    userNameAttributes: [ sAMAccountName ]
+    groupMembershipAttributes: [ "memberOf:1.2.840.113556.1.4.1941:" ]
