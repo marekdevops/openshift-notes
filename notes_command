@@ -2,3 +2,6 @@ oc get clusterrolebindings -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{
 
 
 oc get rolebindings --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.roleRef.name}{"\t"}{.subjects[*].name}{"\n"}{end}' | grep $(oc whoami)
+# Jeśli klucz nazywa się 'bindPassword'
+oc get secret <nazwa-sekretu> -n openshift-config \
+  -o go-template --template="{{.data.bindPassword|base64decode}}"
