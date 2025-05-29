@@ -1,0 +1,4 @@
+oc get clusterrolebindings -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.roleRef.name}{"\t"}{.subjects[*].name}{"\n"}{end}' | grep $(oc whoami)
+
+
+oc get rolebindings --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.roleRef.name}{"\t"}{.subjects[*].name}{"\n"}{end}' | grep $(oc whoami)
