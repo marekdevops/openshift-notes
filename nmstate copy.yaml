@@ -1,18 +1,22 @@
 apiVersion: nmstate.io/v1
 kind: NodeNetworkConfigurationPolicy
 metadata:
-  name: bridge-vlan211-worker1
+  name: attach-bond0-211-to-br-ex
 spec:
   nodeSelector:
-    kubernetes.io/hostname: worker1
+    kubernetes.io/hostname: worker1  # lub inny selektor dla wybranych nodów
   desiredState:
     interfaces:
-      - name: br-vlan211
-        type: linux-bridge
+      - name: bond0.211
+        type: vlan
+        state: up
+        vlan:
+          base-iface: bond0
+          id: 211
+      - name: br-ex
+        type: ovs-bridge
         state: up
         bridge:
-          options:
-            stp:
-              enabled: false
+          options: {}
           port:
             - name: bond0.211
