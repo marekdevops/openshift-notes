@@ -1,0 +1,24 @@
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: vlan10-bridge
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: <nazwa-noda>
+  desiredState:
+    interfaces:
+      - name: br-vlan10
+        type: linux-bridge
+        state: up
+        bridge:
+          options:
+            stp:
+              enabled: false
+          port:
+            - name: <nazwa-fizycznego-interfejsu>  # np. ens192
+      - name: vlan10
+        type: vlan
+        state: up
+        vlan:
+          base-iface: br-vlan10
+          id: 10
