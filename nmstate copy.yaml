@@ -1,12 +1,10 @@
 apiVersion: nmstate.io/v1
 kind: NodeNetworkConfigurationPolicy
 metadata:
-  name: bridge-vlan211
+  name: bridge-vlan211-worker1
 spec:
   nodeSelector:
-    kubernetes.io/hostname:
-      - worker1
-      - worker2
+    kubernetes.io/hostname: worker1
   desiredState:
     interfaces:
       - name: br-vlan211
