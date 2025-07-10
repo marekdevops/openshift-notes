@@ -1,0 +1,20 @@
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: bridge-vlan211
+spec:
+  nodeSelector:
+    kubernetes.io/hostname:
+      - worker1
+      - worker2
+  desiredState:
+    interfaces:
+      - name: br-vlan211
+        type: linux-bridge
+        state: up
+        bridge:
+          options:
+            stp:
+              enabled: false
+          port:
+            - name: bond0.211
