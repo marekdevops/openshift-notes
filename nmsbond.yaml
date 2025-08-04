@@ -1,0 +1,23 @@
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: vlan246-bridge-worker1
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: worker1.your.domain  # <-- ważne!
+  desiredState:
+    interfaces:
+      - name: bond0.246
+        type: vlan
+        vlan:
+          base-iface: bond0
+          id: 246
+        state: up
+      - name: br-vlan246
+        type: linux-bridge
+        state: up
+        bridge:
+          options:
+            stp: false
+          port:
+            - name: bond0.246
