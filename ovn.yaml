@@ -1,0 +1,13 @@
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: br-vlan246-ovn
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: worker1
+  desiredState:
+    ovn:
+      bridgeMappings:
+        - localnet: br-vlan246
+          bridge: br-ex
+          state: present
