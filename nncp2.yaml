@@ -1,0 +1,31 @@
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: vlan369-bridge
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/worker: ""
+  maxUnavailable: "1"
+  desiredState:
+    interfaces:
+    - name: bond0.369
+      description: VLAN 369 on bond0
+      type: vlan
+      state: up
+      vlan:
+        base-iface: bond0
+        id: 369
+    - name: br-vlan369
+      description: Linux bridge for VLAN 369
+      type: linux-bridge
+      state: up
+      bridge:
+        options:
+          stp:
+            enabled: false
+        port:
+        - name: bond0.369
+      ipv4:
+        enabled: false
+      ipv6:
+        enabled: false
