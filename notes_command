@@ -41,7 +41,7 @@ oc get pods -n NAZWA_NAMESPACE -o json \
     | add
     '
 
-
+###########MB
 NS=NAZWA_NAMESPACE
 cpu_sum=$(oc get pods -n $NS -o json \
   | jq '[.items[].spec.containers[].resources.limits.cpu // "0"]
@@ -57,3 +57,24 @@ mem_sum=$(oc get pods -n $NS -o json \
     | add')
 
 echo "CPU: ${cpu_sum}m  Memory: ${mem_sum}Mi"
+#GB
+NS=NAZWA_NAMESPACE
+
+cpu_sum=$(oc get pods -n $NS -o json \
+  | jq '[.items[].spec.containers[].resources.limits.cpu // "0"]
+    | map(if test("m$") then (. | sub("m$"; "") | tonumber)
+          else (. | tonumber * 1000) end)
+    | add')
+
+mem_sum_mib=$(oc get pods -n $NS -o json \
+  | jq '[.items[].spec.containers[].resources.limits.memory // "0"]
+    | map(if test("Mi$") then (. | sub("Mi$"; "") | tonumber)
+          elif test("Gi$") then (. | sub("Gi$"; "") | tonumber * 1024)
+          else 0 end)
+    | add')
+
+# Konwersja: CPU w cores, Memory w GiB
+cpu_cores=$(awk "BEGIN {print $cpu_sum/1000}")
+mem_gib=$(awk "BEGIN {print $mem_sum_mib/1024}")
+
+echo "CPU: ${cpu_cores} cores  Memory: ${mem_gib} GiB"
