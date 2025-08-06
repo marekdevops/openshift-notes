@@ -1,0 +1,15 @@
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: worker-kube-reserve
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      machineconfiguration.openshift.io/role: worker
+  kubeletConfig:
+    systemReserved:
+      cpu: "2"
+      memory: "16Gi"
+    kubeReserved:
+      cpu: "2"
+      memory: "16Gi"
