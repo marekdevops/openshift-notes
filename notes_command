@@ -40,6 +40,10 @@ oc get pods -n NAZWA_NAMESPACE -o json \
       )
     | add
     '
+################Alockacja
+oc get node -o custom-columns=NAME:.metadata.name,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory
+oc adm top node
+
 
 ###########MB
 NS=NAZWA_NAMESPACE
