@@ -11,3 +11,49 @@ oc get secret <nazwa-sekretu> -n openshift-config \
 oc get pods -n NAZWA_NAMESPACE -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .spec.containers[*]}  {.name}{"  CPU limit: "}{.resources.limits.cpu}{"  Mem limit: "}{.resources.limits.memory}{"\n"}{end}{end}'
 
 oc get pods -n NAZWA_NAMESPACE -o custom-columns='POD:.metadata.name,CONTAINER:.spec.containers[*].name,CPU_LIMIT:.spec.containers[*].resources.limits.cpu,MEM_LIMIT:.spec.containers[*].resources.limits.memory'
+
+
+oc get pods -n NAZWA_NAMESPACE -o json \
+  | jq -r '
+    [ .items[].spec.containers[].resources.limits.cpu // "0" ]
+    | map(
+        if test("m$") then
+          (. | sub("m$"; "") | tonumber)
+        else
+          (. | tonumber * 1000)
+        end
+      )
+    | add as $cpuSum
+    | $cpuSum
+    ' && \
+oc get pods -n NAZWA_NAMESPACE -o json \
+  | jq -r '
+    [ .items[].spec.containers[].resources.limits.memory // "0" ]
+    | map(
+        if test("Mi$") then
+          (. | sub("Mi$"; "") | tonumber)
+        elif test("Gi$") then
+          (. | sub("Gi$"; "") | tonumber * 1024)
+        else
+          0
+        end
+      )
+    | add
+    '
+
+
+NS=NAZWA_NAMESPACE
+cpu_sum=$(oc get pods -n $NS -o json \
+  | jq '[.items[].spec.containers[].resources.limits.cpu // "0"]
+    | map(if test("m$") then (. | sub("m$"; "") | tonumber)
+          else (. | tonumber * 1000) end)
+    | add')
+
+mem_sum=$(oc get pods -n $NS -o json \
+  | jq '[.items[].spec.containers[].resources.limits.memory // "0"]
+    | map(if test("Mi$") then (. | sub("Mi$"; "") | tonumber)
+          elif test("Gi$") then (. | sub("Gi$"; "") | tonumber * 1024)
+          else 0 end)
+    | add')
+
+echo "CPU: ${cpu_sum}m  Memory: ${mem_sum}Mi"
