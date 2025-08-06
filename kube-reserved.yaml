@@ -13,3 +13,40 @@ spec:
     kubeReserved:
       cpu: "2"
       memory: "16Gi"
+
+oc label node worker-big node-size=big
+
+
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: kube-reserve-big
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      node-size: big
+  kubeletConfig:
+    systemReserved:
+      cpu: "1"
+      memory: "25Gi"
+    kubeReserved:
+      cpu: "0"
+      memory: "25Gi"
+
+oc label node worker-small node-size=small
+
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: kube-reserve-small
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      node-size: small
+  kubeletConfig:
+    systemReserved:
+      cpu: "1"
+      memory: "19Gi"
+    kubeReserved:
+      cpu: "0"
+      memory: "19Gi"
