@@ -5,3 +5,9 @@ oc get rolebindings --all-namespaces -o jsonpath='{range .items[*]}{.metadata.na
 # Jeśli klucz nazywa się 'bindPassword'
 oc get secret <nazwa-sekretu> -n openshift-config \
   -o go-template --template="{{.data.bindPassword|base64decode}}"
+
+
+#############Limity
+oc get pods -n NAZWA_NAMESPACE -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .spec.containers[*]}  {.name}{"  CPU limit: "}{.resources.limits.cpu}{"  Mem limit: "}{.resources.limits.memory}{"\n"}{end}{end}'
+
+oc get pods -n NAZWA_NAMESPACE -o custom-columns='POD:.metadata.name,CONTAINER:.spec.containers[*].name,CPU_LIMIT:.spec.containers[*].resources.limits.cpu,MEM_LIMIT:.spec.containers[*].resources.limits.memory'
