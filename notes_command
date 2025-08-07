@@ -45,6 +45,9 @@ oc get node -o custom-columns=NAME:.metadata.name,CPU:.status.allocatable.cpu,ME
 oc adm top node
 oc get pods -A -o=jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.containers[*]}{.name}{" CPU limit: "}{.resources.limits.cpu}{"\n"}{end}{end}' | grep -i none
 
+#########PVC
+
+oc get pod -A -o=jsonpath='{range .items[*]}{"\n"}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{range .spec.volumes[*]}{.persistentVolumeClaim.claimName}{"\n"}{end}{end}' | grep -v null
 
 ###########MB
 NS=NAZWA_NAMESPACE
