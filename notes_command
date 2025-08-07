@@ -43,6 +43,7 @@ oc get pods -n NAZWA_NAMESPACE -o json \
 ################Alockacja
 oc get node -o custom-columns=NAME:.metadata.name,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory
 oc adm top node
+oc get pods -A -o=jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.containers[*]}{.name}{" CPU limit: "}{.resources.limits.cpu}{"\n"}{end}{end}' | grep -i none
 
 
 ###########MB
