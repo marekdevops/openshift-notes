@@ -1,0 +1,13 @@
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfigPool
+metadata:
+  name: worker-canary
+spec:
+  machineConfigSelector:
+    matchExpressions:
+    - key: machineconfiguration.openshift.io/role
+      operator: In
+      values: ["worker","worker-canary"]
+  nodeSelector:
+    matchLabels:
+      node-role.kubernetes.io/worker-canary: ""
