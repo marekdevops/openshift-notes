@@ -4,3 +4,17 @@ for H in console-openshift-console.$BASE oauth-openshift.$BASE; do
   echo | openssl s_client -connect $H:443 -servername $H 2>/dev/null \
     | openssl x509 -noout -subject -issuer -dates || echo "EOF/błąd handshaku"
 done
+
+
+SVCIP=$(oc -n openshift-ingress get svc/router-default -o jsonpath='{.spec.clusterIP}')
+H=console-openshift-console.apps.example.com
+oc -n openshift-console run -it diag --image=registry.access.redhat.com/ubi9/ubi --restart=Never -- bash -lc "
+  microdnf -y install openssl >/dev/null 2>&1 || true
+  echo | openssl s_client -connect $SVCIP:443 -servername $H 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+"
+# Działa tu, a z zewnątrz NIE → wina HAProxy/ścieżki sieciowej.
+
+
+oc -n openshift-ingress get pods -o wide
+ROUTER=$(oc -n openshift-ingress get pods -l ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default -o jsonpath='{.items[0].metadata.name}')
+oc -n openshift-ingress logs $ROUTER -c router --tail=200 | egrep -i "proxy|handshake|ssl|error|sni" || true
