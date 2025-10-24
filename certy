@@ -1,0 +1,6 @@
+BASE=apps.example.com
+for H in console-openshift-console.$BASE oauth-openshift.$BASE; do
+  echo "=== $H"
+  echo | openssl s_client -connect $H:443 -servername $H 2>/dev/null \
+    | openssl x509 -noout -subject -issuer -dates || echo "EOF/błąd handshaku"
+done
