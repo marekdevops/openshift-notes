@@ -1,0 +1,86 @@
+# ===============================================================
+# HAProxy config for OpenShift 4.18 (TLS Passthrough Mode)
+## ===============================================================
+
+global
+    log         127.0.0.1 local0
+    maxconn     20000
+    daemon
+    tune.ssl.default-dh-param 2048
+
+defaults
+    log                     global
+    mode                    tcp
+    option                  tcplog
+    option                  dontlognull
+    timeout connect          5s
+    timeout client          30s
+    timeout server          30s
+    retries                 3
+    maxconn              18000
+
+# ===============================================================
+# 1) API SERVER :6443  → masters
+# ===============================================================
+frontend fe_ocp_api
+    bind *:6443
+    default_backend be_ocp_api
+
+backend be_ocp_api
+    balance roundrobin
+    option tcp-check
+    # opcjonalnie: option ssl-hello-chk
+    server master-0 10.0.0.11:6443 check
+    server master-1 10.0.0.12:6443 check
+    server master-2 10.0.0.13:6443 check
+
+# ===============================================================
+# 2) MACHINE CONFIG SERVER :22623  → masters
+# ===============================================================
+frontend fe_ocp_mcs
+    bind *:22623
+    default_backend be_ocp_mcs
+
+backend be_ocp_mcs
+    balance roundrobin
+    option tcp-check
+    server master-0 10.0.0.11:22623 check
+    server master-1 10.0.0.12:22623 check
+    server master-2 10.0.0.13:22623 check
+
+# ===============================================================
+# 3) ADDITIONAL MCS PORT :22624  → masters (opcjonalny)
+# ===============================================================
+frontend fe_ocp_mcs_alt
+    bind *:22624
+    default_backend be_ocp_mcs_alt
+
+backend be_ocp_mcs_alt
+    balance roundrobin
+    option tcp-check
+    server master-0 10.0.0.11:22624 check
+    server master-1 10.0.0.12:22624 check
+    server master-2 10.0.0.13:22624 check
+
+# ===============================================================
+# 4) ROUTER / INGRESS :443  → infra/workers
+# ===============================================================
+frontend fe_ocp_apps
+    bind *:443
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+    default_backend be_ocp_router
+    option tcplog
+
+backend be_ocp_router
+    balance roundrobin
+    option tcp-check
+    # Można też użyć: option ssl-hello-chk
+    # NIE dodawaj "send-proxy" dopóki nie włączysz Proxy Protocol w IngressController
+    server infra-0 10.0.1.21:443 check
+    server infra-1 10.0.1.22:443 check
+    server infra-2 10.0.1.23:443 check
+
+# ===============================================================
+# KONIEC KONFIGURACJI
+# ===============================================================
