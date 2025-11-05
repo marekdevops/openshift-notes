@@ -9,3 +9,12 @@ spec:
   source: redhat-operators
   sourceNamespace: openshift-marketplace
   installPlanApproval: Automatic
+
+
+  oc label node worker-fc-1 hypershift.openshift.io/control-plane=true
+
+  spec:
+  infra:
+    platform: KubeVirt
+    nodeSelector:
+      hypershift.openshift.io/control-plane: "true"
