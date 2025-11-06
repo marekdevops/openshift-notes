@@ -1,0 +1,64 @@
+#rola do serwisu service-account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: read-app-controllers
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
+
+
+oc apply -f clusterrole-read-app-controllers.yaml
+
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-app-controllers-for-version
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: read-app-controllers
+subjects:
+  - kind: ServiceAccount
+    name: version
+    namespace: default
+
+
+
+# Upewnij się, że SA istnieje:
+oc get sa version -n default || oc create sa version -n default
+
+# Przypnij ClusterRole do SA *tylko* w namespace’ach z etykietą type=app:
+for ns in $(oc get ns -l type=app -o jsonpath='{.items[*].metadata.name}'); do
+  oc -n "$ns" apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-app-controllers-for-version
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: read-app-controllers
+subjects:
+  - kind: ServiceAccount
+    name: version
+    namespace: default
+EOF
+done
+
+
+oc create token version -n default
+
+
+# Test w konkretnym projekcie aplikacyjnym:
+oc auth can-i get deployments -n <app-namespace> \
+  --as=system:serviceaccount:default:version
+
+# Albo hurtowo:
+for ns in $(oc get ns -l type=app -o jsonpath='{.items[*].metadata.name}'); do
+  echo -n "$ns: "
+  oc auth can-i list statefulsets -n "$ns" \
+    --as=system:serviceaccount:default:version
+done
