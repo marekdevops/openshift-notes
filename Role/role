@@ -62,3 +62,16 @@ for ns in $(oc get ns -l type=app -o jsonpath='{.items[*].metadata.name}'); do
   oc auth can-i list statefulsets -n "$ns" \
     --as=system:serviceaccount:default:version
 done
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: version-sa-token
+  namespace: default
+  annotations:
+    kubernetes.io/service-account.name: version
+type: kubernetes.io/service-account-token
+
+oc apply -f version-sa-token.yaml
+oc -n default describe secret version-sa-token \
+  | sed -n 's/^token:\s*//p'  # wyciąga sam token
