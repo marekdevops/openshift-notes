@@ -1,0 +1,2 @@
+oc label node <worker-fc-1> hypershift.openshift.io/control-plane=true
+oc label node <worker-fc-2> hypershift.openshift.io/control-plane=true
