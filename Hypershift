@@ -1,2 +1,43 @@
 oc label node <worker-fc-1> hypershift.openshift.io/control-plane=true
-oc label node <worker-fc-2> hypershift.openshift.io/control-plane=true
+
+
+oc -n <NS> patch hostedcluster <NAME> --type=merge -p '{
+  "spec": {
+    "services": [
+      {"service":"APIServer","servicePublishingStrategy":{"type":"Route"}},
+      {"service":"OAuth","servicePublishingStrategy":{"type":"Route"}},
+      {"service":"OIDC","servicePublishingStrategy":{"type":"Route"}}
+    ]
+  }
+}'
+sswe
+
+
+w ramach planowania rozwoju naszej platformy kontenerowej analizujemy dwie możliwe drogi rozbudowy środowiska opartego na Red Hat OpenShift:
+
+Klastry OpenShift uruchamiane w OpenShift Virtualization (czyli instalacja nowego klastra OCP w maszynach wirtualnych tworzonych przez istniejący klaster OpenShift),
+
+Architektura Hosted Control Planes (HCP / HyperShift) – z centralnym klastrem zarządzającym i wieloma klastrami hosted.
+
+Chcielibyśmy doprecyzować kwestie licencjonowania i wsparcia w obu scenariuszach.
+Poniżej przesyłam trzy pytania, które pozwolą nam dobrać właściwy model subskrypcji i architektury:
+
+1. Licencjonowanie OpenShift uruchomionego w OpenShift Virtualization (nested scenario)
+
+W ramach testów planujemy uruchomić nowy klaster OpenShift (OCP #2) jako zestaw maszyn wirtualnych w OpenShift Virtualization działającym na istniejącym klastrze OpenShift (OCP #1).
+Czy Red Hat traktuje taki scenariusz jako środowisko zagnieżdżone (nested virtualization) i czy posiada on status wspierany produkcyjnie, czy raczej jest przeznaczony wyłącznie do środowisk testowych / PoC?
+
+Dodatkowo proszę o potwierdzenie zasad licencjonowania:
+
+czy nowy klaster OCP (uruchomiony w VM) wymaga osobnych subskrypcji OpenShift (core-pair),
+
+oraz czy subskrypcja OpenShift #1 obejmuje system RHEL dla VM uruchamianych w OpenShift Virtualization.
+
+2. Hosted Control Planes (HCP / HyperShift) – zasady subskrypcji i wsparcia
+
+W kontekście wdrożenia HCP chcielibyśmy potwierdzić:
+
+czy poprawne jest założenie, że control plane hostowanych klastrów uruchomiony w klastrze managementowym nie wymaga osobnych subskrypcji,
+a licencjonowaniu podlegają wyłącznie worker nodes klastrów hosted (core-pair / socket-pair),
+
+oraz czy Hosted Control Planes posiadają obecnie pełne wsparcie produkcyjne (GA) dla środowisk self-managed OpenShift 4.x.
