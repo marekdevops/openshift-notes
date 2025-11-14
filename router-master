@@ -10,3 +10,21 @@ spec:
     - key: "node-role.kubernetes.io/master"
       operator: "Exists"
       effect: "NoExecute"
+
+
+oc -n openshift-ingress-operator patch ingresscontroller default --type=merge -p '
+{
+  "spec": {
+    "nodePlacement": {
+      "nodeSelector": {
+        "matchLabels": {
+          "node-role.kubernetes.io/master": ""
+        }
+      },
+      "tolerations": [
+        {"key": "node-role.kubernetes.io/master", "operator": "Exists", "effect": "NoSchedule"},
+        {"key": "node-role.kubernetes.io/master", "operator": "Exists", "effect": "NoExecute"}
+      ]
+    }
+  }
+}'
