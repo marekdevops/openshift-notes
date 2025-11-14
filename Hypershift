@@ -11,3 +11,5 @@ oc -n <NS> patch hostedcluster <NAME> --type=merge -p '{
   }
 }'
 
+
+
