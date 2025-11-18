@@ -1,0 +1,75 @@
+oc label node <infra-node> node-role.kubernetes.io/infra=""
+
+oc label node <infra-node> node-role.kubernetes.io/worker-
+
+
+cat << 'EOF' | oc apply -f -
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfigPool
+metadata:
+  name: infra
+spec:
+  machineConfigSelector:
+    matchExpressions:
+      - key: machineconfiguration.openshift.io/role
+        operator: In
+        values:
+          - worker
+          - infra
+  nodeSelector:
+    matchLabels:
+      node-role.kubernetes.io/infra: ""
+EOF
+
+
+oc adm taint nodes <infra-node-0> node-role.kubernetes.io/infra=:NoSchedule
+oc adm taint nodes <infra-node-1> node-role.kubernetes.io/infra=:NoSchedule
+oc adm taint nodes <infra-node-2> node-role.kubernetes.io/infra=:NoSchedule
+
+
+#przeniesienie 
+oc edit ingresscontroller default -n openshift-ingress-operator
+
+spec:
+  nodePlacement:
+    nodeSelector:
+      matchLabels:
+        node-role.kubernetes.io/infra: ""
+    tolerations:
+      - key: "node-role.kubernetes.io/infra"
+        operator: "Exists"
+        effect: "NoSchedule"
+
+
+
+oc get configmap cluster-monitoring-config -n openshift-monitoring
+cat << 'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    prometheusK8s:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: "node-role.kubernetes.io/infra"
+          operator: "Exists"
+          effect: "NoSchedule"
+    alertmanagerMain:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: "node-role.kubernetes.io/infra"
+          operator: "Exists"
+          effect: "NoSchedule"
+    thanosQuerier:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: "node-role.kubernetes.io/infra"
+          operator: "Exists"
+          effect: "NoSchedule"
+EOF
