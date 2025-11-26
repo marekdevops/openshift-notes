@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: group-manager
+rules:
+  - apiGroups: ["user.openshift.io"]
+    resources: ["groups"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+
+oc apply -f group-manager.yaml
+oc adm policy add-cluster-role-to-group group-manager GRUPA
+oc adm policy add-cluster-role-to-group group-manager GRUPA2
