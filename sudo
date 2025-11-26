@@ -1,0 +1,1 @@
+grep -rE '^[^#].*ALL' /etc/sudoers.d/
