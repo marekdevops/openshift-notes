@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Konfiguracja – jakie grupy chcemy obsługiwać
-GROUPS=("zst" "")
+GROUPS=("zst")
 
 
 # DRY_RUN=true -> tylko loguje co BY zrobił, ale NIC nie zmienia

@@ -11,7 +11,7 @@ rules:
   # PVC
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
 
   # StorageClass
   - apiGroups: ["storage.k8s.io"]
