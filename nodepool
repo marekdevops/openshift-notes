@@ -1,0 +1,13 @@
+apiVersion: hypershift.openshift.io/v1beta1
+kind: NodePool
+metadata:
+  name: my-nodepool
+  namespace: <ns z HCP>
+spec:
+  platform:
+    type: KubeVirt
+    kubevirt:
+      compute:
+        nodePlacement:
+          nodeSelector:
+            portworx.io/storage-node: "true"
