@@ -6,6 +6,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
 
 # Funkcja pomocnicza - konwertuje IP na liczbę
@@ -103,7 +104,8 @@ main() {
     # Tablice do przechowywania wyników
     declare -a free_ips
     declare -a used_ips
-    declare -a dns_ips
+    declare -a dns_active_ips
+    declare -a dns_inactive_ips
     
     local current=0
     local progress_step=$((total / 20))
@@ -126,14 +128,16 @@ main() {
         IFS='|' read -r check_ip ping_status hostname <<< "$result"
         
         if [ "$ping_status" -eq 0 ]; then
+            # Host odpowiada na ping
             if [ -n "$hostname" ]; then
-                dns_ips+=("$check_ip|$hostname")
+                dns_active_ips+=("$check_ip|$hostname")
             else
                 used_ips+=("$check_ip")
             fi
         else
+            # Host NIE odpowiada na ping
             if [ -n "$hostname" ]; then
-                dns_ips+=("$check_ip|$hostname")
+                dns_inactive_ips+=("$check_ip|$hostname")
             else
                 free_ips+=("$check_ip")
             fi
@@ -149,7 +153,7 @@ main() {
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
     echo
     
-    echo -e "${GREEN}✓ Wolne adresy IP (${#free_ips[@]}):${NC}"
+    echo -e "${GREEN}✓ Wolne adresy IP (brak DNS, nie pingują się) [${#free_ips[@]}]:${NC}"
     if [ ${#free_ips[@]} -gt 0 ]; then
         for ip in "${free_ips[@]}"; do
             echo "  • $ip"
@@ -159,7 +163,7 @@ main() {
     fi
     echo
     
-    echo -e "${RED}✗ Zajęte adresy IP bez DNS (${#used_ips[@]}):${NC}"
+    echo -e "${RED}✗ Zajęte adresy IP (bez DNS, pingują się) [${#used_ips[@]}]:${NC}"
     if [ ${#used_ips[@]} -gt 0 ]; then
         for ip in "${used_ips[@]}"; do
             echo "  • $ip"
@@ -169,11 +173,22 @@ main() {
     fi
     echo
     
-    echo -e "${YELLOW}⚠ Adresy z wpisem DNS (${#dns_ips[@]}):${NC}"
-    if [ ${#dns_ips[@]} -gt 0 ]; then
-        for entry in "${dns_ips[@]}"; do
+    echo -e "${YELLOW}⚠ Adresy z DNS - aktywne (pingują się) [${#dns_active_ips[@]}]:${NC}"
+    if [ ${#dns_active_ips[@]} -gt 0 ]; then
+        for entry in "${dns_active_ips[@]}"; do
             IFS='|' read -r ip hostname <<< "$entry"
             echo "  • $ip → $hostname"
+        done
+    else
+        echo "  (brak)"
+    fi
+    echo
+    
+    echo -e "${MAGENTA}⚠ Adresy z DNS - nieaktywne (NIE pingują się) [${#dns_inactive_ips[@]}]:${NC}"
+    if [ ${#dns_inactive_ips[@]} -gt 0 ]; then
+        for entry in "${dns_inactive_ips[@]}"; do
+            IFS='|' read -r ip hostname <<< "$entry"
+            echo "  • $ip → $hostname [OFFLINE]"
         done
     else
         echo "  (brak)"
@@ -183,10 +198,12 @@ main() {
     # Podsumowanie
     echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
     echo -e "${YELLOW}Podsumowanie:${NC}"
-    echo "  Przeskanowano:     $total adresów"
-    echo "  Wolne:            ${#free_ips[@]}"
-    echo "  Zajęte:           $((${#used_ips[@]} + ${#dns_ips[@]}))"
-    echo "  Z wpisem DNS:     ${#dns_ips[@]}"
+    echo "  Przeskanowano:         $total adresów"
+    echo "  Wolne (całkowicie):    ${#free_ips[@]}"
+    echo "  Zajęte bez DNS:        ${#used_ips[@]}"
+    echo "  DNS aktywne:           ${#dns_active_ips[@]}"
+    echo "  DNS nieaktywne:        ${#dns_inactive_ips[@]}"
+    echo "  Razem zajęte/w użyciu: $((${#used_ips[@]} + ${#dns_active_ips[@]} + ${#dns_inactive_ips[@]}))"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
     echo
     echo -e "${YELLOW}Zakończono:${NC} $(date '+%Y-%m-%d %H:%M:%S')"
