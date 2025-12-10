@@ -1,0 +1,27 @@
+# Funkcje logujące do konkretnych klastrów przy użyciu SA tokenów
+
+_ocl_login_test1() {
+  oc login \
+    --server="https://api.test1.example.com:6443" \
+    --token="$(cat ~/.kube/tokens/test1.token)" \
+    --insecure-skip-tls-verify=false
+}
+
+_ocl_login_test2() {
+  oc login \
+    --server="https://api.test2.example.com:6443" \
+    --token="$(cat ~/.kube/tokens/test2.token)" \
+    --insecure-skip-tls-verify=false
+}
+
+_ocl_login_prod() {
+  oc login \
+    --server="https://api.prod.example.com:6443" \
+    --token="$(cat ~/.kube/tokens/prod.token)" \
+    --insecure-skip-tls-verify=false
+}
+
+# Ładne aliasy
+alias clustertest1="_ocl_login_test1"
+alias clustertest2="_ocl_login_test2"
+alias clusterprod="_ocl_login_prod"
