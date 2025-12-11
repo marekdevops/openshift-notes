@@ -1,0 +1,3 @@
+oc -n <namespace> patch vm <nazwa-vm> \
+  --type=merge \
+  -p '{"spec":{"template":{"spec":{"evictionStrategy":"LiveMigrate"}}}}'
