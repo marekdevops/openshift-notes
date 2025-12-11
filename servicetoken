@@ -7,7 +7,3 @@ metadata:
     kubernetes.io/service-account.name: kcli
 type: kubernetes.io/service-account-token
 
-
-oc apply -f kcli-legacy-token.yaml
-oc get secret kcli-legacy-token -n ops -o jsonpath='{.data.token}' | base64 -d
-echo
