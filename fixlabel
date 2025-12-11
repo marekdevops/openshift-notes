@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------
+# EDYTUJ TE LISTY POD SWÓJ KLASTER
+# ---------------------------------------------
+
+# Nazwy masterów (control-plane)
+MASTERS=(
+  master-0
+  master-1
+  master-2
+)
+
+# Nazwy workerów (nody, na których mają działać zwykłe pody)
+WORKERS=(
+  worker-0
+  worker-1
+  worker-2
+)
+
+# Jeśli masz osobne nody infra, ale NA RAZIE chcesz je traktować jak zwykłe workery,
+# możesz je dodać do WORKERS albo dopisać tu osobną listę i pętlę.
+# Na razie skrypt nie robi nic specyficznego z infra.
+
+# ---------------------------------------------
+# KONIEC SEKCJI DO EDYCJI
+# ---------------------------------------------
+
+echo "==> Upewniam się, że jesteś zalogowany do właściwego klastra..."
+oc whoami > /dev/null
+
+echo "==> USTAWIAM MASTER NODES (czyste control-plane, bez worker/infra)..."
+for n in "${MASTERS[@]}"; do
+  echo "----> Master: $n"
+
+  echo "  [labels] ustawiam master/control-plane"
+  oc label node "$n" node-role.kubernetes.io/master="" --overwrite
+  oc label node "$n" node-role.kubernetes.io/control-plane="" --overwrite
+
+  echo "  [labels] usuwam ewentualne worker/infra z mastera"
+  oc label node "$n" node-role.kubernetes.io/worker- || true
+  oc label node "$n" node-role.kubernetes.io/infra- || true
+
+  echo "  [taints] ustawiam klasyczne tainty master/control-plane"
+  oc adm taint nodes "$n" node-role.kubernetes.io/master=:NoSchedule --overwrite
+  oc adm taint nodes "$n" node-role.kubernetes.io/control-plane=:NoSchedule --overwrite
+
+  echo "  [taints] usuwam ewentualny taint infra z mastera"
+  oc adm taint nodes "$n" node-role.kubernetes.io/infra:NoSchedule- || true
+
+  echo "  [sched] uncordon (na wszelki wypadek)"
+  oc uncordon "$n" || true
+
+  echo
+done
+
+echo "==> USTAWIAM WORKER NODES (czyste workery, bez infra/control-plane taintów)..."
+for n in "${WORKERS[@]}"; do
+  echo "----> Worker: $n"
+
+  echo "  [labels] ustawiam rolę worker"
+  oc label node "$n" node-role.kubernetes.io/worker="" --overwrite
+
+  echo "  [labels] usuwam ewentualne infra"
+  oc label node "$n" node-role.kubernetes.io/infra- || true
+
+  echo "  [taints] usuwam tainty infra/master/control-plane (ma być schedulowalny)"
+  oc adm taint nodes "$n" node-role.kubernetes.io/infra:NoSchedule- || true
+  oc adm taint nodes "$n" node-role.kubernetes.io/master:NoSchedule- || true
+  oc adm taint nodes "$n" node-role.kubernetes.io/control-plane:NoSchedule- || true
+
+  echo "  [sched] uncordon (na wszelki wypadek)"
+  oc uncordon "$n" || true
+
+  echo
+done
+
+echo "==> STAN PO OPERACJI:"
+oc get nodes
+echo
+echo "==> Dla pewności sprawdź ręcznie tainty i labele np.:"
+echo "    oc describe node ${MASTERS[0]} | grep -i Taint -A3"
+echo "    oc get node ${MASTERS[0]} --show-labels | tr ',' '\\n' | grep node-role"
+echo
+echo "Gotowe. Teraz pody control-plane powinny móc iść na mastery,"
+echo "a zwykłe pody na workery. Infra możemy dołożyć z powrotem później, już na spokojnie."
