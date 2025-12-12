@@ -1,0 +1,89 @@
+#!/bin/bash
+
+# Ustawienie minimalnych wymagań na pod
+# Przykład: ./znajdz_wezly.sh 0.5 512
+REQUIRED_CPU_CORES=${1}
+REQUIRED_MEM_MIB=${2}
+
+# Sprawdzenie argumentów
+if [ -z "$REQUIRED_CPU_CORES" ] || [ -z "$REQUIRED_MEM_MIB" ]; then
+    echo "🚨 Użycie: $0 <wymagane_CPU_rdzenie> <wymagana_PAMIEC_MiB>"
+    echo "Przykład: $0 0.5 512"
+    exit 1
+fi
+
+echo "--- 📋 Wymagane zasoby: ---"
+echo "CPU: $REQUIRED_CPU_CORES rdzeni"
+echo "PAMIĘĆ: $REQUIRED_MEM_MIB MiB"
+echo "------------------------------"
+
+# Nagłówek tabeli
+echo ""
+printf "%-30s | %-15s | %-15s | %-10s\n" "NAZWA WEZŁA" "DOSTĘPNE CPU" "DOSTĘPNA PAMIĘĆ" "STATUS"
+printf "%-30s | %-15s | %-15s | %-10s\n" "------------------------------" "---------------" "---------------" "----------"
+
+# Pobranie listy wszystkich węzłów i iteracja przez nie
+# Używamy jq do parsowania JSON z 'oc get nodes -o json'
+oc get nodes -o json | jq -r '.items[] | .metadata.name as $name | .status.allocatable as $allocatable | "\($name) \($allocatable.cpu) \($allocatable.memory)"' | while read -r NODE_NAME ALLOCATABLE_CPU ALLOCATABLE_MEM_RAW; do
+
+    # Konwersja jednostek CPU
+    # Kubernetes zwraca "m" (milicore) lub rdzenie. Konwertujemy na rdzenie zmiennoprzecinkowe.
+    if [[ "$ALLOCATABLE_CPU" == *m ]]; then
+        # Ma miliccores, np. 500m
+        CPU_CORES_FLOAT=$(echo "scale=3; ${ALLOCATABLE_CPU%m} / 1000" | bc -l)
+    else
+        # Jest w rdzeniach, np. 4
+        CPU_CORES_FLOAT=$(echo "scale=3; $ALLOCATABLE_CPU / 1" | bc -l)
+    fi
+
+    # Konwersja jednostek Pamięci
+    # Kubernetes zwraca Mi, Gi, Ki, itp. Konwertujemy na MiB (Mebibajty).
+    # UWAGA: Ten prosty skrypt obsługuje tylko Mi, Gi i Ki.
+    MEMORY_MIB_FLOAT=0
+    UNIT=""
+    MEM_VALUE=""
+    
+    # Wyciągnięcie wartości i jednostki (np. 4096Mi -> 4096, Mi)
+    if [[ $ALLOCATABLE_MEM_RAW =~ ([0-9]+)([A-Za-z]+) ]]; then
+        MEM_VALUE=${BASH_REMATCH[1]}
+        UNIT=${BASH_REMATCH[2]}
+    fi
+
+    case $UNIT in
+        Mi)
+            MEMORY_MIB_FLOAT=$(echo "$MEM_VALUE" | bc -l)
+            ;;
+        Gi)
+            # GiB * 1024 MiB/GiB
+            MEMORY_MIB_FLOAT=$(echo "$MEM_VALUE * 1024" | bc -l)
+            ;;
+        Ki)
+            # KiB / 1024 KiB/MiB
+            MEMORY_MIB_FLOAT=$(echo "scale=3; $MEM_VALUE / 1024" | bc -l)
+            ;;
+        *)
+            # Domyślnie bierzemy jako MiB, jeśli nieznana jednostka lub brak jednostki
+            MEMORY_MIB_FLOAT=$(echo "$MEM_VALUE / 1" | bc -l)
+            ;;
+    esac
+
+    # Porównanie zasobów (wymaga bc - kalkulator dla liczb zmiennoprzecinkowych)
+    # Sprawdzenie CPU
+    CAN_RUN_CPU=$(echo "$CPU_CORES_FLOAT >= $REQUIRED_CPU_CORES" | bc)
+    # Sprawdzenie Pamięci
+    CAN_RUN_MEM=$(echo "$MEMORY_MIB_FLOAT >= $REQUIRED_MEM_MIB" | bc)
+
+    STATUS="❌ NIE"
+    if [ "$CAN_RUN_CPU" -eq 1 ] && [ "$CAN_RUN_MEM" -eq 1 ]; then
+        STATUS="✅ TAK"
+    fi
+
+    # Wydruk wyniku
+    printf "%-30s | %-15.3f | %-15.0f | %-10s\n" "$NODE_NAME" "$CPU_CORES_FLOAT" "$MEMORY_MIB_FLOAT" "$STATUS"
+
+done
+
+echo ""
+echo "--- ✅ Koniec skanowania. Powyższa tabela przedstawia węzły, na których pod o podanych wymaganiach może zostać umieszczony. ---"
+
+# Wskazówka: Użyj 'kubectl' zamiast 'oc', jeśli nie jesteś na Red Hat OpenShift.
