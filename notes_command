@@ -86,3 +86,7 @@ cpu_cores=$(awk "BEGIN {print $cpu_sum/1000}")
 mem_gib=$(awk "BEGIN {print $mem_sum_mib/1024}")
 
 echo "CPU: ${cpu_cores} cores  Memory: ${mem_gib} GiB"
+
+
+
+oc patch node worker1 --type='json' -p='[{"op": "replace", "path": "/spec/config/metadata/name", "value": "<NAZWA_RENDERED_WORKER>"}]'
