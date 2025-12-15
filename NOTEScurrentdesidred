@@ -1,0 +1,23 @@
+DESIRED=$(oc get node worker1 -o jsonpath='{.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig}')
+CURRENT=$(oc get node worker1 -o jsonpath='{.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig}')
+
+echo "DESIRED=$DESIRED"
+echo "CURRENT=$CURRENT"
+
+oc get mc "$DESIRED"
+oc get mc "$CURRENT"   # to pewnie wywali NotFound
+
+
+oc debug node/worker1
+chroot /host
+ls -la /etc/machine-config-daemon/
+cat /etc/machine-config-daemon/currentconfig || true
+cat /etc/machine-config-daemon/desiredconfig || true
+
+
+oc patch node worker1 --type=merge -p '{"metadata":{"annotations":{"machineconfiguration.openshift.io/currentConfig":"'"$DESIRED"'"}}}'
+oc annotate node worker1 machineconfiguration.openshift.io/reason- machineconfiguration.openshift.io/state-
+
+
+oc -n openshift-machine-config-operator get pods -o wide | grep worker1
+oc -n openshift-machine-config-operator delete pod <POD_MCD_Z_WORKER1>
