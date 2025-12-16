@@ -2,11 +2,10 @@ import sys
 import argparse
 import json
 import subprocess
-from tabulate import tabulate # Wymaga pip install tabulate
+from tabulate import tabulate 
 
-# --- Funkcje konwersji (zachowane z poprzednich skryptów) ---
+# --- Funkcje konwersji (bez zmian) ---
 
-# Używamy MiB i milicore jako jednostek bazowych do obliczeń
 MEMORY_MULTIPLIERS = {
     'Ki': 1 / 1024, 'Mi': 1, 'Gi': 1024, 'Ti': 1024 * 1024,
     'K': 1 / 1024, 'M': 1, 'G': 1024, 'T': 1024 * 1024,
@@ -41,7 +40,7 @@ def convert_cpu_to_m(value_str):
     except ValueError:
         return 0.0
 
-# --- Funkcja pobierania danych z OC ---
+# --- Funkcja pobierania danych z OC (bez zmian) ---
 
 def get_oc_json_deployments(namespace):
     """Wywołuje 'oc get deployment,deploymentconfig -n <namespace> -o json' i zwraca sparsowany JSON."""
@@ -63,7 +62,7 @@ def get_oc_json_deployments(namespace):
         print("🚨 Błąd: Nie znaleziono polecenia 'oc'. Upewnij się, że jest w Twoim PATH.")
         sys.exit(1)
 
-# --- Główna logika raportowania ---
+# --- Główna logika raportowania (ZMIENIONA) ---
 
 def generate_deployment_report(namespace):
     """Generuje szczegółowy raport zasobów z sumami dla każdego Deploymentu."""
@@ -135,10 +134,10 @@ def generate_deployment_report(namespace):
         report_data.append([
             f"{kind}/{name}",
             replicas,
-            f"{round(current_cpu_req_m / 1000, 2)} Core",
-            f"{round(current_cpu_lim_m / 1000, 2)} Core",
-            f"{round(current_mem_req_mb / 1024, 2)} GiB",
-            f"{round(current_mem_lim_mb / 1024, 2)} GiB",
+            f"{round(current_cpu_req_m / 1000, 2):.2f} Core",
+            f"{round(current_cpu_lim_m / 1000, 2):.2f} Core",
+            f"{round(current_mem_req_mb / 1024, 2):.2f} GiB",
+            f"{round(current_mem_lim_mb / 1024, 2):.2f} GiB",
         ])
 
     # --- Generowanie wiersza sumy ---
@@ -149,17 +148,18 @@ def generate_deployment_report(namespace):
     sum_mem_req_gib = round(total_mem_req_mb / 1024, 2)
     sum_mem_lim_gib = round(total_mem_lim_mb / 1024, 2)
     
-    # Dodanie wiersza sumy do danych raportu
+    # Dodanie separatora i wiersza sumy
+    # Używamy formatowania Markdown (pogrubienie **) lub samego tekstu
     summary_row = [
         "**SUMA DLA NAMESPACE**",
-        total_replicas,
-        f"**{sum_cpu_req_core} Core**",
-        f"**{sum_cpu_lim_core} Core**",
-        f"**{sum_mem_req_gib} GiB**",
-        f"**{sum_mem_lim_gib} GiB**",
+        f"{total_replicas}",
+        f"**{sum_cpu_req_core:.2f} Core**",
+        f"**{sum_cpu_lim_core:.2f} Core**",
+        f"**{sum_mem_req_gib:.2f} GiB**",
+        f"**{sum_mem_lim_gib:.2f} GiB**",
     ]
     
-    # Dodajemy separator, a następnie wiersz sumy
+    # Dodajemy separator
     report_data.append(["---"] * 6)
     report_data.append(summary_row)
 
@@ -174,11 +174,12 @@ def generate_deployment_report(namespace):
     ]
 
     # Wyświetlanie tabeli
-    print(tabulate(report_data, headers=headers, tablefmt="fancy_grid"))
+    # Użycie opcji numalign=None, aby nie próbować wyrównywać sumy jako liczby
+    print(tabulate(report_data, headers=headers, tablefmt="fancy_grid", numalign="left"))
 
     print("\n--- Analiza Raportu ---")
     print(f"* **SUMY w Wierszu Końcowym:** Reprezentują **całkowite rezerwacje** (REQUESTS) i **maksymalne obciążenie** (LIMITS) dla całego Namespace.")
-    print(f"* Aby sprawdzić, czy klaster ma wystarczającą pojemność, porównaj Sumę REQUESTS z raportem Node Capacity.")
+    print(f"* Użycie **{sum_cpu_req_core:.2f} Core** i **{sum_mem_req_gib:.2f} GiB** jest Twoim całkowitym zapotrzebowaniem rezerwacyjnym na zasoby w tym Namespace.")
     
 # --- Uruchomienie skryptu ---
 
