@@ -46,7 +46,6 @@ def convert_cpu_to_m(value_str):
 def get_oc_json_deployments(namespace):
     """Wywołuje 'oc get deployment,deploymentconfig -n <namespace> -o json' i zwraca sparsowany JSON."""
     
-    # Zasoby do audytu
     resources = "deployment.apps,deploymentconfig.apps.openshift.io"
     command = ['oc', 'get', resources, '-n', namespace, '-o', 'json']
     
@@ -67,9 +66,8 @@ def get_oc_json_deployments(namespace):
 # --- Główna logika raportowania ---
 
 def generate_deployment_report(namespace):
-    """Generuje szczegółowy raport zasobów dla każdego Deploymentu."""
+    """Generuje szczegółowy raport zasobów z sumami dla każdego Deploymentu."""
 
-    # Wymagane
     try:
         from tabulate import tabulate
     except ImportError:
@@ -84,6 +82,13 @@ def generate_deployment_report(namespace):
 
     report_data = []
 
+    # Inicjalizacja sumatorów dla całego namespace
+    total_cpu_req_m = 0.0
+    total_cpu_lim_m = 0.0
+    total_mem_req_mb = 0.0
+    total_mem_lim_mb = 0.0
+    total_replicas = 0
+
     print(f"\n--- 📊 Raport Zasobów Deploymentu dla Namespace: **{namespace}** ---")
     
     for item in data['items']:
@@ -91,10 +96,7 @@ def generate_deployment_report(namespace):
         name = item['metadata']['name']
         kind = item['kind']
         
-        # Pobieranie liczby replik
         replicas = item.get('spec', {}).get('replicas', 0)
-        
-        # Ścieżka do szablonu Poda jest taka sama
         containers = item.get('spec', {}).get('template', {}).get('spec', {}).get('containers', [])
 
         pod_cpu_request_m = 0.0
@@ -102,59 +104,86 @@ def generate_deployment_report(namespace):
         pod_mem_request_mb = 0.0
         pod_mem_limit_mb = 0.0
         
-        # Sumowanie zasobów wszystkich kontenerów w ramach JEDNEGO Poda
+        # 1. Sumowanie zasobów jednego Poda (wszystkie kontenery)
         for container in containers:
             resources = container.get('resources', {})
             
-            # Pobieranie wartości
             cpu_req = resources.get('requests', {}).get('cpu', '')
             mem_req = resources.get('requests', {}).get('memory', '')
             cpu_lim = resources.get('limits', {}).get('cpu', '')
             mem_lim = resources.get('limits', {}).get('memory', '')
 
-            # Konwersja i sumowanie dla pojedynczego Poda
             pod_cpu_request_m += convert_cpu_to_m(cpu_req)
             pod_cpu_limit_m += convert_cpu_to_m(cpu_lim)
             pod_mem_request_mb += convert_memory_to_mib(mem_req)
             pod_mem_limit_mb += convert_memory_to_mib(mem_lim)
         
-        # Całkowite zasoby Deploymentu = (Zasoby Poda) * (Liczba replik)
-        total_cpu_request_core = round((pod_cpu_request_m * replicas) / 1000, 2)
-        total_cpu_limit_core = round((pod_cpu_limit_m * replicas) / 1000, 2)
-        total_mem_request_gib = round((pod_mem_request_mb * replicas) / 1024, 2)
-        total_mem_limit_gib = round((pod_mem_limit_mb * replicas) / 1024, 2)
+        # 2. Całkowite zasoby Deploymentu = (Zasoby Poda) * (Liczba replik)
+        current_cpu_req_m = pod_cpu_request_m * replicas
+        current_cpu_lim_m = pod_cpu_limit_m * replicas
+        current_mem_req_mb = pod_mem_request_mb * replicas
+        current_mem_lim_mb = pod_mem_limit_mb * replicas
+        
+        # 3. Sumowanie do globalnych zmiennych
+        total_cpu_req_m += current_cpu_req_m
+        total_cpu_lim_m += current_cpu_lim_m
+        total_mem_req_mb += current_mem_req_mb
+        total_mem_lim_mb += current_mem_lim_mb
+        total_replicas += replicas
 
-        # Dane do raportu
+        # Formatowanie danych do raportu (przeliczenie na Core/GiB)
         report_data.append([
             f"{kind}/{name}",
             replicas,
-            f"{total_cpu_request_core} Core",
-            f"{total_cpu_limit_core} Core",
-            f"{total_mem_request_gib} GiB",
-            f"{total_mem_limit_gib} GiB",
+            f"{round(current_cpu_req_m / 1000, 2)} Core",
+            f"{round(current_cpu_lim_m / 1000, 2)} Core",
+            f"{round(current_mem_req_mb / 1024, 2)} GiB",
+            f"{round(current_mem_lim_mb / 1024, 2)} GiB",
         ])
+
+    # --- Generowanie wiersza sumy ---
+    
+    # Przeliczenie sum globalnych na Core/GiB
+    sum_cpu_req_core = round(total_cpu_req_m / 1000, 2)
+    sum_cpu_lim_core = round(total_cpu_lim_m / 1000, 2)
+    sum_mem_req_gib = round(total_mem_req_mb / 1024, 2)
+    sum_mem_lim_gib = round(total_mem_lim_mb / 1024, 2)
+    
+    # Dodanie wiersza sumy do danych raportu
+    summary_row = [
+        "**SUMA DLA NAMESPACE**",
+        total_replicas,
+        f"**{sum_cpu_req_core} Core**",
+        f"**{sum_cpu_lim_core} Core**",
+        f"**{sum_mem_req_gib} GiB**",
+        f"**{sum_mem_lim_gib} GiB**",
+    ]
+    
+    # Dodajemy separator, a następnie wiersz sumy
+    report_data.append(["---"] * 6)
+    report_data.append(summary_row)
 
     # Nagłówek tabeli
     headers = [
         "ZASÓB (KIND/NAZWA)",
         "REPLIKI",
-        "CPU REQUEST (Core)",
-        "CPU LIMIT (Core)",
-        "MEMORY REQUEST (GiB)",
-        "MEMORY LIMIT (GiB)",
+        "CPU REQUEST",
+        "CPU LIMIT",
+        "MEMORY REQUEST",
+        "MEMORY LIMIT",
     ]
 
     # Wyświetlanie tabeli
     print(tabulate(report_data, headers=headers, tablefmt="fancy_grid"))
 
     print("\n--- Analiza Raportu ---")
-    print("* **REQUESTS (Żądane):** Pamięć i CPU, które klaster **rezerwuje** dla Podów. To jest kluczowe dla planowania pojemności.")
-    print("* **LIMITS (Limity):** Maksymalna ilość zasobów, jaką Pod **może** zużyć. Przekroczenie limitu CPU prowadzi do dławienia (throttlingu), a pamięci do zabicia Poda (OOMKilled).")
+    print(f"* **SUMY w Wierszu Końcowym:** Reprezentują **całkowite rezerwacje** (REQUESTS) i **maksymalne obciążenie** (LIMITS) dla całego Namespace.")
+    print(f"* Aby sprawdzić, czy klaster ma wystarczającą pojemność, porównaj Sumę REQUESTS z raportem Node Capacity.")
     
 # --- Uruchomienie skryptu ---
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OpenShift Deployment Resource Auditor.")
+    parser = argparse.ArgumentParser(description="OpenShift Deployment Resource Auditor (with Sums).")
     parser.add_argument("--namespace", required=True, help="Nazwa przestrzeni nazw OpenShift/Kubernetes.")
     
     args = parser.parse_args()
