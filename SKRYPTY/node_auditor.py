@@ -2,11 +2,12 @@ import sys
 import argparse
 import json
 import subprocess
-from tabulate import tabulate 
+from collections import defaultdict
+from tabulate import tabulate # Wymaga pip install tabulate
 
 # --- Funkcje konwersji jednostek ---
 
-# Używamy MiB i milicore jako jednostek bazowych do obliczeń
+# Używamy MiB jako jednostki bazowej do konwersji, aby zachować precyzję
 MEMORY_MULTIPLIERS = {
     'Ki': 1 / 1024, 'Mi': 1, 'Gi': 1024, 'Ti': 1024 * 1024,
     'K': 1 / 1024, 'M': 1, 'G': 1024, 'T': 1024 * 1024,
@@ -15,8 +16,8 @@ MEMORY_MULTIPLIERS = {
 def convert_memory_to_mib(value_str):
     """Konwertuje wartość pamięci (np. '1Gi', '256Mi') na liczbę MiB."""
     if not value_str: return 0.0
-    temp_value_str = value_str.replace('i', '')
-    
+    temp_value_str = value_str.replace('i', '') 
+
     for unit, multiplier in MEMORY_MULTIPLIERS.items():
         if temp_value_str.endswith(unit):
             try:
@@ -25,170 +26,196 @@ def convert_memory_to_mib(value_str):
             except ValueError:
                 return 0.0
     try:
+        # Traktowanie gołych liczb jako MiB
         return float(value_str)
     except ValueError:
         return 0.0
 
-def convert_cpu_to_m(value_str):
-    """Konwertuje wartość CPU (np. '1', '500m') na liczbę milicore (m)."""
-    if not value_str: return 0.0
-    if value_str.endswith('m'):
-        try:
-            return float(value_str[:-1])
-        except ValueError:
-            return 0.0
-    try:
-        num = float(value_str)
-        return num * 1000.0
-    except ValueError:
-        return 0.0
+# --- Funkcje pobierania danych z OC (Poprawione dla obsługi błędów) ---
 
-# --- Funkcja pobierania danych z OC ---
-
-def get_oc_json_deployments(namespace):
-    """Wywołuje 'oc get deployment,deploymentconfig -n <namespace> -o json' i zwraca sparsowany JSON."""
+def get_oc_json(resource, all_namespaces=False):
+    """Wywołuje 'oc get <resource> -o json' i zwraca sparsowany JSON."""
     
-    # Pobieramy Deploymenty i DeploymentConfigs
-    resources = "deployment.apps,deploymentconfig.apps.openshift.io"
-    command = ['oc', 'get', resources, '-n', namespace, '-o', 'json']
+    command = ['oc', 'get', resource]
+    if all_namespaces:
+        command.append('--all-namespaces')
+    command.extend(['-o', 'json'])
     
-    print(f"Wykonuję: {' '.join(command)}")
+    # print(f"Wykonuję: {' '.join(command)}") # Odkomentuj dla diagnostyki
     
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=True)
-        result.check_returncode()
         return json.loads(result.stdout)
     except subprocess.CalledProcessError as e:
-        print(f"🚨 Błąd wywołania 'oc': Sprawdź, czy jesteś zalogowany i czy namespace '{namespace}' istnieje.")
-        print(f"Błąd: {e.stderr.strip()}")
+        print(f"🚨 Błąd wywołania 'oc get {resource}': Sprawdź uprawnienia.")
+        # Jeśli błąd dotyczy Podów, zwracamy pusty zestaw, aby reszta raportu działała.
+        if 'pods' in resource:
+             return {'items': []} 
         sys.exit(1)
     except FileNotFoundError:
         print("🚨 Błąd: Nie znaleziono polecenia 'oc'. Upewnij się, że jest w Twoim PATH.")
         sys.exit(1)
 
-# --- Główna logika raportowania ---
+def get_nodes_data():
+    """Pobiera i przetwarza dane o pojemności nodów."""
+    print("Pobieranie danych o pojemności nodów...")
+    nodes_data = get_oc_json('nodes')
+    
+    node_metrics = {}
+    
+    for node in nodes_data.get('items', []):
+        node_name = node['metadata']['name']
+        
+        # Pamięć Capacity i Allocatable w MiB
+        capacity_mib = convert_memory_to_mib(
+            node.get('status', {}).get('capacity', {}).get('memory', '0Mi')
+        )
+        allocatable_mib = convert_memory_to_mib(
+            node.get('status', {}).get('allocatable', {}).get('memory', '0Mi')
+        )
+        
+        node_metrics[node_name] = {
+            'capacity_mib': capacity_mib,
+            'allocatable_mib': allocatable_mib,
+            'requested_mib': 0.0  # Będziemy to sumować z Podów
+        }
+        
+    return node_metrics
 
-def generate_deployment_report(namespace):
-    """Generuje szczegółowy raport zasobów dla każdego Deploymentu z sumami."""
+def get_pods_requests(node_metrics):
+    """Pobiera wszystkie Pody i sumuje ich Memory Requests na nodach."""
+    print("Pobieranie i sumowanie Memory Requests z Podów (wszystkie namespaces)...")
+    
+    # Pobieramy Pody ze wszystkich przestrzeni nazw
+    pods_data = get_oc_json('pods', all_namespaces=True)
+    
+    unmatched_pods_count = 0
+    
+    for pod in pods_data.get('items', []):
+        
+        # Filtrujemy Pody: interesują nas tylko te, które są Running lub Pending i mają nodeName
+        phase = pod.get('status', {}).get('phase')
+        if phase not in ['Running', 'Pending']:
+             continue
 
+        node_name = pod.get('spec', {}).get('nodeName')
+        
+        if node_name and node_name in node_metrics:
+            
+            containers = pod.get('spec', {}).get('containers', [])
+            pod_total_mem_request_mib = 0.0
+            
+            for container in containers:
+                resources = container.get('resources', {})
+                mem_req = resources.get('requests', {}).get('memory', '')
+                
+                pod_total_mem_request_mib += convert_memory_to_mib(mem_req)
+            
+            # Dodanie requestów Poda do sumy dla danego Noda
+            node_metrics[node_name]['requested_mib'] += pod_total_mem_request_mib
+            
+        elif node_name:
+            # NodeName istnieje, ale nie ma go na liście węzłów (może być unknwon lub usunięty)
+            unmatched_pods_count += 1
+        # Jeśli nodeName jest pusty, Pod jest Pending i jeszcze nie został zaplanowany (nie rezerwuje zasobów noda)
+        
+    if unmatched_pods_count > 0:
+         print(f"   [INFO] Pominięto {unmatched_pods_count} Podów, ponieważ były przypisane do nieznanego/usuniętego Noda.")
+         
+    return node_metrics
+
+# --- Raport końcowy ---
+
+def generate_full_node_report(target_unit='GiB'):
+    """Generuje kompletny raport o obciążeniu pamięcią na węzłach."""
+    
     try:
         from tabulate import tabulate
     except ImportError:
         print("🚨 Błąd: Wymagana biblioteka 'tabulate'. Zainstaluj ją: 'pip install tabulate'")
         sys.exit(1)
         
-    data = get_oc_json_deployments(namespace)
+    # 1. Pobierz pojemność nodów
+    node_metrics = get_nodes_data()
+    
+    # 2. Pobierz requesty Podów i przypisz do nodów
+    node_metrics = get_pods_requests(node_metrics)
 
-    if not data or 'items' not in data:
-        print(f"Brak Deploymentów lub DeploymentConfigs w przestrzeni nazw '{namespace}'.")
-        return
+    # Ustalenie jednostki docelowej
+    if target_unit.upper() in ['GIB', 'GI']:
+        unit_divisor = 1024.0
+        unit_name = "GiB"
+    elif target_unit.upper() in ['MIB', 'MI']:
+        unit_divisor = 1.0
+        unit_name = "MiB"
+    else:
+        unit_divisor = 1024.0
+        unit_name = "GiB"
+
+    print("\n=====================================================")
+    print(f"   📈 PEŁNY RAPORT REZERWACJI PAMIĘCI NA WĘZŁACH ({unit_name})")
+    print("=====================================================")
 
     report_data = []
 
-    # Inicjalizacja sumatorów dla całego namespace (w jednostkach bazowych)
-    total_cpu_req_m = 0.0
-    total_cpu_lim_m = 0.0
-    total_mem_req_mb = 0.0
-    total_mem_lim_mb = 0.0
-    total_replicas = 0
+    # 
 
-    print(f"\n--- 📊 Raport Zasobów Deploymentu dla Namespace: **{namespace}** ---")
-    
-    for item in data['items']:
+    for node_name, metrics in node_metrics.items():
+        allocatable = metrics['allocatable_mib']
+        requested = metrics['requested_mib']
         
-        name = item['metadata']['name']
-        kind = item['kind']
+        # Wolna rezerwa: Ile pamięci ZAREZERWOWANEJ można jeszcze przydzielić
+        free_reserve = allocatable - requested
         
-        replicas = item.get('spec', {}).get('replicas', 0)
-        containers = item.get('spec', {}).get('template', {}).get('spec', {}).get('containers', [])
+        # Użycie (rezerwacji)
+        if allocatable > 0:
+            usage_percent = (requested / allocatable) * 100
+        else:
+            usage_percent = 0.0
 
-        pod_cpu_request_m = 0.0
-        pod_cpu_limit_m = 0.0
-        pod_mem_request_mb = 0.0
-        pod_mem_limit_mb = 0.0
+        # Konwersja na jednostkę docelową
+        allocatable_unit = round(allocatable / unit_divisor, 2)
+        requested_unit = round(requested / unit_divisor, 2)
+        free_reserve_unit = round(free_reserve / unit_divisor, 2)
         
-        # 1. Sumowanie zasobów jednego Poda (wszystkie kontenery)
-        for container in containers:
-            resources = container.get('resources', {})
-            
-            # Używamy pustego stringa jako wartości domyślnej, aby obsłużyć brakujące pola
-            cpu_req = resources.get('requests', {}).get('cpu', '')
-            mem_req = resources.get('requests', {}).get('memory', '')
-            cpu_lim = resources.get('limits', {}).get('cpu', '')
-            mem_lim = resources.get('limits', {}).get('memory', '')
-
-            pod_cpu_request_m += convert_cpu_to_m(cpu_req)
-            pod_cpu_limit_m += convert_cpu_to_m(cpu_lim)
-            pod_mem_request_mb += convert_memory_to_mib(mem_req)
-            pod_mem_limit_mb += convert_memory_to_mib(mem_lim)
-        
-        # 2. Całkowite zasoby Deploymentu = (Zasoby Poda) * (Liczba replik)
-        current_cpu_req_m = pod_cpu_request_m * replicas
-        current_cpu_lim_m = pod_cpu_limit_m * replicas
-        current_mem_req_mb = pod_mem_request_mb * replicas
-        current_mem_lim_mb = pod_mem_limit_mb * replicas
-        
-        # 3. Sumowanie do globalnych zmiennych
-        total_cpu_req_m += current_cpu_req_m
-        total_cpu_lim_m += current_cpu_lim_m
-        total_mem_req_mb += current_mem_req_mb
-        total_mem_lim_mb += current_mem_lim_mb
-        total_replicas += replicas
-
-        # Formatowanie danych do raportu (przeliczenie na Core/GiB)
+        # Dane do raportu
         report_data.append([
-            f"{kind}/{name}",
-            replicas,
-            f"{round(current_cpu_req_m / 1000, 2):.2f} Core",
-            f"{round(current_cpu_lim_m / 1000, 2):.2f} Core",
-            f"{round(current_mem_req_mb / 1024, 2):.2f} GiB",
-            f"{round(current_mem_lim_mb / 1024, 2):.2f} GiB",
+            node_name, 
+            f"{allocatable_unit:.2f}", 
+            f"{requested_unit:.2f}", 
+            f"{free_reserve_unit:.2f}", 
+            f"{usage_percent:.1f}%"
         ])
-
-    # --- Generowanie wiersza sumy ---
-    
-    # Przeliczenie sum globalnych na Core/GiB
-    sum_cpu_req_core = round(total_cpu_req_m / 1000, 2)
-    sum_cpu_lim_core = round(total_cpu_lim_m / 1000, 2)
-    sum_mem_req_gib = round(total_mem_req_mb / 1024, 2)
-    sum_mem_lim_gib = round(total_mem_lim_mb / 1024, 2)
-    
-    # Dodanie separatora i wiersza sumy (zastosowanie poprawki formatowania)
-    summary_row = [
-        "**SUMA DLA NAMESPACE**",
-        f"{total_replicas}",
-        f"**{sum_cpu_req_core:.2f} Core**",
-        f"**{sum_cpu_lim_core:.2f} Core**",
-        f"**{sum_mem_req_gib:.2f} GiB**",
-        f"**{sum_mem_lim_gib:.2f} GiB**",
-    ]
-    
-    # Dodajemy separator
-    report_data.append(["---"] * 6)
-    report_data.append(summary_row)
-
+        
     # Nagłówek tabeli
     headers = [
-        "ZASÓB (KIND/NAZWA)",
-        "REPLIKI",
-        "CPU REQUEST",
-        "CPU LIMIT",
-        "MEMORY REQUEST",
-        "MEMORY LIMIT",
+        "WĘZEŁ (NODE)", 
+        f"ALLOCATABLE ({unit_name})", 
+        f"REQUESTED ({unit_name})", 
+        f"WOLNA REZERWA ({unit_name})", 
+        "UŻYCIE [%]"
     ]
-
-    # Wyświetlanie tabeli (numalign=None zapewnia poprawne wyświetlanie wiersza sumy)
-    print(tabulate(report_data, headers=headers, tablefmt="fancy_grid", numalign="left"))
+    
+    # Wyświetlanie tabeli
+    print(tabulate(report_data, headers=headers, tablefmt="fancy_grid", numalign="right"))
 
     print("\n--- Analiza Raportu ---")
-    print(f"* **SUMY w Wierszu Końcowym:** {sum_cpu_req_core:.2f} Core i {sum_mem_req_gib:.2f} GiB reprezentują **całkowitą gwarantowaną rezerwację** zasobów, którą musisz zapewnić w klastrze dla tego Namespace.")
-    
+    print("* **ALLOCATABLE:** Całkowita pamięć dostępna do rezerwacji dla Podów (Capacity - system).")
+    print("* **REQUESTED:** Suma żądanej pamięci (requests) przez **wszystkie Pody** na tym nodzie.")
+    print("* **WOLNA REZERWA:** Allocatable - Requested. Tyle pamięci **gwarantowanej** możesz jeszcze przydzielić.")
+
+
 # --- Uruchomienie skryptu ---
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OpenShift Deployment Resource Auditor (with Sums).")
-    parser.add_argument("--namespace", required=True, help="Nazwa przestrzeni nazw OpenShift/Kubernetes.")
+    parser = argparse.ArgumentParser(description="OpenShift Full Node Capacity Auditor.")
+    parser.add_argument(
+        "--memory-unit", 
+        default="GiB", 
+        help="Jednostka dla pamięci (np. MiB, GiB, domyślnie GiB)."
+    )
     
     args = parser.parse_args()
     
-    generate_deployment_report(args.namespace)
+    print("--- ⚙️ Uruchamianie pełnego audytu nodów (Python + oc) ---")
+    generate_full_node_report(args.memory_unit)
