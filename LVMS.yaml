@@ -11,7 +11,12 @@ spec:
     deviceClasses:
     - name: kafka
       nodeSelector:
-        kafka-node: "true"
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kafka-node
+            operator: In
+            values:
+            - "true"
       deviceSelector:
         paths:
         - /dev/vdb
@@ -19,6 +24,7 @@ spec:
         name: thin-pool-kafka
         sizePercent: 90
         overprovisionRatio: 10
+
 
 
 sc-lvms-kafka.yaml:
