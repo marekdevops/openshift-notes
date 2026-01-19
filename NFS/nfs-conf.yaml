@@ -1,0 +1,9 @@
+apiVersion: cache.jhouse.com/v1alpha1
+kind: NFSProvisioner
+metadata:
+  name: lenovo-nfs
+  namespace: nfs-provisioner
+spec:
+  nfsServer: "<IP_LUB_DNS_LENOVO>"
+  nfsPath: "/exports/openshift-prometheus"
+  provisionerName: "lenovo.nfs"   # ⬅️ TO JEST KLUCZOWE POLE
