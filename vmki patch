@@ -1,3 +1,7 @@
 oc -n <namespace> patch vm <nazwa-vm> \
   --type=merge \
   -p '{"spec":{"template":{"spec":{"evictionStrategy":"LiveMigrate"}}}}'
+
+
+
+oc exec -it <nazwa_poda_virt_launcher> -c compute -- virsh domjobinfo $(oc get vmi worker-big-01 -o jsonpath='{.metadata.annotations.kubevirt\.io/domain}')
