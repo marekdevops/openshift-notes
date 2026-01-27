@@ -21,3 +21,7 @@ oc annotate node worker1 machineconfiguration.openshift.io/reason- machineconfig
 
 oc -n openshift-machine-config-operator get pods -o wide | grep worker1
 oc -n openshift-machine-config-operator delete pod <POD_MCD_Z_WORKER1>
+
+
+
+oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.machineconfig\.openshift\.io/state}{"\n"}{end}'
