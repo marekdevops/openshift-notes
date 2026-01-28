@@ -27,3 +27,7 @@ oc -n openshift-machine-config-operator delete pod <POD_MCD_Z_WORKER1>
 oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.machineconfig\.openshift\.io/state}{"\n"}{end}'
 
 oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.machineconfiguration\.openshift\.io/state}{"\t"}{.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig}{"\n"}{end}'
+
+oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.machineconfiguration\.openshift\.io/state}{"\t"}{.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig}{"\n"}{end}'
+
+oc logs -n openshift-machine-config-operator deployment/machine-config-controller -c machine-config-controller | grep -iE "error|fail|worker"
