@@ -1,0 +1,11 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: crd-manager
+rules:
+- apiGroups: ["<api_group1>"]
+  resources: ["<CRD1>"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["<api_group2>"]  # Replace with the actual API group of the CRDs
+  resources: ["<CR1>", "<CR2>"]  # Replace with the specific CR resources
+  verbs: ["create", "get", "list", "watch", "update", "delete"]
