@@ -1,0 +1,48 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-manager-role
+rules:
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+  verbs: ["get", "list", "watch"] # Argo może widzieć RBAC, ale nie może go zmieniać (bezpieczeństwo!)
+
+oc apply -f argocd-manager-role.yaml
+
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-manager-binding
+subjects:
+- kind: ServiceAccount
+  name: openshift-gitops-argocd-application-controller
+  namespace: openshift-gitops
+roleRef:
+  kind: ClusterRole
+  name: argocd-manager-role
+  apiGroup: rbac.authorization.k8s.io
+
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: openshift-gitops
+spec:
+  # Pozwól na wdrażanie do dowolnego namespace (lub ogranicz do konkretnych)
+  destinations:
+  - namespace: '*'
+    server: https://kubernetes.default.svc
+  # Pozwól na tworzenie zasobów o dowolnym zasięgu (klastrowe i namespace)
+  clusterResourceWhitelist:
+  - group: '*'
+    kind: '*'
+  sourceRepos:
+  - '*'
+
+
+
+oc label namespace <twoj-projekt> argocd.argoproj.io/managed-by=openshift-gitops
