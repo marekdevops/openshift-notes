@@ -1,0 +1,76 @@
+---
+- name: OpenShift Service Account Provisioning
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  # Definiujemy wartości domyślne, które zostaną nadpisane przez parametry -e
+  vars:
+    sa_namespace: "{{ ns | default('default') }}"
+    sa_name: "{{ name | default('') }}"
+    role_name: "{{ role | default('view') }}"
+
+  tasks:
+    - name: Sprawdzenie czy podano nazwę SA
+      fail:
+        msg: "BŁĄD: Musisz podać nazwę SA! Użyj: -e name=moja-nazwa"
+      when: sa_name == ""
+
+    - name: "Tworzenie Service Account: {{ sa_name }} w {{ sa_namespace }}"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ sa_name }}"
+            namespace: "{{ sa_namespace }}"
+
+    - name: "Przypisanie roli: {{ role_name }}"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: "{{ sa_name }}-binding"
+            namespace: "{{ sa_namespace }}"
+          subjects:
+            - kind: ServiceAccount
+              name: "{{ sa_name }}"
+              namespace: "{{ sa_namespace }}"
+          roleRef:
+            kind: ClusterRole # Używamy ClusterRole jako źródła (np. view, edit, admin)
+            name: "{{ role_name }}"
+            apiGroup: rbac.authorization.k8s.io
+
+    - name: "Tworzenie Secretu dla trwałego tokenu"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ sa_name }}-token"
+            namespace: "{{ sa_namespace }}"
+            annotations:
+              kubernetes.io/service-account.name: "{{ sa_name }}"
+          type: kubernetes.io/service-account-token
+
+    - name: "Oczekiwanie na wygenerowanie tokenu przez kontroler"
+      kubernetes.core.k8s_info:
+        kind: Secret
+        name: "{{ sa_name }}-token"
+        namespace: "{{ sa_namespace }}"
+      register: sa_secret
+      until: sa_secret.resources[0].data.token is defined
+      retries: 10
+      delay: 1
+
+    - name: "WYNIK: Twój trwały token"
+      debug:
+        msg: 
+          - "Service Account: {{ sa_name }}"
+          - "Projekt:        {{ sa_namespace }}"
+          - "Rola:           {{ role_name }}"
+          - "TOKEN:          {{ sa_secret.resources[0].data.token | b64decode }}"
