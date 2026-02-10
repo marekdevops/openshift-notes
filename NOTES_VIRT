@@ -1,0 +1,2 @@
+  oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.cpu}{"\n"}{end}'                                                                                                                                                                                                                                                                               
+  oc get nodes -o custom-columns="NAME:.metadata.name,CPU-MANAGER:.metadata.labels.cpumanager"
