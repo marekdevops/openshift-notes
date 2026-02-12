@@ -26,7 +26,7 @@ oc adm taint nodes <infra-node-0> node-role.kubernetes.io/infra=:NoSchedule
 oc adm taint nodes <infra-node-1> node-role.kubernetes.io/infra=:NoSchedule
 oc adm taint nodes <infra-node-2> node-role.kubernetes.io/infra=:NoSchedule
 
-
+oc get nodes -l node-role.kubernetes.io/master -o name | xargs -I {} oc adm taint {} node-role.kubernetes.io/master=:NoSchedule --overwrite
 #przeniesienie 
 oc edit ingresscontroller default -n openshift-ingress-operator
 
