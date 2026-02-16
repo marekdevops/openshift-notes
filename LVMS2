@@ -1,0 +1,138 @@
+apiVersion: lvm.topolvm.io/v1alpha1
+kind: LVMCluster
+metadata:
+  name: lvms-storage
+  namespace: openshift-storage
+spec:
+  storage:
+    deviceClasses:
+    - name: kafka
+      nodeSelector:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kafka-node
+            operator: In
+            values: ["true"]
+      deviceSelector:
+        paths:
+        - /dev/vdb
+      thinPoolConfig:
+        name: thin-pool-kafka
+        sizePercent: 90
+        overprovisionRatio: 10
+
+    - name: cyfrowe-dokumenty
+      nodeSelector:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: cyfrowe
+            operator: In
+            values: ["true"]
+      deviceSelector:
+        paths:
+        - /dev/vdc
+      thinPoolConfig:
+        name: thin-pool-cyfrowe
+        sizePercent: 90
+        overprovisionRatio: 10
+
+oc apply -f lvms-multi.yaml
+oc -n openshift-storage get lvmcluster lvms-storage -o yaml | sed -n '/status:/,$p'
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lvms-kafka-thin
+provisioner: topolvm.io
+parameters:
+  device-class: kafka
+  csi.storage.k8s.io/fstype: xfs
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lvms-cyfrowe-thin
+provisioner: topolvm.io
+parameters:
+  device-class: cyfrowe-dokumenty
+  csi.storage.k8s.io/fstype: xfs
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+oc apply -f sc-lvms-kafka.yaml
+oc apply -f sc-lvms-cyfrowe.yaml
+
+
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-kafka-pvc
+  namespace: default
+spec:
+  storageClassName: lvms-kafka-thin
+  accessModes: [ "ReadWriteOnce" ]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-kafka-pod
+  namespace: default
+spec:
+  nodeSelector:
+    kafka-node: "true"
+  containers:
+  - name: test
+    image: registry.access.redhat.com/ubi9/ubi-minimal
+    command: ["sh","-c","echo ok > /data/ok.txt; sleep 3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: test-kafka-pvc
+
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-cyfrowe-pvc
+  namespace: default
+spec:
+  storageClassName: lvms-cyfrowe-thin
+  accessModes: [ "ReadWriteOnce" ]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-cyfrowe-pod
+  namespace: default
+spec:
+  nodeSelector:
+    cyfrowe: "true"
+  containers:
+  - name: test
+    image: registry.access.redhat.com/ubi9/ubi-minimal
+    command: ["sh","-c","echo ok > /data/ok.txt; sleep 3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: test-cyfrowe-pvc
+
+
+oc apply -f test-kafka.yaml
+oc apply -f test-cyfrowe.yaml
+oc -n default get pod -o wide | egrep 'test-kafka|test-cyfrowe'
