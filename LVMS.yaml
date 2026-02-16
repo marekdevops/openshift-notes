@@ -57,3 +57,36 @@ spec:
       storage: 1Gi
 
 oc -n openshift-lvm-storage patch lvmcluster lvms-kafka -p '{"metadata":{"finalizers":[]}}' --type=merge
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-lvms-pvc
+  namespace: default
+spec:
+  storageClassName: lvms-kafka-thin
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-lvms-pod
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: test
+    image: registry.access.redhat.com/ubi9/ubi-minimal
+    command: ["sh", "-c", "echo OK > /data/ok.txt; sleep 3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: test-lvms-pvc
