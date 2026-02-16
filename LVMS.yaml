@@ -42,3 +42,16 @@ allowVolumeExpansion: true
 
 
 oc get sc lvms-kafka-thin
+
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-lvms
+spec:
+  storageClassName: lvms-kafka-thin
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
