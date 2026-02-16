@@ -55,3 +55,5 @@ spec:
   resources:
     requests:
       storage: 1Gi
+
+oc -n openshift-lvm-storage patch lvmcluster lvms-kafka -p '{"metadata":{"finalizers":[]}}' --type=merge
