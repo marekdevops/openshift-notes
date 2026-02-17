@@ -57,6 +57,7 @@ spec:
       storage: 1Gi
 
 oc -n openshift-lvm-storage patch lvmcluster lvms-kafka -p '{"metadata":{"finalizers":[]}}' --type=merge
+oc get crd | egrep -i 'vgstatus|volumegroup|lvmvolumegroup|node|topolvm|logicalvolume'
 
 apiVersion: v1
 kind: PersistentVolumeClaim
