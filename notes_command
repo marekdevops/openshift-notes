@@ -90,3 +90,7 @@ echo "CPU: ${cpu_cores} cores  Memory: ${mem_gib} GiB"
 
 
 oc patch node worker1 --type='json' -p='[{"op": "replace", "path": "/spec/config/metadata/name", "value": "<NAZWA_RENDERED_WORKER>"}]'
+
+#co zjada rezerwacje
+
+oc get pods --all-namespaces --field-selector spec.nodeName=<NAZWA_NODA> -o custom-columns="NAME:.metadata.name,NAMESPACE:.metadata.namespace,MEM_REQ:.spec.containers[*].resources.requests.memory"
