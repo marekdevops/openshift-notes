@@ -1,0 +1,39 @@
+---
+# vars/rbac_config.yml
+# Konfiguracja RBAC dla grup OpenShift
+#
+# DOSTOSUJ PRZED URUCHOMIENIEM:
+#   Zmień nazwy grup na odpowiadające Twoim grupom LDAP/IdP.
+#   Grupy muszą istnieć w OpenShift (synchronizowane z LDAP lub skonfigurowane w IdP).
+#   Sprawdź: oc get groups
+
+# ---------------------------------------------------------------------------
+# Definicja grup OpenShift (z LDAP)
+# ---------------------------------------------------------------------------
+
+ocp_groups:
+  - nazwa-grupy-admins      # <-- zmień na nazwę pierwszej grupy
+  - nazwa-grupy-viewers     # <-- zmień na nazwę drugiej grupy
+
+# ---------------------------------------------------------------------------
+# ClusterRole nadawane KAŻDEJ grupie z listy ocp_groups
+#
+# Wbudowane role OpenShift (zawsze dostępne po instalacji):
+#   - cluster-reader          : odczyt wszystkich zasobów w klastrze (bez sekretów)
+#   - cluster-monitoring-view : dostęp do Prometheus/Alertmanager (OCP Monitoring)
+#
+# Custom role (tworzone przez ten playbook):
+#   - storage-viewer          : odczyt PV/PVC/StorageClass + tworzenie własnych PVC
+#
+# UWAGA: cluster-operator — NIE jest wbudowaną rolą OCP po czystej instalacji.
+#   Jeśli masz ją zainstalowaną przez operator (np. OLM), pozostaw jak jest.
+#   Jeśli nie — playbook zaraportuje błąd przy tworzeniu tego bindingu.
+#   Możesz wykomentować tę linię lub zastąpić rolą odpowiednią dla Twojego środowiska
+#   (np. cluster-admin dla pełnego dostępu operatora).
+# ---------------------------------------------------------------------------
+
+ocp_roles:
+  - cluster-reader
+  - cluster-monitoring-view
+  - cluster-operator
+  - storage-viewer

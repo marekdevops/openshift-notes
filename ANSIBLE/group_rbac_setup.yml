@@ -1,0 +1,142 @@
+---
+# =============================================================================
+# group_rbac_setup.yml
+# Playbook: Nadawanie uprawnień RBAC grupom OpenShift po instalacji klastra
+#
+# Co robi:
+#   1. Tworzy custom ClusterRole 'storage-viewer' (PV/PVC/StorageClass)
+#   2. Dla każdej grupy z vars/rbac_config.yml tworzy ClusterRoleBinding
+#      do wszystkich ról z listy ocp_roles
+#
+# Wymagania:
+#   ansible-galaxy collection install kubernetes.core
+#   pip install kubernetes
+#
+# Uruchomienie:
+#   ansible-playbook group_rbac_setup.yml
+#   ansible-playbook group_rbac_setup.yml --check   # tryb dry-run
+#   ansible-playbook group_rbac_setup.yml -e "ocp_groups=['moja-grupa']"
+#
+# Klaster jest wykrywany z aktywnej sesji oc (plik ~/.kube/config).
+# Uruchamiaj jako użytkownik z uprawnieniami cluster-admin.
+# =============================================================================
+
+- name: "OpenShift RBAC — konfiguracja uprawnień grup"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/rbac_config.yml
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 0. Weryfikacja środowiska
+    # -------------------------------------------------------------------------
+
+    - name: "Sprawdzenie połączenia z klastrem (oc whoami)"
+      ansible.builtin.command: oc whoami
+      register: oc_user
+      changed_when: false
+      failed_when: oc_user.rc != 0
+
+    - name: "Sprawdzenie uprawnień cluster-admin"
+      ansible.builtin.command: oc auth can-i '*' '*' --all-namespaces
+      register: can_admin
+      changed_when: false
+      failed_when: can_admin.stdout | trim != 'yes'
+
+    - name: "INFO — użytkownik i klaster"
+      ansible.builtin.debug:
+        msg:
+          - "Zalogowany jako : {{ oc_user.stdout }}"
+          - "Grupy do skonfigurowania : {{ ocp_groups }}"
+          - "Role do nadania : {{ ocp_roles }}"
+
+    - name: "Weryfikacja — grupy muszą istnieć w klastrze"
+      ansible.builtin.command: oc get group {{ item }}
+      loop: "{{ ocp_groups }}"
+      register: group_check
+      changed_when: false
+      failed_when: group_check.rc != 0
+
+    # -------------------------------------------------------------------------
+    # 1. Tworzenie custom ClusterRole: storage-viewer
+    #    (definicja zgodna z plikiem Role/storageviewer w tym repo)
+    # -------------------------------------------------------------------------
+
+    - name: "ClusterRole — tworzenie 'storage-viewer'"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: storage-viewer
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              rbac.openshift.io/aggregate-to-view: "true"
+          rules:
+            # Persistent Volumes — tylko odczyt (zasób klastrowy)
+            - apiGroups: [""]
+              resources: ["persistentvolumes"]
+              verbs: ["get", "list", "watch"]
+            # Persistent Volume Claims — pełny CRUD (zasób namespace)
+            - apiGroups: [""]
+              resources: ["persistentvolumeclaims"]
+              verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+            # Storage Classes — tylko odczyt
+            - apiGroups: ["storage.k8s.io"]
+              resources: ["storageclasses"]
+              verbs: ["get", "list", "watch"]
+            # VolumeSnapshotClasses / VolumeSnapshots (opcjonalne, jeśli CSI zainstalowane)
+            - apiGroups: ["snapshot.storage.k8s.io"]
+              resources: ["volumesnapshotclasses", "volumesnapshots"]
+              verbs: ["get", "list", "watch"]
+
+    # -------------------------------------------------------------------------
+    # 2. Tworzenie ClusterRoleBindings: każda_grupa × każda_rola
+    # -------------------------------------------------------------------------
+
+    - name: "ClusterRoleBinding — nadawanie uprawnień grupom"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            # Format nazwy: grp-<nazwa-grupy>-<nazwa-roli>
+            name: "grp-{{ item.0 | replace(' ', '-') }}-{{ item.1 }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              rbac.openshift.io/group: "{{ item.0 }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: "{{ item.1 }}"
+          subjects:
+            - kind: Group
+              name: "{{ item.0 }}"
+              apiGroup: rbac.authorization.k8s.io
+      # product() generuje iloczyn kartezjański: każda_grupa × każda_rola
+      # item.0 = nazwa grupy, item.1 = nazwa roli
+      loop: "{{ ocp_groups | product(ocp_roles) | list }}"
+      loop_control:
+        label: "{{ item.0 }}  -->  {{ item.1 }}"
+
+    # -------------------------------------------------------------------------
+    # 3. Weryfikacja — wyświetl podsumowanie nadanych bindingów
+    # -------------------------------------------------------------------------
+
+    - name: "Weryfikacja — pobranie wszystkich ClusterRoleBindings zarządzanych przez Ansible"
+      ansible.builtin.command: >
+        oc get clusterrolebindings
+        -l app.kubernetes.io/managed-by=ansible
+        -o custom-columns=BINDING:.metadata.name,GROUP:.subjects[0].name,ROLE:.roleRef.name
+      register: binding_list
+      changed_when: false
+
+    - name: "PODSUMOWANIE — nadane uprawnienia"
+      ansible.builtin.debug:
+        msg: "{{ binding_list.stdout_lines }}"
