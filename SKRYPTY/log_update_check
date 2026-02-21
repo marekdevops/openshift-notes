@@ -191,56 +191,60 @@ def build_operators(co):
                      title="OPERATORY", border_style="red")
 
     items = co.get('items', [])
-    progressing_list = []
-    degraded_list = []
-    ok_count = 0
-
-    table = Table(box=box.SIMPLE_HEAVY, show_header=True,
-                  header_style="bold white", expand=True)
-    table.add_column("OPERATOR", style="cyan", min_width=35, no_wrap=True)
-    table.add_column("AVAILABLE",   justify="center", min_width=10)
-    table.add_column("PROGRESSING", justify="center", min_width=12)
-    table.add_column("DEGRADED",    justify="center", min_width=10)
-    table.add_column("WIADOMOŚĆ", overflow="fold")
+    active_rows = []   # Progressing lub Degraded — pokazujemy
+    ok_count    = 0
 
     for op in sorted(items, key=lambda x: x['metadata']['name']):
-        name = op['metadata']['name']
+        name  = op['metadata']['name']
         conds = op.get('status', {}).get('conditions', [])
 
-        avail  = get_condition(conds, 'Available')
-        prog   = get_condition(conds, 'Progressing')
-        degrad = get_condition(conds, 'Degraded')
-
-        is_avail  = bool_cond(avail.get('status'))
-        is_prog   = bool_cond(prog.get('status'))
-        is_degrad = bool_cond(degrad.get('status'))
-
-        avail_s  = "[green]✓[/green]" if is_avail  else "[red]✗[/red]"
-        prog_s   = "[yellow]●[/yellow]" if is_prog  else "[dim]–[/dim]"
-        degrad_s = "[red]✗[/red]"      if is_degrad else "[dim]–[/dim]"
+        is_prog   = bool_cond(get_condition(conds, 'Progressing').get('status'))
+        is_degrad = bool_cond(get_condition(conds, 'Degraded').get('status'))
 
         if is_degrad:
-            degraded_list.append(name)
-            msg = truncate(degrad.get('message', ''), 65)
-            style = "on dark_red"
+            msg = truncate(get_condition(conds, 'Degraded').get('message', ''), 75)
+            active_rows.append((name, 'degraded', msg))
         elif is_prog:
-            progressing_list.append(name)
-            msg = truncate(prog.get('message', ''), 65)
-            style = "yellow"
+            msg = truncate(get_condition(conds, 'Progressing').get('message', ''), 75)
+            active_rows.append((name, 'progressing', msg))
         else:
             ok_count += 1
-            msg = ""
-            style = ""
-
-        table.add_row(name, avail_s, prog_s, degrad_s, msg, style=style)
 
     summary = (
         f"[bold]{len(items)}[/bold] operatorów  |  "
-        f"[green]OK: {ok_count}[/green]  |  "
-        f"[yellow]Progressing: {len(progressing_list)}[/yellow]  |  "
-        f"[red]Degraded: {len(degraded_list)}[/red]"
+        f"[green]✓ {ok_count} OK[/green]  |  "
+        f"[yellow]● {len([r for r in active_rows if r[1]=='progressing'])} Progressing[/yellow]  |  "
+        f"[red]✗ {len([r for r in active_rows if r[1]=='degraded'])} Degraded[/red]"
     )
-    border = "red" if degraded_list else ("yellow" if progressing_list else "green")
+
+    # Gdy wszystko OK — minimalistyczny widok bez tabeli
+    if not active_rows:
+        body = Text(f"✓ Wszystkie {ok_count} operatorów Available i stabilnych", style="green")
+        return Panel(body, title=f"[bold]OPERATORY[/bold]  –  {summary}", border_style="green")
+
+    # Są aktywne — tabela tylko z nimi
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True,
+                  header_style="bold white", expand=True)
+    table.add_column("OPERATOR",  style="cyan", min_width=35, no_wrap=True)
+    table.add_column("STATUS",    justify="center", min_width=12)
+    table.add_column("WIADOMOŚĆ", overflow="fold")
+
+    # Najpierw wiersz podsumowania OK (zwinięty)
+    if ok_count:
+        table.add_row(
+            f"[dim]✓ {ok_count} operatorów Available[/dim]",
+            "[dim green]OK[/dim green]",
+            "",
+        )
+        table.add_section()
+
+    for name, kind, msg in active_rows:
+        if kind == 'degraded':
+            table.add_row(name, "[bold red]DEGRADED[/bold red]", msg, style="on dark_red")
+        else:
+            table.add_row(name, "[bold yellow]PROGRESSING[/bold yellow]", msg, style="yellow")
+
+    border = "red" if any(r[1] == 'degraded' for r in active_rows) else "yellow"
     return Panel(table, title=f"[bold]OPERATORY[/bold]  –  {summary}", border_style=border)
 
 
@@ -709,20 +713,15 @@ def main():
         console.print("[dim]Zatrzymano.[/dim]")
 
     else:
-        # Tryb domyślny: Live bez przejmowania ekranu.
-        # Rich nadpisuje poprzedni render przesuwając kursor — zero migotania,
-        # zero blank-screen. Content jest przycinany do wysokości terminala.
+        # Tryb domyślny: clear + print co interval sekund.
+        # Między odświeżeniami terminal jest w pełni scrollowalny.
+        # Krótki flash przy odświeżeniu (raz na interval sekund) jest akceptowalny
+        # i znacznie lepszy niż migotanie co sekundę z Live(screen=False).
         try:
-            with Live(
-                collect_and_render(args.interval, args.all_nodes),
-                console=console,
-                screen=False,
-                refresh_per_second=1,
-                vertical_overflow="visible",
-            ) as live:
-                while True:
-                    time.sleep(args.interval)
-                    live.update(collect_and_render(args.interval, args.all_nodes))
+            while True:
+                console.clear()
+                console.print(collect_and_render(args.interval, args.all_nodes))
+                time.sleep(args.interval)
         except KeyboardInterrupt:
             console.print("\n[dim]Zatrzymano.[/dim]")
 
