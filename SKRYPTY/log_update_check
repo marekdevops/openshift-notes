@@ -709,14 +709,20 @@ def main():
         console.print("[dim]Zatrzymano.[/dim]")
 
     else:
-        # Tryb domyślny: clear + print (jak 'watch')
-        # Czyste zastąpienie ekranu bez przejmowania terminala.
-        # Content dłuższy niż ekran można scrollować — przy następnym odświeżeniu wraca na górę.
+        # Tryb domyślny: Live bez przejmowania ekranu.
+        # Rich nadpisuje poprzedni render przesuwając kursor — zero migotania,
+        # zero blank-screen. Content jest przycinany do wysokości terminala.
         try:
-            while True:
-                console.clear()
-                console.print(collect_and_render(args.interval, args.all_nodes))
-                time.sleep(args.interval)
+            with Live(
+                collect_and_render(args.interval, args.all_nodes),
+                console=console,
+                screen=False,
+                refresh_per_second=1,
+                vertical_overflow="visible",
+            ) as live:
+                while True:
+                    time.sleep(args.interval)
+                    live.update(collect_and_render(args.interval, args.all_nodes))
         except KeyboardInterrupt:
             console.print("\n[dim]Zatrzymano.[/dim]")
 
