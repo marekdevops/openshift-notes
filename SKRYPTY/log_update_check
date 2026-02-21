@@ -329,7 +329,27 @@ def build_mcp(mcp):
 # Sekcja 4: Nody
 # ---------------------------------------------------------------------------
 
-def build_nodes(nodes):
+def _node_mco_state(node):
+    """Zwraca (mco_state, is_done) dla noda."""
+    ann = node['metadata'].get('annotations', {})
+    mco_state   = ann.get('machineconfiguration.openshift.io/state', 'Done')
+    mco_desired = ann.get('machineconfiguration.openshift.io/desiredConfig', '')
+    mco_current = ann.get('machineconfiguration.openshift.io/currentConfig', '')
+    is_done = (
+        mco_state not in ('Working', 'Degraded')
+        and (not mco_desired or mco_desired == mco_current)
+    )
+    return mco_state, mco_desired, mco_current, is_done
+
+
+def _node_role(node):
+    lbl = node['metadata'].get('labels', {})
+    if 'node-role.kubernetes.io/master' in lbl: return 'master'
+    if 'node-role.kubernetes.io/infra'  in lbl: return 'infra'
+    return 'worker'
+
+
+def build_nodes(nodes, all_nodes=False):
     if not nodes:
         return Panel("[red]Brak danych Nodes[/red]",
                      title="NODY", border_style="red")
@@ -343,18 +363,35 @@ def build_nodes(nodes):
     table.add_column("MCO STATE",   justify="center", min_width=10)
     table.add_column("WERSJA OS",   style="dim", overflow="fold")
 
-    # Kolejność: master → infra → worker, potem alfabetycznie
     def sort_key(n):
-        lbl = n['metadata'].get('labels', {})
-        if 'node-role.kubernetes.io/master' in lbl: role_order = 0
-        elif 'node-role.kubernetes.io/infra' in lbl: role_order = 1
-        else: role_order = 2
-        return (role_order, n['metadata']['name'])
+        order = {'master': 0, 'infra': 1, 'worker': 2}
+        return (order.get(_node_role(n), 2), n['metadata']['name'])
 
-    for node in sorted(nodes.get('items', []), key=sort_key):
+    all_items = sorted(nodes.get('items', []), key=sort_key)
+    total     = len(all_items)
+    cordoned  = sum(1 for n in all_items if n.get('spec', {}).get('unschedulable', False))
+
+    # Rozdziel na aktywne (master/infra/problemowe) i zwinięte (worker Done)
+    show_rows   = []
+    hidden_done = []
+
+    for node in all_items:
+        role = _node_role(node)
+        mco_state, mco_desired, mco_current, is_done = _node_mco_state(node)
+        conds     = node.get('status', {}).get('conditions', [])
+        is_ready  = bool_cond(get_condition(conds, 'Ready').get('status'))
+        is_cord   = node.get('spec', {}).get('unschedulable', False)
+
+        # Zawsze pokazuj: master, infra, każdy nie-Done, każdy Not-Ready lub Cordoned
+        if all_nodes or role != 'worker' or not is_done or not is_ready or is_cord:
+            show_rows.append(node)
+        else:
+            hidden_done.append(node)
+
+    for node in show_rows:
         name  = node['metadata']['name']
         lbl   = node['metadata'].get('labels', {})
-        ann   = node['metadata'].get('annotations', {})
+        role  = _node_role(node)
 
         roles = []
         if 'node-role.kubernetes.io/master' in lbl: roles.append('master')
@@ -362,44 +399,48 @@ def build_nodes(nodes):
         if 'node-role.kubernetes.io/worker' in lbl: roles.append('worker')
         role_str = '/'.join(roles) or 'worker'
 
-        conds = node.get('status', {}).get('conditions', [])
-        ready_cond  = get_condition(conds, 'Ready')
-        is_ready    = bool_cond(ready_cond.get('status'))
-        ready_s     = "[green]✓ Ready[/green]"    if is_ready else "[red]✗ NotReady[/red]"
+        conds    = node.get('status', {}).get('conditions', [])
+        is_ready = bool_cond(get_condition(conds, 'Ready').get('status'))
+        ready_s  = "[green]✓ Ready[/green]" if is_ready else "[red]✗ NotReady[/red]"
 
         unschedulable = node.get('spec', {}).get('unschedulable', False)
         sched_s = "[yellow]Cordoned[/yellow]" if unschedulable else "[green]OK[/green]"
 
-        mco_state   = ann.get('machineconfiguration.openshift.io/state', 'Done')
-        mco_desired = ann.get('machineconfiguration.openshift.io/desiredConfig', '')
-        mco_current = ann.get('machineconfiguration.openshift.io/currentConfig', '')
+        mco_state, mco_desired, mco_current, is_done = _node_mco_state(node)
 
         if mco_state == 'Degraded':
-            mco_s = "[bold red]Degraded[/bold red]"
+            mco_s     = "[bold red]Degraded[/bold red]"
             row_style = "on dark_red"
         elif mco_state == 'Working':
-            mco_s = "[bold yellow]Working[/bold yellow]"
+            mco_s     = "[bold yellow]Working[/bold yellow]"
             row_style = ""
         elif mco_desired and mco_desired != mco_current:
-            mco_s = "[yellow]Pending[/yellow]"
+            mco_s     = "[yellow]Pending[/yellow]"
             row_style = ""
         else:
-            mco_s = "[green]Done[/green]"
+            mco_s     = "[green]Done[/green]"
             row_style = ""
 
         os_image = node.get('status', {}).get('nodeInfo', {}).get('osImage', 'N/A')
-        os_short = os_image[:40]
-
-        table.add_row(name, role_str, ready_s, sched_s, mco_s, os_short,
+        table.add_row(name, role_str, ready_s, sched_s, mco_s, os_image[:40],
                       style=row_style)
 
-    total = len(nodes.get('items', []))
-    cordoned = sum(1 for n in nodes.get('items', [])
-                   if n.get('spec', {}).get('unschedulable', False))
+    # Wiersz podsumowania dla zwiniętych workerów
+    if hidden_done:
+        table.add_row(
+            f"[dim]... {len(hidden_done)} worker nodes[/dim]",
+            "[dim]worker[/dim]",
+            "[dim]✓ Ready[/dim]",
+            "[dim]OK[/dim]",
+            "[dim green]Done (wszystkie)[/dim green]",
+            "[dim]ukryte — użyj --all-nodes[/dim]",
+        )
 
     summary = f"[bold]{total}[/bold] nodów"
     if cordoned:
-        summary += f"  |  [yellow]{cordoned} cordoned (drain/update)[/yellow]"
+        summary += f"  |  [yellow]{cordoned} cordoned[/yellow]"
+    if hidden_done:
+        summary += f"  |  [dim]{len(hidden_done)} worker Done (zwinięte)[/dim]"
 
     return Panel(table, title=f"[bold]NODY[/bold]  –  {summary}", border_style="blue")
 
@@ -540,7 +581,7 @@ def build_events(events_data):
 _last_refresh_ts = "nigdy"
 
 
-def collect_and_render(interval):
+def collect_and_render(interval, all_nodes=False):
     """Pobiera wszystkie dane z klastra i buduje kompletny widok."""
     global _last_refresh_ts
 
@@ -562,7 +603,7 @@ def collect_and_render(interval):
         build_header(cv),
         build_operators(co),
         build_mcp(mcp),
-        build_nodes(nodes),
+        build_nodes(nodes, all_nodes=all_nodes),
     ]
 
     # Sekcje opcjonalne — pojawiają się tylko gdy jest co pokazać
@@ -590,10 +631,16 @@ def main():
         epilog=(
             "Uruchamiaj jako użytkownik zalogowany przez 'oc login'.\n"
             "Wystarczą uprawnienia cluster-reader + dostęp do CSR.\n\n"
+            "Tryby odświeżania:\n"
+            "  (domyślny)   clear + print — czyste zastąpienie jak 'watch', można scrollować\n"
+            "  --screen     Rich full-screen — jak htop, content musi mieścić się w oknie\n"
+            "  --log        tryb append — każde odświeżenie dokłada na dół (do pipe/pliku)\n\n"
             "Przykłady:\n"
             "  ./log_update_check\n"
             "  ./log_update_check --interval 15\n"
-            "  ./log_update_check --no-screen    # tryb scroll (do pipe/logi)"
+            "  ./log_update_check --all-nodes\n"
+            "  ./log_update_check --screen\n"
+            "  ./log_update_check --log >> update.log"
         )
     )
     parser.add_argument(
@@ -604,9 +651,19 @@ def main():
         help='Interwał odświeżania w sekundach (domyślnie: 30)'
     )
     parser.add_argument(
-        '--no-screen',
+        '--screen',
         action='store_true',
-        help='Wyłącz tryb pełnoekranowy — dane drukowane sekwencyjnie (do logowania)'
+        help='Tryb Rich full-screen (jak htop) — content musi mieścić się w oknie terminala'
+    )
+    parser.add_argument(
+        '--log',
+        action='store_true',
+        help='Tryb append — każde odświeżenie dokłada na dół terminala (do logowania do pliku)'
+    )
+    parser.add_argument(
+        '--all-nodes',
+        action='store_true',
+        help='Pokaż wszystkie nody (domyślnie: worker Done są zwijane do jednej linii)'
     )
     args = parser.parse_args()
 
@@ -620,34 +677,48 @@ def main():
     server_out, _ = run_oc(['whoami', '--show-server'])
     server = (server_out or '').strip()
 
-    console.print(f"[green]✓[/green] Zalogowany jako: [cyan]{user}[/cyan]  |  Klaster: [cyan]{server}[/cyan]")
-    console.print(f"[dim]Interwał odświeżania: {args.interval}s  |  Ctrl+C aby wyjść[/dim]")
-    time.sleep(1)
+    if not args.screen:
+        console.print(f"[green]✓[/green] Zalogowany jako: [cyan]{user}[/cyan]  |  Klaster: [cyan]{server}[/cyan]")
+        console.print(f"[dim]Interwał: {args.interval}s  |  Ctrl+C aby wyjść[/dim]")
+        time.sleep(1)
 
-    if args.no_screen:
-        # Tryb sekwencyjny — przydatny do logowania do pliku
+    if args.log:
+        # Tryb append — przydatny do logowania do pliku
         try:
             while True:
-                console.print(collect_and_render(args.interval))
+                console.print(collect_and_render(args.interval, args.all_nodes))
                 console.rule()
                 time.sleep(args.interval)
         except KeyboardInterrupt:
             console.print("\n[dim]Zatrzymano.[/dim]")
-    else:
-        # Tryb pełnoekranowy — dashboard bez migotania
+
+    elif args.screen:
+        # Tryb Rich full-screen (stary domyślny) — content musi mieścić się w oknie
         try:
             with Live(
-                collect_and_render(args.interval),
+                collect_and_render(args.interval, args.all_nodes),
                 console=console,
                 screen=True,
                 refresh_per_second=1
             ) as live:
                 while True:
                     time.sleep(args.interval)
-                    live.update(collect_and_render(args.interval))
+                    live.update(collect_and_render(args.interval, args.all_nodes))
         except KeyboardInterrupt:
             pass
         console.print("[dim]Zatrzymano.[/dim]")
+
+    else:
+        # Tryb domyślny: clear + print (jak 'watch')
+        # Czyste zastąpienie ekranu bez przejmowania terminala.
+        # Content dłuższy niż ekran można scrollować — przy następnym odświeżeniu wraca na górę.
+        try:
+            while True:
+                console.clear()
+                console.print(collect_and_render(args.interval, args.all_nodes))
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Zatrzymano.[/dim]")
 
 
 if __name__ == '__main__':
