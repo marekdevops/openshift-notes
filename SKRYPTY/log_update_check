@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""
+log_update_check
+OpenShift Update Monitor — live dashboard procesu aktualizacji klastra.
+
+Agreguje dane z wielu komend oc i wyświetla czytelny panel odświeżany
+co N sekund (domyślnie 30). NIE wykonuje żadnych zmian w klastrze.
+
+Wymagania:
+    pip install rich
+
+Uruchomienie:
+    ./log_update_check                   # odświeżanie co 30s
+    ./log_update_check --interval 15     # odświeżanie co 15s
+    ./log_update_check --no-screen       # tryb bez pełnego ekranu (do logowania)
+"""
+
+import sys
+import json
+import time
+import argparse
+import subprocess
+from datetime import datetime, timezone
+
+try:
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.console import Console, Group
+    from rich.columns import Columns
+    from rich import box
+    from rich.rule import Rule
+    from rich.align import Align
+except ImportError:
+    print("BLAD: Wymagana biblioteka 'rich'.")
+    print("      Zainstaluj: pip install rich")
+    sys.exit(1)
+
+console = Console()
+
+# ---------------------------------------------------------------------------
+# Komunikacja z klastrem
+# ---------------------------------------------------------------------------
+
+def run_oc(args, timeout=20):
+    """Uruchamia polecenie oc. Zwraca (stdout, error_str)."""
+    try:
+        r = subprocess.run(
+            ['oc'] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        if r.returncode != 0:
+            return None, r.stderr.strip()
+        return r.stdout, None
+    except subprocess.TimeoutExpired:
+        return None, f"timeout ({timeout}s)"
+    except FileNotFoundError:
+        console.print("[red]BLAD: Nie znaleziono polecenia 'oc'. Sprawdź PATH.[/red]")
+        sys.exit(1)
+
+
+def get_json(args, timeout=20):
+    """Uruchamia oc i parsuje JSON. Zwraca dict lub None."""
+    stdout, err = run_oc(args, timeout=timeout)
+    if not stdout:
+        return None
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pomocnicze
+# ---------------------------------------------------------------------------
+
+def get_condition(conditions, cond_type):
+    """Zwraca condition słownik po typie lub {}."""
+    for c in (conditions or []):
+        if c.get('type') == cond_type:
+            return c
+    return {}
+
+
+def elapsed_since(iso_str):
+    """Czas od podanej daty ISO do teraz, format: Xh Ym Zs."""
+    if not iso_str:
+        return "N/A"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        delta = datetime.now(timezone.utc) - dt
+        total = int(delta.total_seconds())
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}h {m:02d}m {s:02d}s"
+    except Exception:
+        return "N/A"
+
+
+def bool_cond(status):
+    """Zwraca True/False z pola 'status' condition ('True'/'False')."""
+    return status == 'True'
+
+
+def progress_bar(done, total, width=16):
+    """Prosty pasek postępu ASCII."""
+    if total == 0:
+        return f"[{'─' * width}]  N/A"
+    pct = min(done / total, 1.0)
+    filled = int(pct * width)
+    bar = '█' * filled + '░' * (width - filled)
+    return f"[{bar}] {pct*100:5.1f}%  ({done}/{total})"
+
+
+def truncate(text, length=60):
+    if not text:
+        return ""
+    return text[:length] + ('…' if len(text) > length else '')
+
+
+# ---------------------------------------------------------------------------
+# Sekcja 1: Nagłówek — ClusterVersion
+# ---------------------------------------------------------------------------
+
+def build_header(cv):
+    if not cv:
+        return Panel("[red]Brak danych ClusterVersion — sprawdź połączenie[/red]",
+                     title="STATUS KLASTRA", border_style="red")
+
+    status = cv.get('status', {})
+    desired = status.get('desired', {})
+    history = status.get('history', [])
+
+    target_ver = desired.get('version', '?')
+    current_entry = history[0] if history else {}
+    current_ver = current_entry.get('version', '?')
+    current_state = current_entry.get('state', '')
+    started = current_entry.get('startedTime', '')
+    completed = current_entry.get('completionTime', '')
+
+    is_updating = current_state == 'Partial'
+    is_completed = current_state == 'Completed'
+
+    conds = status.get('conditions', [])
+    progressing = get_condition(conds, 'Progressing')
+    failing     = get_condition(conds, 'Failing')
+    available   = get_condition(conds, 'Available')
+
+    # Linia wersji
+    ver_text = Text()
+    ver_text.append(current_ver, style="bold cyan")
+    if is_updating:
+        ver_text.append("  ──►  ", style="dim yellow")
+        ver_text.append(target_ver, style="bold green")
+        status_badge = Text("  ⟳ AKTUALIZACJA W TOKU  ", style="bold black on yellow")
+    elif is_completed and current_ver == target_ver:
+        status_badge = Text("  ✓ ZAKTUALIZOWANY  ", style="bold black on green")
+    else:
+        status_badge = Text("  ● STABILNY  ", style="bold black on blue")
+
+    lines = []
+    lines.append(Text.assemble("Wersja: ", ver_text, "   ", status_badge))
+
+    if is_updating and started:
+        lines.append(Text(f"Czas aktualizacji: {elapsed_since(started)}", style="yellow"))
+    elif is_completed and completed:
+        lines.append(Text(f"Zakończono: {completed[:19].replace('T',' ')}  (trwało: {elapsed_since(started)})", style="green"))
+
+    if bool_cond(progressing.get('status')):
+        msg = truncate(progressing.get('message', ''), 100)
+        lines.append(Text(f"CVO: {msg}", style="yellow"))
+
+    if bool_cond(failing.get('status')):
+        msg = truncate(failing.get('message', ''), 100)
+        lines.append(Text(f"BŁĄD: {msg}", style="bold red"))
+
+    border = "yellow" if is_updating else ("green" if is_completed else "blue")
+    return Panel(Group(*lines), title="[bold]STATUS KLASTRA[/bold]", border_style=border)
+
+
+# ---------------------------------------------------------------------------
+# Sekcja 2: Cluster Operators
+# ---------------------------------------------------------------------------
+
+def build_operators(co):
+    if not co:
+        return Panel("[red]Brak danych ClusterOperators[/red]",
+                     title="OPERATORY", border_style="red")
+
+    items = co.get('items', [])
+    progressing_list = []
+    degraded_list = []
+    ok_count = 0
+
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True,
+                  header_style="bold white", expand=True)
+    table.add_column("OPERATOR", style="cyan", min_width=35, no_wrap=True)
+    table.add_column("AVAILABLE",   justify="center", min_width=10)
+    table.add_column("PROGRESSING", justify="center", min_width=12)
+    table.add_column("DEGRADED",    justify="center", min_width=10)
+    table.add_column("WIADOMOŚĆ", overflow="fold")
+
+    for op in sorted(items, key=lambda x: x['metadata']['name']):
+        name = op['metadata']['name']
+        conds = op.get('status', {}).get('conditions', [])
+
+        avail  = get_condition(conds, 'Available')
+        prog   = get_condition(conds, 'Progressing')
+        degrad = get_condition(conds, 'Degraded')
+
+        is_avail  = bool_cond(avail.get('status'))
+        is_prog   = bool_cond(prog.get('status'))
+        is_degrad = bool_cond(degrad.get('status'))
+
+        avail_s  = "[green]✓[/green]" if is_avail  else "[red]✗[/red]"
+        prog_s   = "[yellow]●[/yellow]" if is_prog  else "[dim]–[/dim]"
+        degrad_s = "[red]✗[/red]"      if is_degrad else "[dim]–[/dim]"
+
+        if is_degrad:
+            degraded_list.append(name)
+            msg = truncate(degrad.get('message', ''), 65)
+            style = "on dark_red"
+        elif is_prog:
+            progressing_list.append(name)
+            msg = truncate(prog.get('message', ''), 65)
+            style = "yellow"
+        else:
+            ok_count += 1
+            msg = ""
+            style = ""
+
+        table.add_row(name, avail_s, prog_s, degrad_s, msg, style=style)
+
+    summary = (
+        f"[bold]{len(items)}[/bold] operatorów  |  "
+        f"[green]OK: {ok_count}[/green]  |  "
+        f"[yellow]Progressing: {len(progressing_list)}[/yellow]  |  "
+        f"[red]Degraded: {len(degraded_list)}[/red]"
+    )
+    border = "red" if degraded_list else ("yellow" if progressing_list else "green")
+    return Panel(table, title=f"[bold]OPERATORY[/bold]  –  {summary}", border_style=border)
+
+
+# ---------------------------------------------------------------------------
+# Sekcja 3: MachineConfigPools
+# ---------------------------------------------------------------------------
+
+def build_mcp(mcp):
+    if not mcp:
+        return Panel("[red]Brak danych MachineConfigPools[/red]",
+                     title="MACHINE CONFIG POOLS", border_style="red")
+
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True,
+                  header_style="bold white", expand=True)
+    table.add_column("PULA",          style="cyan", min_width=10)
+    table.add_column("STATUS",        justify="center", min_width=12)
+    table.add_column("POSTĘP",        min_width=30)
+    table.add_column("READY",         justify="center")
+    table.add_column("UPDATED",       justify="center")
+    table.add_column("DEGRADED",      justify="center")
+    table.add_column("PAUSED",        justify="center")
+
+    any_updating = False
+    any_degraded = False
+
+    # Kolejność: master → infra → worker
+    ordered = sorted(
+        mcp.get('items', []),
+        key=lambda p: {'master': 0, 'infra': 1, 'worker': 2}.get(p['metadata']['name'], 3)
+    )
+
+    for pool in ordered:
+        name   = pool['metadata']['name']
+        status = pool.get('status', {})
+        spec   = pool.get('spec', {})
+
+        ready   = status.get('readyMachineCount', 0)
+        total   = status.get('machineCount', 0)
+        updated = status.get('updatedMachineCount', 0)
+        degraded= status.get('degradedMachineCount', 0)
+        paused  = spec.get('paused', False)
+
+        conds        = status.get('conditions', [])
+        is_updating  = bool_cond(get_condition(conds, 'MachineConfigPoolUpdating').get('status'))
+        is_updated   = bool_cond(get_condition(conds, 'MachineConfigPoolUpdated').get('status'))
+        is_degraded  = bool_cond(get_condition(conds, 'MachineConfigPoolDegraded').get('status'))
+
+        bar = progress_bar(updated, total)
+
+        if is_degraded:
+            status_str = "[bold red]DEGRADED[/bold red]"
+            row_style  = "on dark_red"
+            any_degraded = True
+        elif paused:
+            status_str = "[dim]PAUSED[/dim]"
+            row_style  = "dim"
+        elif is_updating:
+            status_str = "[bold yellow]UPDATING[/bold yellow]"
+            row_style  = ""
+            any_updating = True
+        elif is_updated:
+            status_str = "[bold green]UPDATED[/bold green]"
+            row_style  = ""
+        else:
+            status_str = "[dim]PENDING[/dim]"
+            row_style  = "dim"
+
+        table.add_row(
+            name,
+            status_str,
+            bar,
+            str(ready),
+            str(updated),
+            f"[red]{degraded}[/red]" if degraded > 0 else "0",
+            "[yellow]TAK[/yellow]" if paused else "nie",
+            style=row_style
+        )
+
+    border = "red" if any_degraded else ("yellow" if any_updating else "green")
+    return Panel(table,
+                 title="[bold]MACHINE CONFIG POOLS[/bold]  –  master / infra / worker",
+                 border_style=border)
+
+
+# ---------------------------------------------------------------------------
+# Sekcja 4: Nody
+# ---------------------------------------------------------------------------
+
+def build_nodes(nodes):
+    if not nodes:
+        return Panel("[red]Brak danych Nodes[/red]",
+                     title="NODY", border_style="red")
+
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True,
+                  header_style="bold white", expand=True)
+    table.add_column("NODE",        style="cyan", min_width=30, no_wrap=True)
+    table.add_column("ROLA",        justify="center", min_width=14)
+    table.add_column("READY",       justify="center", min_width=8)
+    table.add_column("SCHEDULABLE", justify="center", min_width=12)
+    table.add_column("MCO STATE",   justify="center", min_width=10)
+    table.add_column("WERSJA OS",   style="dim", overflow="fold")
+
+    # Kolejność: master → infra → worker, potem alfabetycznie
+    def sort_key(n):
+        lbl = n['metadata'].get('labels', {})
+        if 'node-role.kubernetes.io/master' in lbl: role_order = 0
+        elif 'node-role.kubernetes.io/infra' in lbl: role_order = 1
+        else: role_order = 2
+        return (role_order, n['metadata']['name'])
+
+    for node in sorted(nodes.get('items', []), key=sort_key):
+        name  = node['metadata']['name']
+        lbl   = node['metadata'].get('labels', {})
+        ann   = node['metadata'].get('annotations', {})
+
+        roles = []
+        if 'node-role.kubernetes.io/master' in lbl: roles.append('master')
+        if 'node-role.kubernetes.io/infra'  in lbl: roles.append('infra')
+        if 'node-role.kubernetes.io/worker' in lbl: roles.append('worker')
+        role_str = '/'.join(roles) or 'worker'
+
+        conds = node.get('status', {}).get('conditions', [])
+        ready_cond  = get_condition(conds, 'Ready')
+        is_ready    = bool_cond(ready_cond.get('status'))
+        ready_s     = "[green]✓ Ready[/green]"    if is_ready else "[red]✗ NotReady[/red]"
+
+        unschedulable = node.get('spec', {}).get('unschedulable', False)
+        sched_s = "[yellow]Cordoned[/yellow]" if unschedulable else "[green]OK[/green]"
+
+        mco_state   = ann.get('machineconfiguration.openshift.io/state', 'Done')
+        mco_desired = ann.get('machineconfiguration.openshift.io/desiredConfig', '')
+        mco_current = ann.get('machineconfiguration.openshift.io/currentConfig', '')
+
+        if mco_state == 'Degraded':
+            mco_s = "[bold red]Degraded[/bold red]"
+            row_style = "on dark_red"
+        elif mco_state == 'Working':
+            mco_s = "[bold yellow]Working[/bold yellow]"
+            row_style = ""
+        elif mco_desired and mco_desired != mco_current:
+            mco_s = "[yellow]Pending[/yellow]"
+            row_style = ""
+        else:
+            mco_s = "[green]Done[/green]"
+            row_style = ""
+
+        os_image = node.get('status', {}).get('nodeInfo', {}).get('osImage', 'N/A')
+        os_short = os_image[:40]
+
+        table.add_row(name, role_str, ready_s, sched_s, mco_s, os_short,
+                      style=row_style)
+
+    total = len(nodes.get('items', []))
+    cordoned = sum(1 for n in nodes.get('items', [])
+                   if n.get('spec', {}).get('unschedulable', False))
+
+    summary = f"[bold]{total}[/bold] nodów"
+    if cordoned:
+        summary += f"  |  [yellow]{cordoned} cordoned (drain/update)[/yellow]"
+
+    return Panel(table, title=f"[bold]NODY[/bold]  –  {summary}", border_style="blue")
+
+
+# ---------------------------------------------------------------------------
+# Sekcja 5: Pending CSR-y
+# ---------------------------------------------------------------------------
+
+def build_csrs(csr_data):
+    if not csr_data:
+        return None
+
+    pending = [
+        c for c in csr_data.get('items', [])
+        if not c.get('status', {}).get('conditions')
+    ]
+
+    if not pending:
+        return None  # nie pokazuj sekcji jeśli nie ma pending CSR
+
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+    table.add_column("NAZWA", style="cyan")
+    table.add_column("REQUESTER")
+    table.add_column("UŻYTKOWNIK")
+    table.add_column("WIEK")
+
+    for csr in pending[:10]:
+        name = csr['metadata']['name']
+        spec = csr.get('spec', {})
+        created = csr['metadata'].get('creationTimestamp', '')
+        age = elapsed_since(created)
+        requester = spec.get('signerName', '')
+        username  = spec.get('username', '')
+        table.add_row(name, requester, username, age)
+
+    return Panel(
+        table,
+        title=f"[bold red]⚠ PENDING CSR-Y ({len(pending)})[/bold red]  – mogą wymagać ręcznego zatwierdzenia",
+        border_style="red"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sekcja 6: Problematyczne pody (Error / CrashLoopBackOff)
+# ---------------------------------------------------------------------------
+
+def build_bad_pods(pods_data):
+    if not pods_data:
+        return None
+
+    BAD_PHASES    = {'Failed'}
+    BAD_REASONS   = {'CrashLoopBackOff', 'Error', 'OOMKilled', 'ImagePullBackOff', 'ErrImagePull'}
+    SYSTEM_PREFIX = ('openshift-', 'kube-')
+
+    bad = []
+    for pod in pods_data.get('items', []):
+        ns   = pod['metadata']['namespace']
+        name = pod['metadata']['name']
+
+        # tylko namespace'y systemowe OCP — aplikacyjne pomijamy
+        if not any(ns.startswith(p) for p in SYSTEM_PREFIX):
+            continue
+
+        phase = pod.get('status', {}).get('phase', '')
+        if phase in BAD_PHASES:
+            bad.append((ns, name, phase, ''))
+            continue
+
+        for cs in pod.get('status', {}).get('containerStatuses', []):
+            waiting = cs.get('state', {}).get('waiting', {})
+            reason  = waiting.get('reason', '')
+            if reason in BAD_REASONS:
+                bad.append((ns, name, phase, reason))
+                break
+
+    if not bad:
+        return None
+
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+    table.add_column("NAMESPACE", style="cyan", no_wrap=True)
+    table.add_column("POD", style="cyan", no_wrap=True)
+    table.add_column("PHASE")
+    table.add_column("REASON")
+
+    for ns, name, phase, reason in bad[:15]:
+        table.add_row(ns, name, phase, f"[red]{reason}[/red]" if reason else phase)
+
+    return Panel(
+        table,
+        title=f"[bold red]⚠ PROBLEMATYCZNE PODY W NAMESPACE'ACH SYSTEMOWYCH ({len(bad)})[/bold red]",
+        border_style="red"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sekcja 7: Ostatnie eventy z openshift-machine-config-operator
+# ---------------------------------------------------------------------------
+
+def build_events(events_data):
+    if not events_data:
+        return Panel("[dim]Brak eventów[/dim]",
+                     title="OSTATNIE ZDARZENIA (MCO)", border_style="dim")
+
+    items = sorted(
+        events_data.get('items', []),
+        key=lambda e: e.get('lastTimestamp') or e.get('eventTime') or '',
+        reverse=True
+    )[:10]
+
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+    table.add_column("CZAS",     style="dim", no_wrap=True, min_width=19)
+    table.add_column("TYP",      justify="center", min_width=8)
+    table.add_column("POWÓD",    min_width=14)
+    table.add_column("OBIEKT",   min_width=20)
+    table.add_column("WIADOMOŚĆ", overflow="fold")
+
+    for ev in items:
+        ev_type = ev.get('type', 'Normal')
+        reason  = ev.get('reason', '')
+        obj     = ev.get('involvedObject', {})
+        obj_str = f"{obj.get('kind','')}/{obj.get('name','')}"
+        msg     = truncate(ev.get('message', ''), 70)
+        ts_raw  = ev.get('lastTimestamp') or ev.get('eventTime') or ''
+        ts      = ts_raw[:19].replace('T', ' ')
+
+        type_s = f"[yellow]{ev_type}[/yellow]" if ev_type == 'Warning' else f"[dim]{ev_type}[/dim]"
+        table.add_row(ts, type_s, reason, obj_str, msg)
+
+    return Panel(table,
+                 title="[bold]OSTATNIE ZDARZENIA — openshift-machine-config-operator[/bold]",
+                 border_style="dim")
+
+
+# ---------------------------------------------------------------------------
+# Zbieranie danych + budowanie dashboardu
+# ---------------------------------------------------------------------------
+
+_last_refresh_ts = "nigdy"
+
+
+def collect_and_render(interval):
+    """Pobiera wszystkie dane z klastra i buduje kompletny widok."""
+    global _last_refresh_ts
+
+    cv      = get_json(['get', 'clusterversion', 'version', '-o', 'json'])
+    co      = get_json(['get', 'clusteroperators', '-o', 'json'])
+    mcp     = get_json(['get', 'mcp', '-o', 'json'])
+    nodes   = get_json(['get', 'nodes', '-o', 'json'])
+    events  = get_json(['get', 'events', '-n', 'openshift-machine-config-operator',
+                        '--sort-by=.lastTimestamp', '-o', 'json'])
+    csr     = get_json(['get', 'csr', '-o', 'json'])
+    pods    = get_json(['get', 'pods', '-A', '--field-selector=status.phase!=Running',
+                        '-o', 'json'], timeout=30)
+
+    _last_refresh_ts = datetime.now().strftime("%H:%M:%S")
+
+    sections = [
+        Rule(f"[dim] OpenShift Update Monitor  |  odświeżono: {_last_refresh_ts}"
+             f"  |  interwał: {interval}s  |  Ctrl+C aby wyjść [/dim]"),
+        build_header(cv),
+        build_operators(co),
+        build_mcp(mcp),
+        build_nodes(nodes),
+    ]
+
+    # Sekcje opcjonalne — pojawiają się tylko gdy jest co pokazać
+    csr_panel = build_csrs(csr)
+    if csr_panel:
+        sections.append(csr_panel)
+
+    bad_pods_panel = build_bad_pods(pods)
+    if bad_pods_panel:
+        sections.append(bad_pods_panel)
+
+    sections.append(build_events(events))
+
+    return Group(*sections)
+
+
+# ---------------------------------------------------------------------------
+# Główna pętla
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="OpenShift Update Monitor — live dashboard procesu aktualizacji",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Uruchamiaj jako użytkownik zalogowany przez 'oc login'.\n"
+            "Wystarczą uprawnienia cluster-reader + dostęp do CSR.\n\n"
+            "Przykłady:\n"
+            "  ./log_update_check\n"
+            "  ./log_update_check --interval 15\n"
+            "  ./log_update_check --no-screen    # tryb scroll (do pipe/logi)"
+        )
+    )
+    parser.add_argument(
+        '--interval', '-i',
+        type=int,
+        default=30,
+        metavar='SEKUNDY',
+        help='Interwał odświeżania w sekundach (domyślnie: 30)'
+    )
+    parser.add_argument(
+        '--no-screen',
+        action='store_true',
+        help='Wyłącz tryb pełnoekranowy — dane drukowane sekwencyjnie (do logowania)'
+    )
+    args = parser.parse_args()
+
+    # Weryfikacja połączenia
+    stdout, err = run_oc(['whoami'])
+    if err or not stdout:
+        console.print("[red]BLAD: Nie jesteś zalogowany. Wykonaj: oc login <server>[/red]")
+        sys.exit(1)
+
+    user = stdout.strip()
+    server_out, _ = run_oc(['whoami', '--show-server'])
+    server = (server_out or '').strip()
+
+    console.print(f"[green]✓[/green] Zalogowany jako: [cyan]{user}[/cyan]  |  Klaster: [cyan]{server}[/cyan]")
+    console.print(f"[dim]Interwał odświeżania: {args.interval}s  |  Ctrl+C aby wyjść[/dim]")
+    time.sleep(1)
+
+    if args.no_screen:
+        # Tryb sekwencyjny — przydatny do logowania do pliku
+        try:
+            while True:
+                console.print(collect_and_render(args.interval))
+                console.rule()
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Zatrzymano.[/dim]")
+    else:
+        # Tryb pełnoekranowy — dashboard bez migotania
+        try:
+            with Live(
+                collect_and_render(args.interval),
+                console=console,
+                screen=True,
+                refresh_per_second=1
+            ) as live:
+                while True:
+                    time.sleep(args.interval)
+                    live.update(collect_and_render(args.interval))
+        except KeyboardInterrupt:
+            pass
+        console.print("[dim]Zatrzymano.[/dim]")
+
+
+if __name__ == '__main__':
+    main()
