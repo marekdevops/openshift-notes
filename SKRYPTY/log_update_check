@@ -217,19 +217,24 @@ def build_operators(co):
         f"[red]✗ {len([r for r in active_rows if r[1]=='degraded'])} Degraded[/red]"
     )
 
+    total_ops = len(items)
+    bar_style = "green" if ok_count == total_ops else ("red" if any(r[1]=='degraded' for r in active_rows) else "yellow")
+    bar_line  = Text(f"  Postęp: {progress_bar(ok_count, total_ops, width=20)}  operatorów stabilnych", style=bar_style)
+
     # Gdy wszystko OK — minimalistyczny widok bez tabeli
     if not active_rows:
         body = Text(f"✓ Wszystkie {ok_count} operatorów Available i stabilnych", style="green")
-        return Panel(body, title=f"[bold]OPERATORY[/bold]  –  {summary}", border_style="green")
+        return Panel(Group(bar_line, body),
+                     title=f"[bold]OPERATORY[/bold]  –  {summary}", border_style="green")
 
-    # Są aktywne — tabela tylko z nimi
+    # Są aktywne — pasek + tabela tylko z aktywnymi
     table = Table(box=box.SIMPLE_HEAVY, show_header=True,
                   header_style="bold white", expand=True)
     table.add_column("OPERATOR",  style="cyan", min_width=35, no_wrap=True)
     table.add_column("STATUS",    justify="center", min_width=12)
     table.add_column("WIADOMOŚĆ", overflow="fold")
 
-    # Najpierw wiersz podsumowania OK (zwinięty)
+    # Wiersz podsumowania OK (zwinięty)
     if ok_count:
         table.add_row(
             f"[dim]✓ {ok_count} operatorów Available[/dim]",
@@ -245,7 +250,8 @@ def build_operators(co):
             table.add_row(name, "[bold yellow]PROGRESSING[/bold yellow]", msg, style="yellow")
 
     border = "red" if any(r[1] == 'degraded' for r in active_rows) else "yellow"
-    return Panel(table, title=f"[bold]OPERATORY[/bold]  –  {summary}", border_style=border)
+    return Panel(Group(bar_line, table),
+                 title=f"[bold]OPERATORY[/bold]  –  {summary}", border_style=border)
 
 
 # ---------------------------------------------------------------------------
@@ -444,13 +450,24 @@ def build_nodes(nodes, all_nodes=False):
             "[dim]ukryte — użyj --all-nodes[/dim]",
         )
 
+    # Liczba zaktualizowanych nodów = hidden_done + te z show_rows które są Done
+    done_count = len(hidden_done) + sum(
+        1 for n in show_rows if _node_mco_state(n)[3]
+    )
+    node_bar_style = "green" if done_count == total else "yellow"
+    node_bar_line  = Text(
+        f"  Postęp: {progress_bar(done_count, total, width=20)}  nodów zaktualizowanych",
+        style=node_bar_style
+    )
+
     summary = f"[bold]{total}[/bold] nodów"
     if cordoned:
         summary += f"  |  [yellow]{cordoned} cordoned[/yellow]"
     if hidden_done:
         summary += f"  |  [dim]{len(hidden_done)} worker Done (zwinięte)[/dim]"
 
-    return Panel(table, title=f"[bold]NODY[/bold]  –  {summary}", border_style="blue")
+    return Panel(Group(node_bar_line, table),
+                 title=f"[bold]NODY[/bold]  –  {summary}", border_style="blue")
 
 
 # ---------------------------------------------------------------------------
