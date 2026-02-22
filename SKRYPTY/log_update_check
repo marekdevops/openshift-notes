@@ -624,34 +624,27 @@ def collect_and_render(interval, all_nodes=False):
 
     _last_refresh_ts = datetime.now().strftime("%H:%M:%S")
 
-    # Prawdziwy postęp nodów: porównanie currentConfig noda z docelowym MC puli
-    # (mcp.spec.configuration.name). updatedMachineCount jest mylące przy Pending —
-    # pokazuje 43/43 bo nody mają stary config == stary desired, zanim MCO zacznie pushować nowy.
-    mcp_items = (mcp or {}).get('items', [])
-
-    # Mapa: nazwa puli → docelowy rendered MachineConfig (spec.configuration.name)
-    pool_target = {}
-    for pool in mcp_items:
-        pool_name   = pool['metadata']['name']
-        target_mc   = pool.get('spec', {}).get('configuration', {}).get('name', '')
-        pool_target[pool_name] = target_mc
-
-    # Dla każdego noda: sprawdź czy jego currentConfig == targetConfig jego puli
+    # Postęp nodów liczony z kondycji MCP — ta sama logika co tabela MCP (która jest poprawna).
+    # Zasada per pula:
+    #   MachineConfigPoolUpdated=True  → wszystkie nody puli zaktualizowane (machineCount)
+    #   MachineConfigPoolUpdating=True → część nodów (updatedMachineCount)
+    #   Pending (żadna z powyższych)   → 0 nodów zaktualizowanych
+    # Dzięki temu Pending pool nie fałszuje wyniku jak przy updatedMachineCount czy spec.configuration.name
+    mcp_items   = (mcp or {}).get('items', [])
     mcp_total   = 0
     mcp_updated = 0
-    for node in (nodes or {}).get('items', []):
-        ann          = node['metadata'].get('annotations', {})
-        current_cfg  = ann.get('machineconfiguration.openshift.io/currentConfig', '')
-        lbl          = node['metadata'].get('labels', {})
+    for pool in mcp_items:
+        machine_count  = pool.get('status', {}).get('machineCount', 0)
+        updated_count  = pool.get('status', {}).get('updatedMachineCount', 0)
+        conds          = pool.get('status', {}).get('conditions', [])
+        is_updated     = bool_cond(get_condition(conds, 'MachineConfigPoolUpdated').get('status'))
+        is_updating    = bool_cond(get_condition(conds, 'MachineConfigPoolUpdating').get('status'))
 
-        if   'node-role.kubernetes.io/master' in lbl: pool = 'master'
-        elif 'node-role.kubernetes.io/infra'  in lbl: pool = 'infra'
-        else:                                          pool = 'worker'
-
-        target_cfg = pool_target.get(pool, '')
-        mcp_total += 1
-        if target_cfg and current_cfg == target_cfg:
-            mcp_updated += 1
+        mcp_total += machine_count
+        if is_updated:
+            mcp_updated += machine_count   # cała pula gotowa
+        elif is_updating:
+            mcp_updated += updated_count   # pula w trakcie — częściowo
 
     sections = [
         Rule(f"[dim] OpenShift Update Monitor  |  odświeżono: {_last_refresh_ts}"
