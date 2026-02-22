@@ -365,6 +365,7 @@ def build_nodes(nodes, all_nodes=False):
     table.add_column("READY",       justify="center", min_width=8)
     table.add_column("SCHEDULABLE", justify="center", min_width=12)
     table.add_column("MCO STATE",   justify="center", min_width=10)
+    table.add_column("VERSION",     style="dim", min_width=18, no_wrap=True)
     table.add_column("WERSJA OS",   style="dim", overflow="fold")
 
     def sort_key(n):
@@ -425,9 +426,11 @@ def build_nodes(nodes, all_nodes=False):
             mco_s     = "[green]Done[/green]"
             row_style = ""
 
-        os_image = node.get('status', {}).get('nodeInfo', {}).get('osImage', 'N/A')
-        table.add_row(name, role_str, ready_s, sched_s, mco_s, os_image[:40],
-                      style=row_style)
+        node_info    = node.get('status', {}).get('nodeInfo', {})
+        kubelet_ver  = node_info.get('kubeletVersion', 'N/A')
+        os_image     = node_info.get('osImage', 'N/A')
+        table.add_row(name, role_str, ready_s, sched_s, mco_s,
+                      kubelet_ver, os_image[:35], style=row_style)
 
     # Wiersz podsumowania dla zwiniętych workerów
     if hidden_done:
@@ -437,6 +440,7 @@ def build_nodes(nodes, all_nodes=False):
             "[dim]✓ Ready[/dim]",
             "[dim]OK[/dim]",
             "[dim green]Done (wszystkie)[/dim green]",
+            "",
             "[dim]ukryte — użyj --all-nodes[/dim]",
         )
 
