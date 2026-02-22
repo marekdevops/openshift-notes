@@ -624,11 +624,34 @@ def collect_and_render(interval, all_nodes=False):
 
     _last_refresh_ts = datetime.now().strftime("%H:%M:%S")
 
-    # Sumy z MachineConfigPools — wiarygodne źródło postępu nodów
-    # updatedMachineCount = nody które mają już nowy MachineConfig (niezależnie od stanu Pending/Updating)
-    mcp_items    = (mcp or {}).get('items', [])
-    mcp_total    = sum(p.get('status', {}).get('machineCount', 0)    for p in mcp_items)
-    mcp_updated  = sum(p.get('status', {}).get('updatedMachineCount', 0) for p in mcp_items)
+    # Prawdziwy postęp nodów: porównanie currentConfig noda z docelowym MC puli
+    # (mcp.spec.configuration.name). updatedMachineCount jest mylące przy Pending —
+    # pokazuje 43/43 bo nody mają stary config == stary desired, zanim MCO zacznie pushować nowy.
+    mcp_items = (mcp or {}).get('items', [])
+
+    # Mapa: nazwa puli → docelowy rendered MachineConfig (spec.configuration.name)
+    pool_target = {}
+    for pool in mcp_items:
+        pool_name   = pool['metadata']['name']
+        target_mc   = pool.get('spec', {}).get('configuration', {}).get('name', '')
+        pool_target[pool_name] = target_mc
+
+    # Dla każdego noda: sprawdź czy jego currentConfig == targetConfig jego puli
+    mcp_total   = 0
+    mcp_updated = 0
+    for node in (nodes or {}).get('items', []):
+        ann          = node['metadata'].get('annotations', {})
+        current_cfg  = ann.get('machineconfiguration.openshift.io/currentConfig', '')
+        lbl          = node['metadata'].get('labels', {})
+
+        if   'node-role.kubernetes.io/master' in lbl: pool = 'master'
+        elif 'node-role.kubernetes.io/infra'  in lbl: pool = 'infra'
+        else:                                          pool = 'worker'
+
+        target_cfg = pool_target.get(pool, '')
+        mcp_total += 1
+        if target_cfg and current_cfg == target_cfg:
+            mcp_updated += 1
 
     sections = [
         Rule(f"[dim] OpenShift Update Monitor  |  odświeżono: {_last_refresh_ts}"
