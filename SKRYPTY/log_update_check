@@ -359,7 +359,7 @@ def _node_role(node):
     return 'worker'
 
 
-def build_nodes(nodes, all_nodes=False):
+def build_nodes(nodes, all_nodes=False, mcp_updated=None, mcp_total=None):
     if not nodes:
         return Panel("[red]Brak danych Nodes[/red]",
                      title="NODY", border_style="red")
@@ -450,21 +450,23 @@ def build_nodes(nodes, all_nodes=False):
             "[dim]ukryte — użyj --all-nodes[/dim]",
         )
 
-    # Liczba zaktualizowanych nodów = hidden_done + te z show_rows które są Done
-    done_count = len(hidden_done) + sum(
-        1 for n in show_rows if _node_mco_state(n)[3]
-    )
-    node_bar_style = "green" if done_count == total else "yellow"
-    node_bar_line  = Text(
-        f"  Postęp: {progress_bar(done_count, total, width=20)}  nodów zaktualizowanych",
-        style=node_bar_style
-    )
-
     summary = f"[bold]{total}[/bold] nodów"
     if cordoned:
         summary += f"  |  [yellow]{cordoned} cordoned[/yellow]"
     if hidden_done:
         summary += f"  |  [dim]{len(hidden_done)} worker Done (zwinięte)[/dim]"
+
+    # Pasek postępu — liczymy z danych MCP (updatedMachineCount) jeśli dostępne,
+    # bo MCO annotations na nodzie mogą być mylące gdy MCP jest w stanie Pending
+    # (stary currentConfig == desiredConfig wygląda jak Done, choć nowy nie dotarł)
+    if mcp_updated is not None and mcp_total is not None and mcp_total > 0:
+        node_bar_style = "green" if mcp_updated == mcp_total else "yellow"
+        node_bar_line  = Text(
+            f"  Postęp: {progress_bar(mcp_updated, mcp_total, width=20)}  nodów zaktualizowanych (wg MCP)",
+            style=node_bar_style
+        )
+    else:
+        node_bar_line = Text("  Postęp: N/A", style="dim")
 
     return Panel(Group(node_bar_line, table),
                  title=f"[bold]NODY[/bold]  –  {summary}", border_style="blue")
@@ -622,13 +624,19 @@ def collect_and_render(interval, all_nodes=False):
 
     _last_refresh_ts = datetime.now().strftime("%H:%M:%S")
 
+    # Sumy z MachineConfigPools — wiarygodne źródło postępu nodów
+    # updatedMachineCount = nody które mają już nowy MachineConfig (niezależnie od stanu Pending/Updating)
+    mcp_items    = (mcp or {}).get('items', [])
+    mcp_total    = sum(p.get('status', {}).get('machineCount', 0)    for p in mcp_items)
+    mcp_updated  = sum(p.get('status', {}).get('updatedMachineCount', 0) for p in mcp_items)
+
     sections = [
         Rule(f"[dim] OpenShift Update Monitor  |  odświeżono: {_last_refresh_ts}"
              f"  |  interwał: {interval}s  |  Ctrl+C aby wyjść [/dim]"),
         build_header(cv),
         build_operators(co),
         build_mcp(mcp),
-        build_nodes(nodes, all_nodes=all_nodes),
+        build_nodes(nodes, all_nodes=all_nodes, mcp_updated=mcp_updated, mcp_total=mcp_total),
     ]
 
     # Sekcje opcjonalne — pojawiają się tylko gdy jest co pokazać
