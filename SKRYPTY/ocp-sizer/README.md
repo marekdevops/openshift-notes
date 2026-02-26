@@ -14,6 +14,18 @@ pip install -e .
 ```bash
 # Analiza jednego namespace
 ocp-sizer my-namespace
+dnf install -y \
+    python3-kubernetes \
+    python3-jinja2 \
+    python3-requests \
+    python3-urllib3 \
+    python3-pyyaml \
+    python3-six \
+    python3-dateutil \
+    python3-certifi \
+    python3-oauthlib \
+    python3-google-auth \
+    python3-websocket-client
 
 # Analiza wielu namespace'ów + raport HTML
 ocp-sizer ns1 ns2 ns3 --html raport.html
