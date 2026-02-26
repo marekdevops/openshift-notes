@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from ..models.resources import ResourceSpec
 from ..models.workload import WorkloadInfo
-from ..models.sizing import NodeVariant, SizingVariant
+from ..models.sizing import NodeVariant, PeakMetrics, SizingVariant
 
 # Red Hat best practices — stałe
 SYSTEM_RESERVED_CPU_MC = 1000          # 1 CPU per node (OCP system overhead)
@@ -14,10 +14,13 @@ TARGET_UTILIZATION = 0.75              # 75% — środek przedziału 70-80%
 MIN_NODES = 3                          # minimum sensownego klastra
 
 DEFAULT_NODE_VARIANTS = [
-    NodeVariant(label="small",  cpu_cores=8,  memory_gib=32),
-    NodeVariant(label="medium", cpu_cores=16, memory_gib=64),
-    NodeVariant(label="large",  cpu_cores=32, memory_gib=128),
-    NodeVariant(label="xlarge", cpu_cores=48, memory_gib=192),
+    NodeVariant(label="small",      cpu_cores=8,  memory_gib=32),
+    NodeVariant(label="medium",     cpu_cores=16, memory_gib=64),
+    NodeVariant(label="large",      cpu_cores=32, memory_gib=128),
+    NodeVariant(label="xlarge",     cpu_cores=48, memory_gib=192),
+    NodeVariant(label="mem-large",  cpu_cores=32, memory_gib=512),
+    NodeVariant(label="mem-xlarge", cpu_cores=48, memory_gib=768),
+    NodeVariant(label="mem-2xl",    cpu_cores=64, memory_gib=1024),
 ]
 
 
@@ -31,12 +34,17 @@ class ClusterSizer:
         global_min_nodes_from_constraints: int,
         node_variants: list[NodeVariant] | None = None,
         target_utilization: float = TARGET_UTILIZATION,
+        peak_metrics: dict[str, PeakMetrics] | None = None,
     ):
         self.cluster_totals = cluster_totals
         self.daemonset_overhead = daemonset_overhead_per_node
         self.global_min_nodes = global_min_nodes_from_constraints
         self.node_variants = node_variants or DEFAULT_NODE_VARIANTS
         self.target_utilization = target_utilization
+        self.peak_metrics = peak_metrics or {}
+        # Efektywne totale (max requests vs peak) — ustawiane przez compute_all_variants()
+        self._effective_totals: ResourceSpec = cluster_totals
+        self._basis_label: str = "requests (brak Prometheus)"
 
     @staticmethod
     def compute_daemonset_overhead(daemonsets: list[WorkloadInfo]) -> ResourceSpec:
@@ -86,6 +94,9 @@ class ClusterSizer:
                 warnings=["Wariant nieużywalny"],
             )
 
+        # Informacja o podstawie obliczeń (requests vs peak)
+        reasoning.append(f"Podstawa obliczeń: {self._basis_label}")
+
         reasoning.append(
             f"Allocatable po odjęciu system ({SYSTEM_RESERVED_CPU_MC}m CPU, "
             f"{SYSTEM_RESERVED_MEM_BYTES // (1024**3)}GiB RAM) "
@@ -95,10 +106,10 @@ class ClusterSizer:
 
         # Ile node'ów potrzeba na zasoby (bez N+1)
         needed_for_cpu = math.ceil(
-            self.cluster_totals.cpu_millicores / self.target_utilization / alloc_cpu
+            self._effective_totals.cpu_millicores / self.target_utilization / alloc_cpu
         )
         needed_for_mem = math.ceil(
-            self.cluster_totals.memory_bytes / self.target_utilization / alloc_mem
+            self._effective_totals.memory_bytes / self.target_utilization / alloc_mem
         )
         needed_resources = max(needed_for_cpu, needed_for_mem)
 
@@ -130,8 +141,8 @@ class ClusterSizer:
 
         # Faktyczny utilization przy N node'ach (N-1 aktywnych podczas drain)
         active = n - 1
-        util_cpu = self.cluster_totals.cpu_millicores / (active * alloc_cpu)
-        util_mem = self.cluster_totals.memory_bytes / (active * alloc_mem)
+        util_cpu = self._effective_totals.cpu_millicores / (active * alloc_cpu)
+        util_mem = self._effective_totals.memory_bytes / (active * alloc_mem)
 
         reasoning.append(
             f"Utilization przy {n} node'ach ({active} aktywnych): "
@@ -161,6 +172,36 @@ class ClusterSizer:
 
     def compute_all_variants(self) -> list[SizingVariant]:
         """Oblicza sizing dla wszystkich wariantów i wybiera rekomendowany."""
+        # Wyznacz efektywne totale — max(requests, peak)
+        if self.peak_metrics:
+            total_peak_cpu = sum(p.peak_cpu_millicores for p in self.peak_metrics.values())
+            total_peak_mem = sum(p.peak_memory_bytes for p in self.peak_metrics.values())
+            eff_cpu = max(self.cluster_totals.cpu_millicores, total_peak_cpu)
+            eff_mem = max(self.cluster_totals.memory_bytes, total_peak_mem)
+            self._effective_totals = ResourceSpec(
+                cpu_millicores=eff_cpu,
+                memory_bytes=eff_mem,
+            )
+            # Etykieta informuje czy peak przewyższył requests
+            lookback = next(iter(self.peak_metrics.values())).lookback
+            if eff_cpu > self.cluster_totals.cpu_millicores or eff_mem > self.cluster_totals.memory_bytes:
+                self._basis_label = (
+                    f"peak (Prometheus {lookback}) — "
+                    f"CPU: {eff_cpu / 1000:.1f} cores, RAM: {eff_mem / (1024**3):.1f} GiB"
+                )
+            else:
+                self._basis_label = (
+                    f"requests (peak < requests) — "
+                    f"CPU: {eff_cpu / 1000:.1f} cores, RAM: {eff_mem / (1024**3):.1f} GiB"
+                )
+        else:
+            self._effective_totals = self.cluster_totals
+            self._basis_label = (
+                f"requests (brak Prometheus) — "
+                f"CPU: {self.cluster_totals.cpu_millicores / 1000:.1f} cores, "
+                f"RAM: {self.cluster_totals.memory_bytes / (1024**3):.1f} GiB"
+            )
+
         variants = [self.size_for_variant(v) for v in self.node_variants]
 
         # Rekomenduj wariant najbliższy target utilization (75%)

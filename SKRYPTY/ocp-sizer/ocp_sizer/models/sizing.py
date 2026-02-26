@@ -7,6 +7,17 @@ from .resources import ResourceSpec
 
 
 @dataclass
+class PeakMetrics:
+    """Historyczne maksimum zużycia zasobów dla namespace'a (z Prometheusa)."""
+
+    namespace: str
+    peak_cpu_millicores: int   # max z okresu lookback
+    peak_memory_bytes: int     # max z okresu lookback
+    lookback: str              # np. "7d"
+    source: str = "prometheus"
+
+
+@dataclass
 class NodeVariant:
     """Jeden wariant rozmiaru node'a (np. 16CPU / 64GiB)."""
 
@@ -47,6 +58,7 @@ class NamespaceSummary:
     pdb_min_nodes: int
     anti_affinity_min_nodes: int
     node_selectors: list[str]
+    peak_metrics: Optional[PeakMetrics] = None
 
 
 @dataclass
@@ -62,3 +74,5 @@ class ClusterSizing:
     source_cluster_context: str
     metrics_available: bool
     global_min_nodes_from_constraints: int
+    prometheus_available: bool = False
+    lookback: str = "7d"

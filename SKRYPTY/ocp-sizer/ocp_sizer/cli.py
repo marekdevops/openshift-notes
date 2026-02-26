@@ -5,8 +5,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from kubernetes import client as k8s_client
+
 from .utils.k8s_client import build_k8s_clients
 from .collector.pods import PodCollector
+from .collector.prometheus import PrometheusCollector
 from .collector.workloads import WorkloadCollector
 from .collector.quotas import QuotaCollector
 from .collector.policies import PolicyCollector
@@ -67,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Własne warianty node'ów: 'CPU:GiB,CPU:GiB,...' (np. '8:32,16:64')",
     )
+    parser.add_argument(
+        "--lookback",
+        default="7d",
+        metavar="DURATION",
+        help="Okres historyczny dla peak metrics z Prometheusa (np. 1d, 7d, 30d). Domyślnie: 7d",
+    )
     return parser
 
 
@@ -96,6 +105,8 @@ def main() -> None:
 
     # 1. Połączenie z klastrem
     core_v1, apps_v1, policy_v1, custom_api, context_name = build_k8s_clients()
+    # ApiClient tworzy się po load_kube_config() wywołanym przez build_k8s_clients()
+    api_client = k8s_client.ApiClient()
     namespaces = args.namespaces
 
     print(f"Łączę z klastrem: {context_name}")
@@ -126,6 +137,16 @@ def main() -> None:
         + (", metryki dostępne" if metrics_available else ", metryki niedostępne")
     )
 
+    # Peak metrics z Prometheusa (opcjonalne)
+    print(f"Sprawdzanie dostępności Prometheusa (lookback: {args.lookback})...")
+    prom_collector = PrometheusCollector(api_client, namespaces, args.lookback)
+    prometheus_available = prom_collector.is_available()
+    peak_metrics = prom_collector.collect_peak_metrics() if prometheus_available else {}
+    print(
+        "Prometheus: "
+        + (f"dostępny — pobrano peak metrics ({args.lookback})" if prometheus_available else "niedostępny — używam requests")
+    )
+
     # 3. Analiza constraints
     constraint_analyzer = ConstraintAnalyzer()
     pdbs = constraint_analyzer.analyze_pdbs(pdbs, workloads)
@@ -135,11 +156,12 @@ def main() -> None:
     aggregator = NamespaceAggregator(pods, quotas, pdbs, pod_metrics)
     ns_summaries = aggregator.aggregate(namespaces)
 
-    # Uzupełnij anti_affinity_min_nodes per namespace
+    # Uzupełnij anti_affinity_min_nodes i peak_metrics per namespace
     for summary in ns_summaries:
         summary.anti_affinity_min_nodes = constraint_analyzer.get_namespace_min_nodes(
             summary.namespace, pdbs, affinity_constraints
         )
+        summary.peak_metrics = peak_metrics.get(summary.namespace)
 
     cluster_req, cluster_lim = aggregator.compute_cluster_totals(ns_summaries)
 
@@ -164,6 +186,7 @@ def main() -> None:
         global_min_nodes_from_constraints=global_min_nodes,
         node_variants=node_variants,
         target_utilization=args.target_utilization,
+        peak_metrics=peak_metrics,
     )
     sizing_variants = sizer.compute_all_variants()
 
@@ -178,6 +201,8 @@ def main() -> None:
         source_cluster_context=context_name,
         metrics_available=metrics_available,
         global_min_nodes_from_constraints=global_min_nodes,
+        prometheus_available=prometheus_available,
+        lookback=args.lookback,
     )
 
     # 8. Output

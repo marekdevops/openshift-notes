@@ -27,12 +27,18 @@ class TerminalRenderer:
         self._render_warnings(sizing)
 
     def _render_header(self, sizing: ClusterSizing) -> None:
+        prom_status = (
+            f"[green]dostępne ({sizing.lookback})[/green]"
+            if sizing.prometheus_available
+            else "[dim]niedostępne[/dim]"
+        )
         content = (
             f"[bold]ocp-sizer[/bold]  |  "
             f"Cluster: [cyan]{sizing.source_cluster_context}[/cyan]\n"
             f"Wygenerowano: [dim]{sizing.generated_at}[/dim]  |  "
             f"Namespace'y: [yellow]{len(sizing.namespaces)}[/yellow]  |  "
-            f"Metrics: {'[green]dostępne[/green]' if sizing.metrics_available else '[dim]niedostępne[/dim]'}"
+            f"Metrics: {'[green]dostępne[/green]' if sizing.metrics_available else '[dim]niedostępne[/dim]'}  |  "
+            f"Prometheus: {prom_status}"
         )
         self.console.print(Panel(content, border_style="blue"))
 
@@ -47,6 +53,12 @@ class TerminalRenderer:
         table.add_column("Lim RAM", justify="right")
         table.add_column("Act CPU", justify="right")
         table.add_column("Act RAM", justify="right")
+
+        # Kolumny peak — tylko jeśli Prometheus dostępny
+        if sizing.prometheus_available:
+            table.add_column(f"Peak CPU\n({sizing.lookback})", justify="right")
+            table.add_column(f"Peak RAM\n({sizing.lookback})", justify="right")
+
         table.add_column("Nodes", justify="right")
         table.add_column("PDB\nmin", justify="right")
         table.add_column("AA\nmin", justify="right")
@@ -65,7 +77,7 @@ class TerminalRenderer:
             if len(ns.node_selectors) > 2:
                 selectors += f" +{len(ns.node_selectors)-2}"
 
-            table.add_row(
+            row = [
                 ns.namespace,
                 f"{ns.pod_count}/{ns.running_pod_count}",
                 fmt_cpu(ns.total_requests.cpu_millicores),
@@ -74,11 +86,24 @@ class TerminalRenderer:
                 fmt_mem(ns.total_limits.memory_bytes),
                 act_cpu,
                 act_mem,
+            ]
+
+            if sizing.prometheus_available:
+                if ns.peak_metrics:
+                    row.append(fmt_cpu(ns.peak_metrics.peak_cpu_millicores))
+                    row.append(fmt_mem(ns.peak_metrics.peak_memory_bytes))
+                else:
+                    row.append("-")
+                    row.append("-")
+
+            row.extend([
                 str(len(ns.active_nodes)),
                 str(ns.pdb_min_nodes) if ns.pdb_min_nodes else "-",
                 str(ns.anti_affinity_min_nodes) if ns.anti_affinity_min_nodes else "-",
                 selectors or "-",
-            )
+            ])
+
+            table.add_row(*row)
 
         self.console.print(table)
 
