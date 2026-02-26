@@ -1,8 +1,12 @@
 """Fabryka klientów Kubernetes — ładuje aktywny kubeconfig."""
 
 import sys
+import urllib3
 from kubernetes import client, config
 from kubernetes.config.config_exception import ConfigException
+
+# Wycisz ostrzeżenia o self-signed certach (typowe dla klastrów OpenShift dev)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def build_k8s_clients() -> tuple[
