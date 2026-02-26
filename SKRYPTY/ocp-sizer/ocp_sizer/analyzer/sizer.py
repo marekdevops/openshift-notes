@@ -18,6 +18,11 @@ DEFAULT_NODE_VARIANTS = [
     NodeVariant(label="medium",     cpu_cores=16, memory_gib=64),
     NodeVariant(label="large",      cpu_cores=32, memory_gib=128),
     NodeVariant(label="xlarge",     cpu_cores=48, memory_gib=192),
+    # Warstwa pośrednia 8 GiB/core (popularne konfiguracje serwerów fizycznych)
+    NodeVariant(label="mem-std-m",  cpu_cores=32, memory_gib=256),
+    NodeVariant(label="mem-std-l",  cpu_cores=48, memory_gib=384),
+    NodeVariant(label="mem-std-xl", cpu_cores=64, memory_gib=512),
+    # Warstwa 16 GiB/core — memory-intensive workloady (bazy danych, JVM, ML)
     NodeVariant(label="mem-large",  cpu_cores=32, memory_gib=512),
     NodeVariant(label="mem-xlarge", cpu_cores=48, memory_gib=768),
     NodeVariant(label="mem-2xl",    cpu_cores=64, memory_gib=1024),
