@@ -62,6 +62,24 @@ class NamespaceSummary:
 
 
 @dataclass
+class WorkerSizingOption:
+    """Opcja sizingu VM workerów dla konkretnej liczby node'ów.
+
+    Używana w trybie 'vm' — oblicza optymalny rozmiar VM workera
+    zamiast dobierać liczbę node'ów do stałych wariantów.
+    """
+
+    worker_count: int
+    cpu_per_worker_cores: int
+    mem_per_worker_gib: int
+    utilization_cpu_pct: float
+    utilization_mem_pct: float
+    driver: str
+    reasoning: list[str]
+    is_recommended: bool = False
+
+
+@dataclass
 class ClusterSizing:
     """Kompletny wynik analizy — dane wejściowe do renderera."""
 
@@ -69,10 +87,13 @@ class ClusterSizing:
     cluster_totals_requests: ResourceSpec
     cluster_totals_limits: ResourceSpec
     daemonset_overhead_per_node: ResourceSpec
-    sizing_variants: list[SizingVariant]
     generated_at: str
     source_cluster_context: str
     metrics_available: bool
     global_min_nodes_from_constraints: int
+    # Wyniki sizingu — jedno z dwóch, zależnie od sizing_mode
+    sizing_variants: list[SizingVariant] = field(default_factory=list)
+    worker_sizing_options: list[WorkerSizingOption] = field(default_factory=list)
+    sizing_mode: str = "vm"
     prometheus_available: bool = False
     lookback: str = "7d"

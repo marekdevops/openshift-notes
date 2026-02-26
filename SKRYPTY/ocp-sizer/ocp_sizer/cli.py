@@ -76,6 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DURATION",
         help="Okres historyczny dla peak metrics z Prometheusa (np. 1d, 7d, 30d). Domyślnie: 7d",
     )
+    parser.add_argument(
+        "--sizing-mode",
+        choices=["vm", "variants"],
+        default="vm",
+        help=(
+            "Tryb sizingu: "
+            "'vm' (domyślnie) — oblicza optymalny rozmiar VM workera dla zakresu liczby node'ów; "
+            "'variants' — klasyczna tabela stałych wariantów (small/medium/large/...)"
+        ),
+    )
     return parser
 
 
@@ -188,7 +198,14 @@ def main() -> None:
         target_utilization=args.target_utilization,
         peak_metrics=peak_metrics,
     )
-    sizing_variants = sizer.compute_all_variants()
+
+    sizing_mode = args.sizing_mode
+    if sizing_mode == "vm":
+        worker_sizing_options = sizer.compute_optimal_worker_sizes()
+        sizing_variants = []
+    else:
+        sizing_variants = sizer.compute_all_variants()
+        worker_sizing_options = []
 
     # 7. Wynik
     sizing = ClusterSizing(
@@ -196,11 +213,13 @@ def main() -> None:
         cluster_totals_requests=cluster_req,
         cluster_totals_limits=cluster_lim,
         daemonset_overhead_per_node=ds_overhead,
-        sizing_variants=sizing_variants,
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         source_cluster_context=context_name,
         metrics_available=metrics_available,
         global_min_nodes_from_constraints=global_min_nodes,
+        sizing_variants=sizing_variants,
+        worker_sizing_options=worker_sizing_options,
+        sizing_mode=sizing_mode,
         prometheus_available=prometheus_available,
         lookback=args.lookback,
     )

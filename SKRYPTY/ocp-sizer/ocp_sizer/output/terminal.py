@@ -8,7 +8,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich import box
 
-from ..models.sizing import ClusterSizing, NamespaceSummary, SizingVariant
+from ..models.sizing import ClusterSizing, NamespaceSummary, SizingVariant, WorkerSizingOption
 from ..utils.units import fmt_cpu, fmt_mem
 
 
@@ -23,7 +23,10 @@ class TerminalRenderer:
         self._render_namespace_table(sizing)
         self._render_cluster_totals(sizing)
         self._render_daemonset_overhead(sizing)
-        self._render_sizing_table(sizing)
+        if sizing.sizing_mode == "vm":
+            self._render_worker_sizing_table(sizing)
+        else:
+            self._render_sizing_table(sizing)
         self._render_warnings(sizing)
 
     def _render_header(self, sizing: ClusterSizing) -> None:
@@ -154,6 +157,55 @@ class TerminalRenderer:
         self.console.print(table)
         self.console.print("[dim][★] = rekomendowany wariant (najbliżej 75% target utilization)[/dim]")
 
+    def _render_worker_sizing_table(self, sizing: ClusterSizing) -> None:
+        """Tabela optymalnego sizingu VM workerów — tryb 'vm'."""
+        self.console.print("\n[bold]Optimal Worker VM Sizing[/bold]")
+        table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+        table.add_column("Workerów", justify="center")
+        table.add_column("CPU/worker", justify="right")
+        table.add_column("RAM/worker", justify="right")
+        table.add_column("CPU util\n(N-1 active)", justify="right")
+        table.add_column("RAM util\n(N-1 active)", justify="right")
+        table.add_column("Total CPU\n(klaster)", justify="right", style="dim")
+        table.add_column("Total RAM\n(klaster)", justify="right", style="dim")
+        table.add_column("Driver", style="dim")
+
+        for opt in sizing.worker_sizing_options:
+            label = (
+                f"[bold green][★] {opt.worker_count}[/bold green]"
+                if opt.is_recommended
+                else str(opt.worker_count)
+            )
+            cpu_col = (
+                f"[bold]{opt.cpu_per_worker_cores} cores[/bold]"
+                if opt.is_recommended
+                else f"{opt.cpu_per_worker_cores} cores"
+            )
+            mem_col = (
+                f"[bold]{opt.mem_per_worker_gib} GiB[/bold]"
+                if opt.is_recommended
+                else f"{opt.mem_per_worker_gib} GiB"
+            )
+            total_cpu = opt.cpu_per_worker_cores * opt.worker_count
+            total_mem = opt.mem_per_worker_gib * opt.worker_count
+
+            table.add_row(
+                label,
+                cpu_col,
+                mem_col,
+                self._colorize_pct(opt.utilization_cpu_pct),
+                self._colorize_pct(opt.utilization_mem_pct),
+                f"{total_cpu} cores",
+                f"{total_mem} GiB",
+                opt.driver,
+            )
+
+        self.console.print(table)
+        self.console.print(
+            "[dim][★] = rekomendowany wariant (max(CPU util, RAM util) najbliżej 75% target) — "
+            "CPU i RAM zaokrąglone w górę do całkowitych rdzeni/GiB[/dim]"
+        )
+
     def _render_warnings(self, sizing: ClusterSizing) -> None:
         all_warnings = []
         for v in sizing.sizing_variants:
@@ -164,6 +216,14 @@ class TerminalRenderer:
             self.console.print("\n[bold yellow]Ostrzeżenia:[/bold yellow]")
             for w in all_warnings:
                 self.console.print(f"  [yellow]⚠[/yellow]  {w}")
+
+        # Ostrzeżenia dla trybu vm
+        for opt in sizing.worker_sizing_options:
+            if opt.utilization_cpu_pct > 0.95 or opt.utilization_mem_pct > 0.95:
+                self.console.print(
+                    f"\n  [yellow]⚠[/yellow]  [{opt.worker_count} workerów] "
+                    "Wysokie utilization (>95%) — rozważ więcej node'ów"
+                )
 
     @staticmethod
     def _colorize_pct(pct: float) -> str:

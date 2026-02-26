@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from ..models.resources import ResourceSpec
 from ..models.workload import WorkloadInfo
-from ..models.sizing import NodeVariant, PeakMetrics, SizingVariant
+from ..models.sizing import NodeVariant, PeakMetrics, SizingVariant, WorkerSizingOption
 
 # Red Hat best practices — stałe
 SYSTEM_RESERVED_CPU_MC = 1000          # 1 CPU per node (OCP system overhead)
@@ -170,19 +170,14 @@ class ClusterSizer:
             warnings=warnings,
         )
 
-    def compute_all_variants(self) -> list[SizingVariant]:
-        """Oblicza sizing dla wszystkich wariantów i wybiera rekomendowany."""
-        # Wyznacz efektywne totale — max(requests, peak)
+    def _compute_effective_totals(self) -> None:
+        """Wyznacza efektywne totale — max(requests, peak). Ustawia _effective_totals i _basis_label."""
         if self.peak_metrics:
             total_peak_cpu = sum(p.peak_cpu_millicores for p in self.peak_metrics.values())
             total_peak_mem = sum(p.peak_memory_bytes for p in self.peak_metrics.values())
             eff_cpu = max(self.cluster_totals.cpu_millicores, total_peak_cpu)
             eff_mem = max(self.cluster_totals.memory_bytes, total_peak_mem)
-            self._effective_totals = ResourceSpec(
-                cpu_millicores=eff_cpu,
-                memory_bytes=eff_mem,
-            )
-            # Etykieta informuje czy peak przewyższył requests
+            self._effective_totals = ResourceSpec(cpu_millicores=eff_cpu, memory_bytes=eff_mem)
             lookback = next(iter(self.peak_metrics.values())).lookback
             if eff_cpu > self.cluster_totals.cpu_millicores or eff_mem > self.cluster_totals.memory_bytes:
                 self._basis_label = (
@@ -202,6 +197,10 @@ class ClusterSizer:
                 f"RAM: {self.cluster_totals.memory_bytes / (1024**3):.1f} GiB"
             )
 
+    def compute_all_variants(self) -> list[SizingVariant]:
+        """Oblicza sizing dla wszystkich wariantów i wybiera rekomendowany."""
+        self._compute_effective_totals()
+
         variants = [self.size_for_variant(v) for v in self.node_variants]
 
         # Rekomenduj wariant najbliższy target utilization (75%)
@@ -216,3 +215,103 @@ class ClusterSizer:
             best.is_recommended = True
 
         return variants
+
+    # ------------------------------------------------------------------
+    # Tryb VM: optymalny rozmiar VM workera dla zakresu liczby node'ów
+    # ------------------------------------------------------------------
+
+    def compute_optimal_worker_sizes(self, max_count: int | None = None) -> list[WorkerSizingOption]:
+        """Oblicza optymalny rozmiar VM workera dla zakresu liczby node'ów.
+
+        Zamiast dopasowywać liczbę node'ów do stałych wariantów,
+        dla każdej kandydującej liczby workerów oblicza dokładne
+        parametry VM (cores, GiB RAM) zapewniające docelowe utilization.
+
+        Args:
+            max_count: maksymalna liczba workerów do zbadania.
+                       Domyślnie min_count + 7.
+        """
+        self._compute_effective_totals()
+
+        min_count = max(self.global_min_nodes, MIN_NODES)
+        if max_count is None:
+            max_count = min_count + 7
+
+        options = [self._size_for_worker_count(n, min_count) for n in range(min_count, max_count + 1)]
+
+        # Rekomenduj opcję, której max(util_cpu, util_mem) jest najbliższy target
+        if options:
+            best = min(
+                options,
+                key=lambda o: abs(
+                    max(o.utilization_cpu_pct, o.utilization_mem_pct) - self.target_utilization
+                ),
+            )
+            best.is_recommended = True
+
+        return options
+
+    def _size_for_worker_count(self, n: int, min_count: int) -> WorkerSizingOption:
+        """Oblicza rozmiar VM workera dla dokładnie N node'ów."""
+        reasoning: list[str] = []
+
+        reasoning.append(f"Podstawa obliczeń: {self._basis_label}")
+
+        active = n - 1  # N+1: jeden node zawsze wolny do drainowania
+        reasoning.append(f"Przy {n} workerach — {active} aktywnych (N+1 dla drain/upgrade)")
+
+        # Ile allocatable potrzeba per node przy docelowym utilization
+        if active > 0 and self._effective_totals.cpu_millicores > 0:
+            cpu_alloc_needed = self._effective_totals.cpu_millicores / (active * self.target_utilization)
+            mem_alloc_needed = self._effective_totals.memory_bytes / (active * self.target_utilization)
+        else:
+            cpu_alloc_needed = 0.0
+            mem_alloc_needed = 0.0
+
+        # Dodaj system reserved i DaemonSet overhead → raw capacity per VM
+        cpu_raw = cpu_alloc_needed + SYSTEM_RESERVED_CPU_MC + self.daemonset_overhead.cpu_millicores
+        mem_raw = mem_alloc_needed + SYSTEM_RESERVED_MEM_BYTES + self.daemonset_overhead.memory_bytes
+
+        # Zaokrąglij w górę do całkowitych rdzeni / GiB
+        cpu_cores = max(math.ceil(cpu_raw / 1000), 4)    # minimum 4 cores (OCP worker)
+        mem_gib = max(math.ceil(mem_raw / (1024 ** 3)), 16)  # minimum 16 GiB
+
+        reasoning.append(
+            f"Wymagane allocatable per node (target {self.target_utilization*100:.0f}%): "
+            f"CPU {cpu_alloc_needed/1000:.1f} cores + overhead → raw {cpu_raw/1000:.1f} cores → {cpu_cores} cores"
+        )
+        reasoning.append(
+            f"RAM {mem_alloc_needed/(1024**3):.1f} GiB + overhead → raw {mem_raw/(1024**3):.1f} GiB → {mem_gib} GiB"
+        )
+
+        # Faktyczne allocatable po zaokrągleniu
+        alloc_cpu = cpu_cores * 1000 - SYSTEM_RESERVED_CPU_MC - self.daemonset_overhead.cpu_millicores
+        alloc_mem = mem_gib * (1024 ** 3) - SYSTEM_RESERVED_MEM_BYTES - self.daemonset_overhead.memory_bytes
+
+        # Faktyczny utilization
+        if alloc_cpu > 0 and alloc_mem > 0 and active > 0:
+            util_cpu = self._effective_totals.cpu_millicores / (active * alloc_cpu)
+            util_mem = self._effective_totals.memory_bytes / (active * alloc_mem)
+        else:
+            util_cpu = 0.0
+            util_mem = 0.0
+
+        reasoning.append(
+            f"Faktyczny utilization: CPU={util_cpu*100:.1f}%, RAM={util_mem*100:.1f}%"
+        )
+
+        # Driver: powód dlaczego nie można zejść poniżej min_count
+        if n == min_count:
+            driver = "pdb/anti-affinity" if self.global_min_nodes > MIN_NODES else "minimum"
+        else:
+            driver = "resources"
+
+        return WorkerSizingOption(
+            worker_count=n,
+            cpu_per_worker_cores=cpu_cores,
+            mem_per_worker_gib=mem_gib,
+            utilization_cpu_pct=util_cpu,
+            utilization_mem_pct=util_mem,
+            driver=driver,
+            reasoning=reasoning,
+        )
