@@ -1,5 +1,7 @@
 """Renderowanie raportu HTML przez Jinja2."""
 
+from __future__ import annotations
+
 from pathlib import Path
 from datetime import datetime
 from jinja2 import Environment, FileSystemLoader

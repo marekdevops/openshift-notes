@@ -1,5 +1,7 @@
 """Analiza PDB i anti-affinity — oblicza minimalną liczbę node'ów."""
 
+from __future__ import annotations
+
 import math
 from ..models.constraints import PDBInfo, AffinityConstraint
 from ..models.workload import WorkloadInfo

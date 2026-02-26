@@ -1,5 +1,7 @@
 """Renderowanie wyników w terminalu — rich tables + kolory."""
 
+from __future__ import annotations
+
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel

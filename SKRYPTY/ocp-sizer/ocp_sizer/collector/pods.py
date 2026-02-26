@@ -1,5 +1,7 @@
 """Kolekcja podów z K8s API — requests, limits, owner, affinity."""
 
+from __future__ import annotations
+
 from kubernetes import client
 from ..models.resources import ResourceSpec
 from ..models.workload import PodInfo

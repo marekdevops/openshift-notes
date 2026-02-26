@@ -1,5 +1,7 @@
 """Agregacja danych per namespace."""
 
+from __future__ import annotations
+
 from ..models.resources import ResourceSpec, ResourceUsage
 from ..models.workload import PodInfo
 from ..models.constraints import QuotaInfo, PDBInfo

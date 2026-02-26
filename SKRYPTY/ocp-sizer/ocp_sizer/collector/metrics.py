@@ -1,5 +1,7 @@
 """Kolekcja faktycznego zużycia z metrics-server (opcjonalna)."""
 
+from __future__ import annotations
+
 from kubernetes import client
 from ..models.resources import ResourceUsage
 from ..utils.units import parse_cpu, parse_memory

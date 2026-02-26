@@ -1,5 +1,7 @@
 """Główny algorytm sizingu klastra — N+1 z uwzględnieniem constraints."""
 
+from __future__ import annotations
+
 import math
 from ..models.resources import ResourceSpec
 from ..models.workload import WorkloadInfo

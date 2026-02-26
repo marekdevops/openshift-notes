@@ -1,6 +1,6 @@
 """Konwersja jednostek CPU i pamięci Kubernetes."""
 
-import re
+from __future__ import annotations
 
 
 def parse_cpu(value: str | None) -> int:
