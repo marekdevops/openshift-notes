@@ -46,3 +46,26 @@ for pod in $ROUTER_PODS; do
 done
 
 echo "--- Koniec przeszukiwania ---"
+
+
+#!/bin/bash
+
+DOMENA="TWOJA_DOMENA" # Wpisz fragment swojej domeny
+NAMESPACE="openshift-ingress"
+
+echo "🔍 Przeszukuję pody w $NAMESPACE dla domeny: $DOMENA"
+
+# Pobieramy czyste nazwy podów (bez przedrostka pod/)
+PODS=$(oc get pods -n $NAMESPACE --no-headers -o custom-columns=":metadata.name" | grep router-default)
+
+for p in $PODS; do
+    echo "--- Sprawdzam pod: $p ---"
+    
+    # Przeszukujemy ostatnie 10 000 linii, łącząc strumienie błędów i wyjścia (2>&1)
+    # Ignorujemy wielkość liter w grep (-i)
+    oc logs -n $NAMESPACE $p -c logs --tail=10000 2>&1 | grep -i "$DOMENA"
+    
+    if [ ${PIPESTATUS[1]} -ne 0 ]; then
+        echo "Brak wpisów w tym podzie."
+    fi
+done
