@@ -7,3 +7,6 @@ oc logs -n openshift-ingress -l ingresscontroller.operator.openshift.io/owning-i
 
   oc logs -f -n openshift-ingress -l ingresscontroller.operator.openshift.io/owning-ingresscontroller=default --since=10m \
   | grep "YOUR_DOMAIN_NAME"
+
+
+  oc logs -n openshift-ingress -l app=router --tail=100 | grep "TWOJA_DOMENA" | awk '$11 ~ /^5/ {print $0}'
