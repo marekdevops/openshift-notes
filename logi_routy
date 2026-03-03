@@ -20,3 +20,29 @@ done
 
 
 oc logs -f -n openshift-ingress -l ingresscontroller.operator.openshift.io/owning-ingresscontroller=default -c router | grep "TWOJA_DOMENA"
+
+
+oc logs -f -n openshift-ingress $(oc get pods -n openshift-ingress -o name | grep router-default) -c router | grep "TWOJA_DOMENA"
+
+oc get route <nazwa-routy> -n <twój-projekt> -o jsonpath='{.status.ingress[*].conditions[?(@.type=="Admitted")].status}'
+
+#!/bin/bash
+
+# Ustaw swoją domenę lub fragment nazwy routy
+DOMENA="MOJA_DOMENA"
+NAMESPACE="openshift-ingress"
+
+echo "--- Rozpoczynam przeszukiwanie wszystkich routerów dla: $DOMENA ---"
+
+# Pobranie listy wszystkich podów routera
+ROUTER_PODS=$(oc get pods -n $NAMESPACE -o name | grep router-default)
+
+for pod in $ROUTER_PODS; do
+    echo "Sprawdzam pod: $pod..."
+    
+    # Wyciągamy logi z kontenera 'logs' (używamy --tail, żeby nie czytać GB danych)
+    # Filtrujemy po domenie i szukamy błędów 5xx
+    oc logs -n $NAMESPACE $pod -c logs --tail=5000 | grep "$DOMENA" | awk '$11 ~ /^5/ {print "ZNALAZŁEM BŁĄD: " $0}'
+done
+
+echo "--- Koniec przeszukiwania ---"
