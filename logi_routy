@@ -12,7 +12,7 @@ oc logs -n openshift-ingress -l ingresscontroller.operator.openshift.io/owning-i
   oc logs -n openshift-ingress -l app=router --tail=100 | grep "TWOJA_DOMENA" | awk '$11 ~ /^5/ {print $0}'
 
 
-  for pod in $(oc get pods -n openshift-ingress -o name | grep router-default); do
+for pod in $(oc get pods -n openshift-ingress -o name | grep router-default); do
   echo "--- LOGI Z PODA: $pod ---"
   oc logs -n openshift-ingress $pod --tail=2000 | grep "TWOJA_DOMENA" | awk '$11 ~ /^5/ {print $0}'
 done
