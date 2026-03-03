@@ -1,0 +1,9 @@
+oc logs -n openshift-ingress -l ingresscontroller.operator.openshift.io/owning-ingresscontroller=default \
+  | grep "YOUR_DOMAIN_NAME" \
+  | awk '$11 ~ /^5/ {print $0}'
+
+  oc get pods -n openshift-ingress -l ingresscontroller.operator.openshift.io/owning-ingresscontroller=default
+
+
+  oc logs -f -n openshift-ingress -l ingresscontroller.operator.openshift.io/owning-ingresscontroller=default --since=10m \
+  | grep "YOUR_DOMAIN_NAME"
