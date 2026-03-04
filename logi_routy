@@ -69,3 +69,11 @@ for p in $PODS; do
         echo "Brak wpisów w tym podzie."
     fi
 done
+
+
+oc logs -f -n openshift-ingress -l ingresscontroller.operator.openshift.io/owning-ingresscontroller=default -c logs | grep "TWOJA_DOMENA"
+
+oc debug node/<nazwa-nody-gdzie-jest-aplikacja> # Lub po prostu:
+oc run debug-pod --image=curlimages/curl -i --tty --rm -- /bin/sh
+
+curl -v http://<nazwa-serwisu>:<port>
