@@ -77,3 +77,14 @@ oc debug node/<nazwa-nody-gdzie-jest-aplikacja> # Lub po prostu:
 oc run debug-pod --image=curlimages/curl -i --tty --rm -- /bin/sh
 
 curl -v http://<nazwa-serwisu>:<port>
+
+
+
+#######################
+# Znajdź wszystkie pody, których nazwa zaczyna się od "moja-app"
+PODS=$(oc get pods -o name | grep moja-app)
+
+for pod in $PODS; do
+    echo "--- Logi z $pod ---"
+    oc logs $pod --since-time="2026-03-05T13:00:00Z"
+done
