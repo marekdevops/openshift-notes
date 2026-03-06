@@ -88,3 +88,18 @@ for pod in $PODS; do
     echo "--- Logi z $pod ---"
     oc logs $pod --since-time="2026-03-05T13:00:00Z"
 done
+
+
+# Szukamy nazwy Twojego serwisu w logach systemowych wszystkich workerów
+for node in $(oc get nodes -l node-role.kubernetes.io/worker -o name); do
+  echo "--- Sprawdzam węzeł: $node ---"
+  oc adm node-logs $node --since=-24h | grep -i "NAZWA_TWOJEGO_SERWISU"
+done
+
+for node in $(oc get nodes -l node-role.kubernetes.io/worker -o name); do
+  echo "--- Sprawdzam błędy pamięci na: $node ---"
+  oc adm node-logs $node --unit=crio | grep -i "OOM"
+done
+
+
+oc adm node-logs <nazwa-workera> --unit=crio --since=-24h | grep "error"
