@@ -1,0 +1,81 @@
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: scc-custom-chroot
+allowPrivilegedContainer: false # Nie pozwalamy na pełny 'privileged'
+allowPrivilegeEscalation: true
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+allowedCapabilities:
+- SYS_CHROOT
+defaultAddCapabilities:
+- SYS_CHROOT
+fsGroup:
+  type: RunAsAny
+groups: []
+priority: null
+runAsUser:
+  type: RunAsAny # Pozwala na runAsUser: 0
+seLinuxContext:
+  type: MustRunAs
+supplementalGroups:
+  type: RunAsAny
+volumes:
+- configMap
+- downwardAPI
+- emptyDir
+- persistentVolumeClaim
+- projected
+- secret
+
+
+#################################################################
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-app-sa
+  namespace: <TWOJ-NAMESPACE>
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: use-custom-chroot-scc
+  namespace: <TWOJ-NAMESPACE>
+rules:
+- apiGroups: ["security.openshift.io"]
+  resources: ["securitycontextconstraints"]
+  resourceNames: ["scc-custom-chroot"]
+  verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bind-custom-chroot-scc
+  namespace: <TWOJ-NAMESPACE>
+subjects:
+- kind: ServiceAccount
+  name: my-app-sa
+  namespace: <TWOJ-NAMESPACE>
+roleRef:
+  kind: Role
+  name: use-custom-chroot-scc
+  apiGroup: rbac.authorization.k8s.
+
+
+
+
+spec:
+  template:
+    spec:
+      serviceAccountName: my-app-sa # <--- TO JEST KLUCZOWE
+      containers:
+      - name: ifdd-container
+        securityContext:
+          runAsUser: 0
+          capabilities:
+            add:
+              - SYS_CHROOT
