@@ -9,4 +9,65 @@ oc exec <pod-name> -n <namespace> -- sysctl \
   net.ipv4.tcp_fin_timeout
 
 # Czy keepalive jest w ogóle włączony
-oc exec <pod-name> -n <namespace> -- sysctl net.ipv4.tcp_keepalive_time
+oc exec <pod-name> -n <namespace> -- sysctl net.ipv4.
+
+
+
+
+####################################
+Aplikacja uruchomiona na platformie OpenShift posiada skonfigurowane następujące sondy Kubernetes:
+
+    • Liveness Probe – weryfikuje, czy kontener jest aktywny i odpowiada. W przypadku niepowodzenia Kubernetes restartuje pod.
+    • Readiness Probe – weryfikuje gotowość do obsługi ruchu sieciowego. W przypadku niepowodzenia pod jest usuwany z puli Service/LoadBalancer, ale nie jest restartowany.
+    Obie sondy wykorzystują mechanizm HTTP GET. Kubelet (agent węzła Kubernetes) wykonuje żądanie HTTP GET na wskazany endpoint aplikacji. Odpowiedź z kodem HTTP 2xx lub 3xx jest traktowana jako sukces; każdy inny kod lub brak odpowiedzi w limicie czasu – jako niepowodzenie.
+
+    oniższe wartości odpowiadają konfiguracji Deployment/DeploymentConfig w OpenShift. Wartości oznaczone jako domyślne są zgodne z dokumentacją Kubernetes i nie były zmieniane.
+
+Parametr
+Wartość
+initialDelaySeconds
+[WARTOŚĆ]  (domyślnie: 0 s)
+periodSeconds
+[WARTOŚĆ]  (domyślnie: 10 s)
+timeoutSeconds
+[WARTOŚĆ]  (domyślnie: 1 s)
+successThreshold
+[WARTOŚĆ]  (domyślnie: 1)
+failureThreshold
+[WARTOŚĆ]  (domyślnie: 3)
+
+
+Healthchecki OpenShift/Kubernetes nie obsługują bezpośrednio konceptów close/retry/reconnect w sensie sesji TCP – są to sondy infrastrukturalne, nie aplikacyjne. Zachowanie platformy przy niepowodzeniu jest deterministyczne:
+
+Scenariusz
+Działanie platformy
+Liveness Probe – failureThreshold przekroczony
+Kubernetes restartuje kontener (SIGTERM → SIGKILL po terminationGracePeriodSeconds). Nowa instancja kontenera nawiązuje połączenia od nowa.
+Readiness Probe – niepowodzenie
+Pod usuwany z Endpoints obiektu Service. Ruch przestaje być do niego kierowany. BRAK restartu. Powrót do puli po successThreshold kolejnych sukcesach.
+Mechanizm retry sondy
+Brak jawnego retry w jednej iteracji – każde wykonanie sondy jest niezależne. Tolerancja na chwilowe błędy realizowana jest przez parametr failureThreshold.
+Healthcheck Kubernetes operują na warstwie infrastruktury i nie mają wpływu na zarządzanie sesjami TCP aplikacji względem systemów zewnętrznych. Utrata połączenia z zewnętrznym interfejsem sieciowym jest poza zakresem działania tych mechanizmów.
+
+2.
+Kontenery na platformie OpenShift działają w środowisku Red Hat Enterprise Linux CoreOS (RHCOS). Parametry sieciowe TCP są dziedziczone z konfiguracji węzła (node), jeśli nie zostały jawnie nadpisane na poziomie poda poprzez securityContext lub inicjalizacyjny kontener uprzywilejowany.
+Mechanizm TCP keepalive jest aktywny w kernelu Linux (domyślnie włączony). Keepalive działa na poziomie stosu sieciowego jądra systemu – jest niezależny od aplikacji, o ile aplikacja nie wyłączy go jawnie na poziomie gniazda (SO_KEEPALIVE).
+Parametr sysctl
+Wartość
+net.ipv4.tcp_keepalive_time
+[WARTOŚĆ]  (domyślnie RHCOS/RHEL: 7200 s = 2 h)
+net.ipv4.tcp_keepalive_intvl
+[WARTOŚĆ]  (domyślnie: 75 s)
+net.ipv4.tcp_keepalive_probes
+[WARTOŚĆ]  (domyślnie: 9)
+Interpretacja wartości domyślnych: pierwsze keepalive zostanie wysłane po 2 godzinach bezczynności sesji, następnie co 75 sekund, maksymalnie 9 razy. Sesja zostanie uznana za zerwańą po łącznie ~2 h 11 min bez aktywności.
+
+
+Parametr sysctl
+Wartość
+net.ipv4.tcp_fin_timeout
+[WARTOŚĆ]  (domyślnie: 60 s)
+net.ipv4.tcp_retries2
+[WARTOŚĆ]  (domyślnie: 15, ≈ ~924 s do zerwania aktywnej sesji)
+net.ipv4.tcp_syn_retries
+[WARTOŚĆ]  (domyślnie: 6)
