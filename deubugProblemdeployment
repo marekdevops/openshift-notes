@@ -1,0 +1,12 @@
+# Wartości probe'ów
+oc get deployment <nazwa> -n <namespace> -o yaml | grep -A 20 "livenessProbe\|readinessProbe"
+
+# TCP keepalive i timeout na poziomie OS w podzie
+oc exec <pod-name> -n <namespace> -- sysctl \
+  net.ipv4.tcp_keepalive_time \
+  net.ipv4.tcp_keepalive_intvl \
+  net.ipv4.tcp_keepalive_probes \
+  net.ipv4.tcp_fin_timeout
+
+# Czy keepalive jest w ogóle włączony
+oc exec <pod-name> -n <namespace> -- sysctl net.ipv4.tcp_keepalive_time
