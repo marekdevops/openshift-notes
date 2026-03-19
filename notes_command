@@ -96,7 +96,4 @@ oc patch node worker1 --type='json' -p='[{"op": "replace", "path": "/spec/config
 oc get pods --all-namespaces --field-selector spec.nodeName=<NAZWA_NODA> -o custom-columns="NAME:.metadata.name,NAMESPACE:.metadata.namespace,MEM_REQ:.spec.containers[*].resources.requests.memory"
 oc describe node <node-name> | sed -n '/Non-terminated Pods:/,/Allocated resources:/p'
 
-oc get vmi -A -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.migrationState.status}{"\t"}{.status.migrationState.migrationPolicyName}{"\n"}{end}'
-oc get vimm -A -o jsonpath='{range .items[?(@.status.phase=="Running" || @.status.phase=="Pending")]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.spec.vmiName}{"\n"}{end}'
-oc get vimm -A -o jsonpath='{range .items[?(@.status.phase=="Pending")]}{"VM: "}{.spec.vmiName}{"\t"}{"Status: "}{.status.phase}{"\t"}{"Policy: "}{.status.migrationPolicyName}{"\n"}{end}'
-oc get vimm -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name,VM:.spec.vmiName,PHASE:.status.phase,POLICY:.status.migrationPolicyName" | grep -E "Pending|Running"
+oc get vmim -A -o jsonpath='{range .items[?(@.status.phase=="Running" || @.status.phase=="Pending")]}{.metadata.namespace}{"\t"}{.spec.vmiName}{"\t"}{.status.phase}{"\t"}{.status.migrationPolicyName}{"\n"}{end}'
