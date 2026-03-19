@@ -11,3 +11,5 @@ rules:
   verbs: ["get", "list", "watch"] # Pozwala podglądać wygenerowane sekrety
 
   oc adm policy add-role-to-user external-secrets-developer <USER_NAME> -n <MY_APP_PROJECT>
+
+  oc label clusterrole external-secrets-developer rbac.authorization.k8s.io/aggregate-to-edit="true"
