@@ -97,3 +97,4 @@ oc get pods --all-namespaces --field-selector spec.nodeName=<NAZWA_NODA> -o cust
 oc describe node <node-name> | sed -n '/Non-terminated Pods:/,/Allocated resources:/p'
 
 oc get vmim -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.spec.vmiName}{"\t"}{.status.phase}{"\t"}{.status.migrationPolicyName}{"\n"}{end}' | grep -E "Running|Pending"
+oc get vmim -A -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.namespace}{"\t"}{.spec.vmiName}{"\t"}{.status.phase}{"\t"}{.status.migrationPolicyName}{"\n"}{end}'
