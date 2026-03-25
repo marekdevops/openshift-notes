@@ -18,3 +18,32 @@ done
         - /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-ua-disk-kafka-UZUPELNIJ
         - /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-ua-disk-kafka-UZUPELNIJ
         - /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-ua-disk-kafka-UZUPELNIJ
+
+
+
+
+
+
+
+
+
+
+
+spec:
+  template:
+    pod:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kafka-node
+                operator: In
+                values:
+                - "true"
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/name: <kafka-cluster-name>-kafka
+              topologyKey: kubernetes.io/hostname
