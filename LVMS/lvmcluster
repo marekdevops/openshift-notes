@@ -1,0 +1,7 @@
+for node in <node1> <node2> <node3> <node4> <node7>; do
+  echo "=== $node ==="
+  oc debug node/$node -- chroot /host bash -c \
+    "ls -la /dev/disk/by-id/ | grep -v part"
+done
+
+
