@@ -5,3 +5,16 @@ for node in <node1> <node2> <node3> <node4> <node7>; do
 done
 
 
+- name: kafka-thick
+      nodeSelector:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kafka-node
+            operator: In
+            values: ["true"]
+      deviceSelector:
+        optionalPaths:
+        - /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-ua-disk-kafka-UZUPELNIJ
+        - /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-ua-disk-kafka-UZUPELNIJ
+        - /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-ua-disk-kafka-UZUPELNIJ
+        - /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-ua-disk-kafka-UZUPELNIJ
