@@ -1,2 +1,8 @@
 oc patch secret kubeadmin -n kube-system \                                                                                                                                                                                                           
     -p '{"data":{"kubeadmin":"'$(htpasswd -bnBC 10 "" "NoweHaslo123!" | tr -d ':\n' | base64)'"}}'   
+
+
+  oc patch secret kubeadmin -n kube-system \                                                                                                                                                                                                           
+    --type json \                                                                                                                                                                                                                                      
+    -p '[{"op":"replace","path":"/data/kubeadmin","value":"'$(echo -n 'HASH_TUTAJ' | base64)'"}]'
+                                                                                                         
