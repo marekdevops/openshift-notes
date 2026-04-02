@@ -6,3 +6,13 @@ oc patch secret kubeadmin -n kube-system \
     --type json \                                                                                                                                                                                                                                      
     -p '[{"op":"replace","path":"/data/kubeadmin","value":"'$(echo -n 'HASH_TUTAJ' | base64)'"}]'
                                                                                                          
+
+  oc patch secret kubeadmin -n kube-system \                                                                                                                                                                                                           
+    --type json \                                                                                                                                                                                                                                      
+    -p '[{"op":"replace","path":"/data/kubeadmin","value":"'$(echo -n 'HASH_TUTAJ' | base64)'"}]'
+                                                                                                         
+
+python3 -c "                                              
+  import crypt                                                                                                                                                                                                                                         
+  print(crypt.crypt('NoweHaslo123!', crypt.mksalt(crypt.METHOD_BLOWFISH)))
+  "
