@@ -16,3 +16,18 @@ python3 -c "
   import crypt                                                                                                                                                                                                                                         
   print(crypt.crypt('NoweHaslo123!', crypt.mksalt(crypt.METHOD_BLOWFISH)))
   "
+
+# Krok 1: wygeneruj hash                                                                                                                                                                                                                             
+  HASH=$(python3 -c "import crypt; print(crypt.crypt('NoweHaslo123!', crypt.mksalt(crypt.METHOD_BLOWFISH)))")                                                                                                                                          
+                                                                                                                                                                                                                                                       
+  # Krok 2: zakoduj base64                                                                                                                                                                                                                             
+  HASH_B64=$(echo -n "$HASH" | base64 -w 0)                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                       
+  # Krok 3: sprawdz czy wyglada sensownie                                                                                                                                                                                                              
+  echo $HASH_B64                                            
+                                                                                                                                                                                                                                                       
+  # Krok 4: patch                                                                                                                                                                                                                                      
+  oc patch secret kubeadmin -n kube-system \
+    --type=merge \                                                                                                                                                                                                                                     
+    -p "{\"data\":{\"kubeadmin\":\"${HASH_B64}\"}}"         
+
