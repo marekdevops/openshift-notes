@@ -8,12 +8,16 @@ Użycie:
   python3 virt_overcommit.py --namespace produkcja
   python3 virt_overcommit.py --node worker-03
   python3 virt_overcommit.py --warn-cpu 80 --warn-mem 90
+  python3 virt_overcommit.py --html raport.html
+  python3 virt_overcommit.py --html raport.html --warn-mem 85
 """
 
 import subprocess
 import json
 import sys
 import argparse
+import datetime
+import os
 from collections import defaultdict
 
 
@@ -340,6 +344,546 @@ def print_overcommit_warnings(node_data, nodes, warn_cpu, warn_mem):
     print_separator()
 
 
+# ── HTML Report ──────────────────────────────────────────────────────────────
+def pct_class(pct, warn, crit=100):
+    if pct >= crit:
+        return "crit"
+    elif pct >= warn:
+        return "warn"
+    return "ok"
+
+
+def bar_html(pct, warn, crit=100):
+    cls   = pct_class(pct, warn, crit)
+    width = min(pct, 100)
+    return (
+        f'<div class="bar-wrap">'
+        f'<div class="bar {cls}" style="width:{width:.1f}%"></div>'
+        f'</div>'
+        f'<span class="pct {cls}">{pct:.1f}%</span>'
+    )
+
+
+def node_status_badge(ni):
+    if not ni:
+        return '<span class="badge unknown">unknown</span>'
+    if not ni["ready"]:
+        return '<span class="badge notready">NotReady</span>'
+    if ni["unschedulable"]:
+        return '<span class="badge unschedulable">Unschedulable</span>'
+    return '<span class="badge ready">Ready</span>'
+
+
+def phase_badge(phase):
+    cls = "running" if phase == "Running" else "other"
+    return f'<span class="badge {cls}">{phase}</span>'
+
+
+def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem, filter_node, filter_ns):
+    now       = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    all_nodes = sorted(set(nodes.keys()) | set(node_data.keys()))
+
+    # ── summary cards ─────────────────────────────────────────────────────────
+    total_vms   = sum(len(nd["vms"]) for nd in node_data.values())
+    total_nodes = len(nodes)
+    warn_nodes  = []
+    for nn in all_nodes:
+        nd = node_data.get(nn, {"cpu_m": 0, "mem_mib": 0, "vms": []})
+        ni = nodes.get(nn)
+        if not ni:
+            continue
+        cpu_pct = (nd["cpu_m"]   / ni["allocatable_cpu_m"]  * 100) if ni["allocatable_cpu_m"]  > 0 else 0
+        mem_pct = (nd["mem_mib"] / ni["allocatable_mem_mib"] * 100) if ni["allocatable_mem_mib"] > 0 else 0
+        if cpu_pct >= warn_cpu or mem_pct >= warn_mem:
+            warn_nodes.append(nn)
+
+    summary_cards = f"""
+    <div class="cards">
+      <div class="card"><div class="card-val">{total_nodes}</div><div class="card-lbl">Worker nodes</div></div>
+      <div class="card"><div class="card-val">{total_vms}</div><div class="card-lbl">VM instancji</div></div>
+      <div class="card {'card--warn' if warn_nodes else ''}">
+        <div class="card-val {'warn-text' if warn_nodes else 'ok-text'}">{len(warn_nodes)}</div>
+        <div class="card-lbl">Nodów z overcommit</div>
+      </div>
+      <div class="card"><div class="card-val">{warn_cpu:.0f}% / {warn_mem:.0f}%</div><div class="card-lbl">Próg CPU / MEM</div></div>
+    </div>"""
+
+    # ── per-node table ─────────────────────────────────────────────────────────
+    node_rows = ""
+    for node_name in all_nodes:
+        nd = node_data.get(node_name, {"cpu_m": 0, "mem_mib": 0, "vms": []})
+        ni = nodes.get(node_name)
+
+        if not ni:
+            node_rows += f"""
+            <tr class="node-row">
+              <td class="node-name">{node_name}</td>
+              <td>{node_status_badge(None)}</td>
+              <td>{len(nd['vms'])}</td>
+              <td>{fmt_cpu(nd['cpu_m'])}</td><td>—</td><td colspan="2">—</td>
+              <td>{fmt_mib(nd['mem_mib'])}</td><td>—</td><td colspan="2">—</td>
+            </tr>"""
+            continue
+
+        alloc_cpu = ni["allocatable_cpu_m"]
+        alloc_mem = ni["allocatable_mem_mib"]
+        cpu_pct   = (nd["cpu_m"]   / alloc_cpu  * 100) if alloc_cpu  > 0 else 0
+        mem_pct   = (nd["mem_mib"] / alloc_mem * 100) if alloc_mem > 0 else 0
+        row_cls   = "node-row warn-row" if (cpu_pct >= warn_cpu or mem_pct >= warn_mem) else "node-row"
+
+        # VM sub-rows
+        vm_rows = ""
+        for vmi in sorted(nd["vms"], key=lambda x: x["mem_mib"], reverse=True):
+            vm_rows += f"""
+            <tr class="vm-row">
+              <td colspan="2" class="vm-indent">
+                <span class="vm-ns">{vmi['namespace']}</span>
+                <span class="vm-name">{vmi['name']}</span>
+              </td>
+              <td>{phase_badge(vmi['phase'])}</td>
+              <td>{fmt_cpu(vmi['cpu_m'])}</td><td>—</td><td colspan="2"></td>
+              <td>{fmt_mib(vmi['mem_mib'])}</td><td>—</td><td colspan="2"></td>
+            </tr>"""
+
+        node_rows += f"""
+        <tr class="{row_cls}" onclick="toggleVMs(this)">
+          <td class="node-name">
+            <span class="chevron">▶</span> {node_name}
+          </td>
+          <td>{node_status_badge(ni)}</td>
+          <td>{len(nd['vms'])}</td>
+          <td>{fmt_cpu(nd['cpu_m'])}</td>
+          <td>{fmt_cpu(alloc_cpu)}</td>
+          <td>{bar_html(cpu_pct, warn_cpu)}</td>
+          <td class="pct-cell {pct_class(cpu_pct, warn_cpu)}">{cpu_pct:.1f}%</td>
+          <td>{fmt_mib(nd['mem_mib'])}</td>
+          <td>{fmt_mib(alloc_mem)}</td>
+          <td>{bar_html(mem_pct, warn_mem)}</td>
+          <td class="pct-cell {pct_class(mem_pct, warn_mem)}">{mem_pct:.1f}%</td>
+        </tr>
+        <tr class="vm-group hidden"><td colspan="11"><table class="vm-table">{vm_rows}</table></td></tr>"""
+
+    # ── per-namespace table ────────────────────────────────────────────────────
+    ns_rows      = ""
+    total_ns_cpu = 0.0
+    total_ns_mem = 0.0
+    for ns in sorted(ns_data.keys()):
+        nd = ns_data[ns]
+        total_ns_cpu += nd["cpu_m"]
+        total_ns_mem += nd["mem_mib"]
+        vm_rows = ""
+        for vmi in sorted(nd["vms"], key=lambda x: x["mem_mib"], reverse=True):
+            node_txt = vmi["node"] if vmi["node"] != "<unscheduled>" else "⚠ unscheduled"
+            vm_rows += f"""
+            <tr class="vm-row">
+              <td class="vm-indent"><span class="vm-name">{vmi['name']}</span></td>
+              <td>{phase_badge(vmi['phase'])}</td>
+              <td>{fmt_cpu(vmi['cpu_m'])}</td>
+              <td>{fmt_mib(vmi['mem_mib'])}</td>
+              <td class="vm-node">{node_txt}</td>
+            </tr>"""
+
+        ns_rows += f"""
+        <tr class="node-row" onclick="toggleVMs(this)">
+          <td class="node-name"><span class="chevron">▶</span> {ns}</td>
+          <td>{len(nd['vms'])}</td>
+          <td>{fmt_cpu(nd['cpu_m'])}</td>
+          <td>{fmt_mib(nd['mem_mib'])}</td>
+        </tr>
+        <tr class="vm-group hidden"><td colspan="4"><table class="vm-table">{vm_rows}</table></td></tr>"""
+
+    ns_rows += f"""
+    <tr class="total-row">
+      <td>TOTAL</td>
+      <td>{sum(len(nd['vms']) for nd in ns_data.values())}</td>
+      <td>{fmt_cpu(total_ns_cpu)}</td>
+      <td>{fmt_mib(total_ns_mem)}</td>
+    </tr>"""
+
+    # ── full HTML ──────────────────────────────────────────────────────────────
+    filter_info = ""
+    if filter_node:
+        filter_info += f'<span class="filter-tag">node: {filter_node}</span>'
+    if filter_ns:
+        filter_info += f'<span class="filter-tag">namespace: {filter_ns}</span>'
+
+    return f"""<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OCP Virt Overcommit Report</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@300;400;500;600&display=swap');
+
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  :root {{
+    --bg:        #0d1117;
+    --bg2:       #161b22;
+    --bg3:       #1c2128;
+    --border:    #30363d;
+    --border2:   #21262d;
+    --text:      #e6edf3;
+    --muted:     #7d8590;
+    --ok:        #3fb950;
+    --warn:      #d29922;
+    --crit:      #f85149;
+    --accent:    #388bfd;
+    --accent2:   #1f6feb;
+    --node-bg:   #161b22;
+    --vm-bg:     #0d1117;
+    --mono:      'JetBrains Mono', monospace;
+    --sans:      'Inter', system-ui, sans-serif;
+  }}
+
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.5;
+    min-height: 100vh;
+  }}
+
+  /* ── Header ── */
+  header {{
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 20px 32px 16px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+  }}
+  .header-left h1 {{
+    font-family: var(--mono);
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: -0.3px;
+  }}
+  .header-left h1 span {{ color: var(--muted); }}
+  .header-meta {{
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }}
+  .filter-tag {{
+    display: inline-block;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    margin-left: 8px;
+  }}
+  .legend {{
+    display: flex;
+    gap: 16px;
+    font-size: 11px;
+    color: var(--muted);
+    align-items: center;
+    flex-shrink: 0;
+  }}
+  .legend-dot {{
+    width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px;
+  }}
+
+  /* ── Summary cards ── */
+  .cards {{
+    display: flex;
+    gap: 12px;
+    padding: 20px 32px;
+    border-bottom: 1px solid var(--border2);
+  }}
+  .card {{
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 20px;
+    min-width: 130px;
+  }}
+  .card--warn {{ border-color: var(--warn); }}
+  .card-val {{
+    font-family: var(--mono);
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1.2;
+  }}
+  .card-lbl {{ font-size: 11px; color: var(--muted); margin-top: 2px; }}
+  .ok-text   {{ color: var(--ok); }}
+  .warn-text {{ color: var(--warn); }}
+  .crit-text {{ color: var(--crit); }}
+
+  /* ── Section ── */
+  .section {{ padding: 24px 32px; }}
+  .section + .section {{ border-top: 1px solid var(--border2); }}
+  .section-title {{
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 14px;
+  }}
+
+  /* ── Tables ── */
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }}
+  th {{
+    background: var(--bg3);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }}
+  td {{ padding: 7px 12px; border-bottom: 1px solid var(--border2); vertical-align: middle; }}
+
+  .node-row {{
+    background: var(--node-bg);
+    cursor: pointer;
+    transition: background 0.15s;
+  }}
+  .node-row:hover {{ background: var(--bg3); }}
+  .warn-row {{ border-left: 3px solid var(--warn); }}
+  .node-name {{
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+  }}
+  .chevron {{
+    display: inline-block;
+    font-size: 9px;
+    color: var(--muted);
+    margin-right: 6px;
+    transition: transform 0.2s;
+  }}
+  .node-row.open .chevron {{ transform: rotate(90deg); }}
+
+  .vm-group {{ background: var(--vm-bg); }}
+  .vm-group.hidden {{ display: none; }}
+  .vm-table {{ margin: 4px 0 4px 24px; width: calc(100% - 24px); }}
+  .vm-table td {{ border-color: transparent; padding: 4px 12px; }}
+  .vm-indent {{ padding-left: 28px !important; }}
+  .vm-ns {{
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    margin-right: 8px;
+  }}
+  .vm-name {{
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+  }}
+  .vm-node {{
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+  }}
+
+  .total-row td {{
+    font-family: var(--mono);
+    font-weight: 600;
+    color: var(--text);
+    background: var(--bg3);
+    border-top: 1px solid var(--border);
+  }}
+
+  /* ── Badges ── */
+  .badge {{
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 600;
+    font-family: var(--mono);
+    white-space: nowrap;
+  }}
+  .badge.ready         {{ background: #1a3a1f; color: var(--ok);   border: 1px solid #2ea043; }}
+  .badge.notready      {{ background: #3a1a1a; color: var(--crit); border: 1px solid #da3633; }}
+  .badge.unschedulable {{ background: #3a2f1a; color: var(--warn); border: 1px solid #9e6a03; }}
+  .badge.unknown       {{ background: var(--bg3); color: var(--muted); border: 1px solid var(--border); }}
+  .badge.running       {{ background: #1a3a1f; color: var(--ok);   border: 1px solid #2ea043; }}
+  .badge.other         {{ background: #3a2f1a; color: var(--warn); border: 1px solid #9e6a03; }}
+
+  /* ── Progress bars ── */
+  .bar-wrap {{
+    display: inline-block;
+    width: 80px;
+    height: 6px;
+    background: var(--bg3);
+    border-radius: 3px;
+    overflow: hidden;
+    vertical-align: middle;
+    margin-right: 6px;
+    border: 1px solid var(--border2);
+  }}
+  .bar {{
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s;
+  }}
+  .bar.ok   {{ background: var(--ok); }}
+  .bar.warn {{ background: var(--warn); }}
+  .bar.crit {{ background: var(--crit); }}
+
+  .pct {{ font-family: var(--mono); font-size: 11px; }}
+  .pct.ok   {{ color: var(--ok); }}
+  .pct.warn {{ color: var(--warn); }}
+  .pct.crit {{ color: var(--crit); }}
+
+  .pct-cell {{ font-family: var(--mono); font-size: 11px; font-weight: 600; }}
+  .pct-cell.ok   {{ color: var(--ok); }}
+  .pct-cell.warn {{ color: var(--warn); }}
+  .pct-cell.crit {{ color: var(--crit); }}
+
+  /* ── Warnings panel ── */
+  .warn-panel {{
+    margin: 0 32px 24px;
+    background: #1c1a13;
+    border: 1px solid var(--warn);
+    border-radius: 8px;
+    padding: 16px 20px;
+  }}
+  .warn-panel-title {{
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--warn);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 10px;
+  }}
+  .warn-item {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 0;
+    font-family: var(--mono);
+    font-size: 12px;
+  }}
+  .warn-item-node {{ color: var(--text); min-width: 200px; }}
+  .warn-chip {{
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }}
+  .warn-chip.cpu {{ background: #1a2a3a; color: var(--accent); border: 1px solid var(--accent2); }}
+  .warn-chip.mem {{ background: #3a1a1a; color: var(--crit);   border: 1px solid #da3633; }}
+  .warn-chip.wmem {{ background: #3a2f1a; color: var(--warn);  border: 1px solid #9e6a03; }}
+
+  footer {{
+    padding: 16px 32px;
+    border-top: 1px solid var(--border2);
+    font-size: 11px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <h1>OCP<span>/</span>Virt &mdash; Overcommit Report</h1>
+    <div class="header-meta">
+      Wygenerowano: {now}
+      {filter_info}
+    </div>
+  </div>
+  <div class="legend">
+    <span><span class="legend-dot" style="background:var(--ok)"></span>OK</span>
+    <span><span class="legend-dot" style="background:var(--warn)"></span>Ostrzeżenie</span>
+    <span><span class="legend-dot" style="background:var(--crit)"></span>Krytyczny</span>
+  </div>
+</header>
+
+{summary_cards}
+
+{'<div class="warn-panel"><div class="warn-panel-title">&#9888; Węzły przekraczające progi overcommit</div>' + ''.join(f"""
+  <div class="warn-item">
+    <span class="warn-item-node">&#9658; {nn}</span>
+    {_warn_chips(nn, node_data, nodes, warn_cpu, warn_mem)}
+  </div>""" for nn in warn_nodes) + '</div>' if warn_nodes else ''}
+
+<div class="section">
+  <div class="section-title">&#9632; Overcommit per Worker Node</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Node</th><th>Status</th><th>VM</th>
+        <th>CPU commit</th><th>CPU alloc</th><th colspan="2">CPU %</th>
+        <th>MEM commit</th><th>MEM alloc</th><th colspan="2">MEM %</th>
+      </tr>
+    </thead>
+    <tbody>
+      {node_rows}
+    </tbody>
+  </table>
+</div>
+
+<div class="section">
+  <div class="section-title">&#9632; Overcommit per Namespace</div>
+  <table>
+    <thead>
+      <tr><th>Namespace</th><th>VM</th><th>CPU commit</th><th>MEM commit</th></tr>
+    </thead>
+    <tbody>{ns_rows}</tbody>
+  </table>
+</div>
+
+<footer>OCP Virtualization Overcommit Analyzer &bull; próg CPU: {warn_cpu:.0f}% &bull; próg MEM: {warn_mem:.0f}%</footer>
+
+<script>
+function toggleVMs(row) {{
+  row.classList.toggle('open');
+  const next = row.nextElementSibling;
+  if (next && next.classList.contains('vm-group')) {{
+    next.classList.toggle('hidden');
+  }}
+}}
+</script>
+</body>
+</html>"""
+
+
+def _warn_chips(node_name, node_data, nodes, warn_cpu, warn_mem):
+    nd = node_data.get(node_name, {"cpu_m": 0, "mem_mib": 0, "vms": []})
+    ni = nodes.get(node_name)
+    if not ni:
+        return ""
+    cpu_pct = (nd["cpu_m"]   / ni["allocatable_cpu_m"]  * 100) if ni["allocatable_cpu_m"]  > 0 else 0
+    mem_pct = (nd["mem_mib"] / ni["allocatable_mem_mib"] * 100) if ni["allocatable_mem_mib"] > 0 else 0
+    chips = ""
+    if cpu_pct >= warn_cpu:
+        cls = "cpu"
+        chips += f'<span class="warn-chip {cls}">CPU {cpu_pct:.1f}%</span>'
+    if mem_pct >= 100:
+        chips += f'<span class="warn-chip mem">MEM {mem_pct:.1f}%</span>'
+    elif mem_pct >= warn_mem:
+        chips += f'<span class="warn-chip wmem">MEM {mem_pct:.1f}%</span>'
+    return chips
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -351,6 +895,8 @@ def main():
                         help="Próg ostrzeżenia CPU w %% (domyślnie 80)")
     parser.add_argument("--warn-mem",  type=float, default=80,
                         help="Próg ostrzeżenia MEM w %% (domyślnie 80)")
+    parser.add_argument("--html", metavar="PLIK.html",
+                        help="Zapisz raport HTML do pliku (np. --html raport.html)")
     args = parser.parse_args()
 
     print(f"{BOLD}Pobieranie danych z klastra...{RESET}")
@@ -374,9 +920,22 @@ def main():
         warn_mem=args.warn_mem,
     )
 
+    # ── Terminal output ───────────────────────────────────────────────────────
     print_node_report(node_data, nodes, args.warn_cpu, args.warn_mem)
     print_namespace_report(ns_data, args.warn_cpu, args.warn_mem)
     print_overcommit_warnings(node_data, nodes, args.warn_cpu, args.warn_mem)
+
+    # ── HTML output ───────────────────────────────────────────────────────────
+    if args.html:
+        html = generate_html(
+            node_data, ns_data, nodes,
+            args.warn_cpu, args.warn_mem,
+            args.node, args.namespace,
+        )
+        out_path = args.html
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"\n{GREEN}{BOLD}✔ Raport HTML zapisany:{RESET} {os.path.abspath(out_path)}")
 
 
 if __name__ == "__main__":
