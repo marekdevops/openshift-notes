@@ -507,6 +507,25 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem, filter_node, fi
     if filter_ns:
         filter_info += f'<span class="filter-tag">namespace: {filter_ns}</span>'
 
+    # warn_panel budujemy bez zagniezdoznych f-stringow (blad na Python < 3.12)
+    if warn_nodes:
+        warn_items = ""
+        for nn in warn_nodes:
+            chips = _warn_chips(nn, node_data, nodes, warn_cpu, warn_mem)
+            warn_items += (
+                '<div class="warn-item">'
+                '<span class="warn-item-node">&#9658; ' + nn + '</span>'
+                + chips + '</div>'
+            )
+        warn_panel_html = (
+            '<div class="warn-panel">'
+            '<div class="warn-panel-title">&#9888; '
+            'W\u0119z\u0142y przekraczaj\u0105ce progi overcommit</div>'
+            + warn_items + '</div>'
+        )
+    else:
+        warn_panel_html = ""
+
     return f"""<!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -819,11 +838,7 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem, filter_node, fi
 
 {summary_cards}
 
-{'<div class="warn-panel"><div class="warn-panel-title">&#9888; Węzły przekraczające progi overcommit</div>' + ''.join(f"""
-  <div class="warn-item">
-    <span class="warn-item-node">&#9658; {nn}</span>
-    {_warn_chips(nn, node_data, nodes, warn_cpu, warn_mem)}
-  </div>""" for nn in warn_nodes) + '</div>' if warn_nodes else ''}
+{warn_panel_html}
 
 <div class="section">
   <div class="section-title">&#9632; Overcommit per Worker Node</div>
