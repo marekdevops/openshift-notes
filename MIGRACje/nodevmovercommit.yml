@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""
+OCP Virtualization - Memory & CPU Overcommit Analyzer
+Sprawdza overcommit zasobów per worker node oraz per namespace.
+
+Użycie:
+  python3 virt_overcommit.py
+  python3 virt_overcommit.py --namespace produkcja
+  python3 virt_overcommit.py --node worker-03
+  python3 virt_overcommit.py --warn-cpu 80 --warn-mem 90
+"""
+
+import subprocess
+import json
+import sys
+import argparse
+from collections import defaultdict
+
+
+# ── ANSI kolory ──────────────────────────────────────────────────────────────
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+GREEN  = "\033[92m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+
+def color_pct(pct, warn, crit=100):
+    if pct >= crit:
+        return f"{RED}{BOLD}{pct:.1f}%{RESET}"
+    elif pct >= warn:
+        return f"{YELLOW}{pct:.1f}%{RESET}"
+    return f"{GREEN}{pct:.1f}%{RESET}"
+
+
+# ── Pomocnicze parsery ────────────────────────────────────────────────────────
+def parse_memory_to_mib(raw):
+    """Konwertuje wartość pamięci K8s (np. '512Gi', '4096Mi') na MiB (float)."""
+    if not raw or raw in ("0", ""):
+        return 0.0
+    raw = str(raw).strip()
+    try:
+        if raw.endswith("Ki"):
+            return float(raw[:-2]) / 1024
+        elif raw.endswith("Mi"):
+            return float(raw[:-2])
+        elif raw.endswith("Gi"):
+            return float(raw[:-2]) * 1024
+        elif raw.endswith("Ti"):
+            return float(raw[:-2]) * 1024 * 1024
+        elif raw.endswith("K") or raw.endswith("k"):
+            return float(raw[:-1]) / 1024
+        elif raw.endswith("M"):
+            return float(raw[:-1])
+        elif raw.endswith("G"):
+            return float(raw[:-1]) * 1024
+        else:
+            return float(raw) / (1024 * 1024)
+    except ValueError:
+        return 0.0
+
+
+def parse_cpu_to_mcores(raw):
+    """Konwertuje wartość CPU K8s (np. '4', '500m') na millicores (float)."""
+    if not raw or raw in ("0", ""):
+        return 0.0
+    raw = str(raw).strip()
+    try:
+        if raw.endswith("m"):
+            return float(raw[:-1])
+        else:
+            return float(raw) * 1000
+    except ValueError:
+        return 0.0
+
+
+def fmt_mib(mib):
+    if mib >= 1024:
+        return f"{mib/1024:.1f} GiB"
+    return f"{mib:.0f} MiB"
+
+
+def fmt_cpu(mcores):
+    if mcores >= 1000:
+        return f"{mcores/1000:.2f} cores"
+    return f"{mcores:.0f}m"
+
+
+# ── oc wrapper ────────────────────────────────────────────────────────────────
+def oc_get(resource, namespace=None, extra_args=None):
+    cmd = ["oc", "get", resource, "-o", "json"]
+    if namespace:
+        cmd += ["-n", namespace]
+    else:
+        cmd += ["-A"]
+    if extra_args:
+        cmd += extra_args
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            print(f"{RED}Błąd oc: {result.stderr.strip()}{RESET}", file=sys.stderr)
+            return None
+        return json.loads(result.stdout)
+    except subprocess.TimeoutExpired:
+        print(f"{RED}Timeout podczas pobierania {resource}{RESET}", file=sys.stderr)
+        return None
+    except json.JSONDecodeError as e:
+        print(f"{RED}JSON decode error dla {resource}: {e}{RESET}", file=sys.stderr)
+        return None
+
+
+# ── Dane z klastra ────────────────────────────────────────────────────────────
+def get_nodes():
+    """Zwraca dict: node_name → {allocatable_cpu_m, allocatable_mem_mib, roles, ready}"""
+    data = oc_get("nodes")
+    if not data:
+        return {}
+    nodes = {}
+    for item in data.get("items", []):
+        name = item["metadata"]["name"]
+        labels = item["metadata"].get("labels", {})
+        alloc  = item["status"].get("allocatable", {})
+
+        roles = []
+        for k in labels:
+            if k.startswith("node-role.kubernetes.io/"):
+                roles.append(k.split("/")[-1])
+
+        # Pomiń mastery
+        if "master" in roles or "control-plane" in roles:
+            continue
+
+        conditions = item["status"].get("conditions", [])
+        ready = any(c["type"] == "Ready" and c["status"] == "True" for c in conditions)
+
+        taints = item["spec"].get("taints", [])
+        unschedulable = item["spec"].get("unschedulable", False)
+
+        nodes[name] = {
+            "allocatable_cpu_m":   parse_cpu_to_mcores(alloc.get("cpu", "0")),
+            "allocatable_mem_mib": parse_memory_to_mib(alloc.get("memory", "0")),
+            "roles":               roles,
+            "ready":               ready,
+            "unschedulable":       unschedulable,
+            "taints":              taints,
+        }
+    return nodes
+
+
+def get_vmis(filter_ns=None):
+    """Zwraca listę VMI z polami: name, namespace, node, cpu_cores, mem_mib, phase."""
+    data = oc_get("virtualmachineinstances", namespace=filter_ns)
+    if not data:
+        return []
+    vmis = []
+    for item in data.get("items", []):
+        meta   = item["metadata"]
+        spec   = item.get("spec", {})
+        status = item.get("status", {})
+        domain = spec.get("domain", {})
+
+        # CPU — preferuj dedicatedCpuPlacement cores, fallback do requests/limits
+        cpu_obj   = domain.get("cpu", {})
+        cpu_cores = cpu_obj.get("cores", 1) * cpu_obj.get("sockets", 1) * cpu_obj.get("threads", 1)
+
+        # Pamięć — z domain.resources lub domain.memory
+        resources = domain.get("resources", {})
+        memory_raw = (
+            domain.get("memory", {}).get("guest")
+            or resources.get("requests", {}).get("memory")
+            or resources.get("limits", {}).get("memory")
+            or "0"
+        )
+
+        vmis.append({
+            "name":      meta["name"],
+            "namespace": meta["namespace"],
+            "node":      status.get("nodeName", "<unscheduled>"),
+            "phase":     status.get("phase", "Unknown"),
+            "cpu_m":     cpu_cores * 1000,   # cores → millicores
+            "mem_mib":   parse_memory_to_mib(memory_raw),
+        })
+    return vmis
+
+
+# ── Analiza ───────────────────────────────────────────────────────────────────
+def analyze(vmis, nodes, filter_node=None, warn_cpu=80, warn_mem=80):
+    # ── Per node ──────────────────────────────────────────────────────────────
+    node_data = defaultdict(lambda: {"cpu_m": 0.0, "mem_mib": 0.0, "vms": []})
+
+    for vmi in vmis:
+        node = vmi["node"]
+        if filter_node and node != filter_node:
+            continue
+        node_data[node]["cpu_m"]   += vmi["cpu_m"]
+        node_data[node]["mem_mib"] += vmi["mem_mib"]
+        node_data[node]["vms"].append(vmi)
+
+    # ── Per namespace ─────────────────────────────────────────────────────────
+    ns_data = defaultdict(lambda: {"cpu_m": 0.0, "mem_mib": 0.0, "vms": []})
+    for vmi in vmis:
+        if filter_node and vmi["node"] != filter_node:
+            continue
+        ns_data[vmi["namespace"]]["cpu_m"]   += vmi["cpu_m"]
+        ns_data[vmi["namespace"]]["mem_mib"] += vmi["mem_mib"]
+        ns_data[vmi["namespace"]]["vms"].append(vmi)
+
+    return node_data, ns_data
+
+
+# ── Wydruk ────────────────────────────────────────────────────────────────────
+def print_separator(char="─", width=90):
+    print(char * width)
+
+
+def print_node_report(node_data, nodes, warn_cpu, warn_mem):
+    print(f"\n{BOLD}{CYAN}{'═'*90}{RESET}")
+    print(f"{BOLD}{CYAN}  OVERCOMMIT PER WORKER NODE{RESET}")
+    print(f"{BOLD}{CYAN}{'═'*90}{RESET}")
+
+    header = (
+        f"{'NODE':<30} {'STATUS':<14} {'VM count':>8} "
+        f"{'CPU commit':>12} {'CPU alloc':>10} {'CPU %':>8} "
+        f"{'MEM commit':>12} {'MEM alloc':>12} {'MEM %':>8}"
+    )
+    print(f"{BOLD}{header}{RESET}")
+    print_separator()
+
+    # Nody bez VM też pokaz (żeby widać było wolne)
+    all_nodes = set(nodes.keys()) | set(node_data.keys())
+
+    for node_name in sorted(all_nodes):
+        nd   = node_data.get(node_name, {"cpu_m": 0, "mem_mib": 0, "vms": []})
+        ni   = nodes.get(node_name)
+
+        if not ni:
+            # Node nieznany (np. usunięty) — pokaż dane bez alokacji
+            status_str = f"{YELLOW}unknown{RESET}"
+            print(
+                f"{node_name:<30} {status_str:<23} {len(nd['vms']):>8} "
+                f"{fmt_cpu(nd['cpu_m']):>12} {'?':>10} {'?':>8} "
+                f"{fmt_mib(nd['mem_mib']):>12} {'?':>12} {'?':>8}"
+            )
+            continue
+
+        alloc_cpu = ni["allocatable_cpu_m"]
+        alloc_mem = ni["allocatable_mem_mib"]
+
+        cpu_pct = (nd["cpu_m"]   / alloc_cpu  * 100) if alloc_cpu  > 0 else 0
+        mem_pct = (nd["mem_mib"] / alloc_mem * 100) if alloc_mem > 0 else 0
+
+        if not ni["ready"]:
+            status_str = f"{RED}NotReady{RESET}"
+        elif ni["unschedulable"]:
+            status_str = f"{YELLOW}Unschedulable{RESET}"
+        else:
+            status_str = f"{GREEN}Ready{RESET}"
+
+        print(
+            f"{node_name:<30} {status_str:<23} {len(nd['vms']):>8} "
+            f"{fmt_cpu(nd['cpu_m']):>12} {fmt_cpu(alloc_cpu):>10} "
+            f"{color_pct(cpu_pct, warn_cpu):>18} "
+            f"{fmt_mib(nd['mem_mib']):>12} {fmt_mib(alloc_mem):>12} "
+            f"{color_pct(mem_pct, warn_mem):>18}"
+        )
+
+        # Szczegóły VM na tym nodzie
+        for vmi in sorted(nd["vms"], key=lambda x: x["mem_mib"], reverse=True):
+            phase_color = GREEN if vmi["phase"] == "Running" else YELLOW
+            print(
+                f"  {'└─'} {vmi['namespace']:<26} {phase_color}{vmi['name']:<40}{RESET} "
+                f"CPU: {fmt_cpu(vmi['cpu_m']):<10} MEM: {fmt_mib(vmi['mem_mib'])}"
+            )
+
+    print_separator()
+
+
+def print_namespace_report(ns_data, warn_cpu, warn_mem):
+    print(f"\n{BOLD}{CYAN}{'═'*90}{RESET}")
+    print(f"{BOLD}{CYAN}  OVERCOMMIT PER NAMESPACE{RESET}")
+    print(f"{BOLD}{CYAN}{'═'*90}{RESET}")
+
+    header = (
+        f"{'NAMESPACE':<35} {'VM count':>8} "
+        f"{'CPU commit':>12} {'MEM commit':>14}"
+    )
+    print(f"{BOLD}{header}{RESET}")
+    print_separator()
+
+    total_cpu = 0.0
+    total_mem = 0.0
+
+    for ns in sorted(ns_data.keys()):
+        nd = ns_data[ns]
+        total_cpu += nd["cpu_m"]
+        total_mem += nd["mem_mib"]
+        print(
+            f"{ns:<35} {len(nd['vms']):>8} "
+            f"{fmt_cpu(nd['cpu_m']):>12} {fmt_mib(nd['mem_mib']):>14}"
+        )
+        for vmi in sorted(nd["vms"], key=lambda x: x["mem_mib"], reverse=True):
+            phase_color = GREEN if vmi["phase"] == "Running" else YELLOW
+            node_info   = f"@ {vmi['node']}" if vmi["node"] != "<unscheduled>" else f"{RED}unscheduled{RESET}"
+            print(
+                f"  {'└─'} {phase_color}{vmi['name']:<40}{RESET} "
+                f"CPU: {fmt_cpu(vmi['cpu_m']):<10} MEM: {fmt_mib(vmi['mem_mib']):<14} {node_info}"
+            )
+
+    print_separator()
+    print(
+        f"{'TOTAL':<35} {sum(len(nd['vms']) for nd in ns_data.values()):>8} "
+        f"{fmt_cpu(total_cpu):>12} {fmt_mib(total_mem):>14}"
+    )
+
+
+def print_overcommit_warnings(node_data, nodes, warn_cpu, warn_mem):
+    warnings = []
+    for node_name, nd in node_data.items():
+        ni = nodes.get(node_name)
+        if not ni:
+            continue
+        cpu_pct = (nd["cpu_m"]   / ni["allocatable_cpu_m"]  * 100) if ni["allocatable_cpu_m"]  > 0 else 0
+        mem_pct = (nd["mem_mib"] / ni["allocatable_mem_mib"] * 100) if ni["allocatable_mem_mib"] > 0 else 0
+        if cpu_pct >= warn_cpu or mem_pct >= warn_mem:
+            warnings.append((node_name, cpu_pct, mem_pct, nd))
+
+    if not warnings:
+        return
+
+    print(f"\n{BOLD}{RED}{'═'*90}{RESET}")
+    print(f"{BOLD}{RED}  OSTRZEŻENIA O OVERCOMMIT{RESET}")
+    print(f"{BOLD}{RED}{'═'*90}{RESET}")
+    for node_name, cpu_pct, mem_pct, nd in sorted(warnings, key=lambda x: x[2], reverse=True):
+        print(f"  {RED}▶{RESET} {BOLD}{node_name}{RESET}")
+        if cpu_pct >= warn_cpu:
+            print(f"    CPU overcommit: {color_pct(cpu_pct, warn_cpu)} ({len(nd['vms'])} VM-ek)")
+        if mem_pct >= warn_mem:
+            print(f"    MEM overcommit: {color_pct(mem_pct, warn_mem)} ({len(nd['vms'])} VM-ek)")
+    print_separator()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="OCP Virtualization overcommit analyzer"
+    )
+    parser.add_argument("--namespace", "-n", help="Filtruj po namespace")
+    parser.add_argument("--node",      "-N", help="Filtruj po worker nodzie")
+    parser.add_argument("--warn-cpu",  type=float, default=80,
+                        help="Próg ostrzeżenia CPU w %% (domyślnie 80)")
+    parser.add_argument("--warn-mem",  type=float, default=80,
+                        help="Próg ostrzeżenia MEM w %% (domyślnie 80)")
+    args = parser.parse_args()
+
+    print(f"{BOLD}Pobieranie danych z klastra...{RESET}")
+
+    nodes = get_nodes()
+    if not nodes:
+        print(f"{RED}Nie udało się pobrać danych o nodach. Sprawdź 'oc get nodes'.{RESET}")
+        sys.exit(1)
+
+    vmis = get_vmis(filter_ns=args.namespace)
+    if not vmis:
+        print(f"{YELLOW}Brak VMI w klastrze (lub brak uprawnień do ich odczytu).{RESET}")
+        sys.exit(0)
+
+    print(f"Znaleziono {len(nodes)} worker nodów i {len(vmis)} VMI.\n")
+
+    node_data, ns_data = analyze(
+        vmis, nodes,
+        filter_node=args.node,
+        warn_cpu=args.warn_cpu,
+        warn_mem=args.warn_mem,
+    )
+
+    print_node_report(node_data, nodes, args.warn_cpu, args.warn_mem)
+    print_namespace_report(ns_data, args.warn_cpu, args.warn_mem)
+    print_overcommit_warnings(node_data, nodes, args.warn_cpu, args.warn_mem)
+
+
+if __name__ == "__main__":
+    main()
