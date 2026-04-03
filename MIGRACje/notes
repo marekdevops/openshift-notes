@@ -1,0 +1,4 @@
+watch -n5 'oc get vmi -A -o json | jq -r ".items[] | select(.status.phase != \"Running\") | .metadata.namespace + \"/\" + .metadata.name + \" -> \" + .status.phase"'
+
+
+oc get vmi -A -o json | jq -r '.items[] | .metadata.namespace + "/" + .metadata.name + " -> " + .status.phase'
