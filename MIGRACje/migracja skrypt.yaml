@@ -1,0 +1,19 @@
+#!/bin/bash
+# Dla każdej VM w Pending pokaż co ją blokuje
+for vmi in $(oc get vmi -A --field-selector status.phase=Pending \
+             -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns=$(echo $vmi | cut -d/ -f1)
+  name=$(echo $vmi | cut -d/ -f2)
+  echo "=== VMI: $name (ns: $ns) ==="
+  echo "-- NodeSelector:"
+  oc get vmi $name -n $ns -o jsonpath='{.spec.nodeSelector}' 2>/dev/null
+  echo ""
+  echo "-- Affinity:"
+  oc get vmi $name -n $ns -o jsonpath='{.spec.affinity}' 2>/dev/null
+  echo ""
+  echo "-- Events:"
+  oc get events -n $ns --field-selector \
+    involvedObject.name=$name,involvedObject.kind=VirtualMachineInstance \
+    --sort-by='.lastTimestamp' | tail -5
+  echo ""
+done
