@@ -1,0 +1,31 @@
+#!/bin/bash
+VMI=$1
+NS=$2
+
+echo "=== Migration target pod ==="
+POD=$(oc get pods -n $NS | grep "virt-launcher.*$VMI.*target\|migration" | awk '{print $1}')
+if [ -z "$POD" ]; then
+  echo "Brak migration pod — migracja jeszcze nie startowała lub już skończyła"
+else
+  oc describe pod $POD -n $NS | grep -A20 "Events:"
+fi
+
+echo ""
+echo "=== VMI nodeSelector ==="
+oc get vmi $VMI -n $NS -o jsonpath='{.spec.nodeSelector}' && echo ""
+
+echo ""
+echo "=== VMI tolerations ==="
+oc get vmi $VMI -n $NS -o jsonpath='{.spec.tolerations}' && echo ""
+
+echo ""
+echo "=== VMI CPU config ==="
+oc get vmi $VMI -n $NS -o jsonpath='{.spec.domain.cpu}' && echo ""
+
+echo ""
+echo "=== Aktywna migracja ==="
+oc get vmim -n $NS | grep $VMI
+
+echo ""
+echo "=== virt-controller logi dla tej VMI ==="
+oc logs -n openshift-cnv deployment/virt-controller --tail=100 | grep $VMI | tail -20
