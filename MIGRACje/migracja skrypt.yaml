@@ -1,24 +1,20 @@
 #!/bin/bash
-for vmi_info in $(oc get vmi -A -o json | \
-  jq -r '.items[] | select(.status.phase=="Pending") | 
-  .metadata.namespace + "/" + .metadata.name'); do
-
-  ns=$(echo $vmi_info | cut -d/ -f1)
-  name=$(echo $vmi_info | cut -d/ -f2)
-
+oc get vmi -A -o json | jq -r \
+  '.items[] | select(.status.phase == "Pending") | .metadata.namespace + "/" + .metadata.name' | \
+while IFS='/' read -r ns name; do
   echo "=== VMI: $name (ns: $ns) ==="
-
+  
   echo "-- NodeSelector:"
-  oc get vmi $name -n $ns -o jsonpath='{.spec.nodeSelector}' 2>/dev/null
+  oc get vmi $name -n $ns -o jsonpath='{.spec.nodeSelector}'
   echo ""
-
+  
   echo "-- Affinity:"
-  oc get vmi $name -n $ns -o jsonpath='{.spec.affinity}' 2>/dev/null
+  oc get vmi $name -n $ns -o jsonpath='{.spec.affinity}'
   echo ""
-
+  
   echo "-- Events:"
   oc get events -n $ns \
     --field-selector involvedObject.name=$name,involvedObject.kind=VirtualMachineInstance \
     --sort-by='.lastTimestamp' 2>/dev/null | tail -5
-  echo ""
+  echo "---"
 done
