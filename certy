@@ -38,3 +38,13 @@ oc exec <pod> -n <ns> -- bash -c "openssl s_client -connect poczta.moja.domena.p
 oc get configmap custom-ca -n openshift-config -o jsonpath='{.data.ca-bundle\.crt}' | \
   awk 'BEGIN{c=0} /BEGIN CERT/{c++} {print > "/tmp/cert"c".pem"}' && \
   for f in /tmp/cert*.pem; do echo "=== $f ==="; openssl x509 -noout -subject -issuer -in $f; done
+
+
+  # Czy jest jakis volume mount z CA?
+oc get deployment <nazwa> -n <ns> -o yaml | grep -A5 -E "volume|secret|configmap" | grep -iE "ca|cert|tls|trust"
+
+# Czy JAVA_OPTS wskazuje na truststore?
+oc exec <pod> -n <ns> -- env | grep -iE "java_opts|javax.net.ssl"
+
+# Czy jest jakis init container który importuje certy?
+oc get deployment <nazwa> -n <ns> -o yaml | grep -A20 initContainer
