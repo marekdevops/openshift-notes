@@ -421,8 +421,8 @@ def main():
         help="Wyjście w formacie JSON zamiast czytelnego raportu"
     )
     parser.add_argument(
-        "--namespace", "-n", default=None,
-        help="Skanuj tylko ten namespace (domyślnie: wszystkie)"
+        "--namespace", "-n", default=None, nargs="+",
+        help="Skanuj tylko podane namespacy (można podać kilka, domyślnie: wszystkie)"
     )
     parser.add_argument(
         "--skip-system", action="store_true",
@@ -444,7 +444,7 @@ def main():
 
     # Pobierz listę namespaców
     if args.namespace:
-        namespaces = [args.namespace]
+        namespaces = args.namespace
     else:
         ns_data = run_oc("get", "namespaces")
         if not ns_data:
