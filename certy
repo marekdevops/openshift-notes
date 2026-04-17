@@ -33,3 +33,8 @@ oc get secret gbw-pki -n openshift-ingress -o jsonpath='{.data.ca\.crt}' | base6
 # Sprawdź jaki certyfikat faktycznie serwuje serwer SMTP
 # Uruchom z poda na nowym klastrze
 oc exec <pod> -n <ns> -- bash -c "openssl s_client -connect poczta.moja.domena.pl:587 -starttls smtp"
+
+
+oc get configmap custom-ca -n openshift-config -o jsonpath='{.data.ca-bundle\.crt}' | \
+  awk 'BEGIN{c=0} /BEGIN CERT/{c++} {print > "/tmp/cert"c".pem"}' && \
+  for f in /tmp/cert*.pem; do echo "=== $f ==="; openssl x509 -noout -subject -issuer -in $f; done
