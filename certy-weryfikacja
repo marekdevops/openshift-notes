@@ -1,0 +1,25 @@
+# Wyciągnij root CA z chainu który masz w custom-ca / openshift-config
+oc get configmap custom-ca -n openshift-config \
+  -o jsonpath='{.data.ca-bundle\.crt}' > /tmp/bundle.pem
+
+# Policz ile certów jest w bundle
+grep -c "BEGIN CERTIFICATE" /tmp/bundle.pem
+
+# Sprawdź każdy
+cat /tmp/bundle.pem | awk 'BEGIN{c=0} /BEGIN CERT/{c++; f="/tmp/ca"c".pem"} {print > f}' 
+for f in /tmp/ca*.pem; do 
+  echo "=== $f ==="
+  openssl x509 -noout -subject -issuer -in $f
+done
+
+openssl s_client -connect poczta.moja.domena.pl:587 \
+  -starttls smtp -showcerts 2>/dev/null \
+  | awk '/BEGIN CERT/{c++; f="/tmp/smtp"c".pem"} /BEGIN CERT/,/END CERT/{print > f}'
+
+for f in /tmp/smtp*.pem; do
+  echo "=== $f ==="
+  openssl x509 -noout -subject -issuer -in $f
+done
+
+
+openssl verify -CAfile /tmp/bundle.pem /tmp/smtp1.pem
