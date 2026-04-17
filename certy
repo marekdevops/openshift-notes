@@ -29,3 +29,7 @@ oc get secret gbw-pki -n openshift-ingress -o jsonpath='{.data.tls\.crt}' | base
 
 # Sprawdź czy to CA czy leaf cert
 oc get secret gbw-pki -n openshift-ingress -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -text 2>/dev/null
+
+# Sprawdź jaki certyfikat faktycznie serwuje serwer SMTP
+# Uruchom z poda na nowym klastrze
+oc exec <pod> -n <ns> -- bash -c "openssl s_client -connect poczta.moja.domena.pl:587 -starttls smtp"
