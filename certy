@@ -48,3 +48,7 @@ oc exec <pod> -n <ns> -- env | grep -iE "java_opts|javax.net.ssl"
 
 # Czy jest jakis init container który importuje certy?
 oc get deployment <nazwa> -n <ns> -o yaml | grep -A20 initContainer
+
+oc get secret <nazwa-secretu> -n <namespace> -o go-template='{{range $k,$v := .data}}{{$k}}{{"\n"}}{{$v | base64decode}}{{"\n"}}{{end}}' | \
+  awk '/BEGIN CERT/{p=1} p{print} /END CERT/{p=0}' | \
+  openssl x509 -noout -subject -issuer -dates
