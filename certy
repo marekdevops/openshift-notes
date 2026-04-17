@@ -52,3 +52,10 @@ oc get deployment <nazwa> -n <ns> -o yaml | grep -A20 initContainer
 oc get secret <nazwa-secretu> -n <namespace> -o go-template='{{range $k,$v := .data}}{{$k}}{{"\n"}}{{$v | base64decode}}{{"\n"}}{{end}}' | \
   awk '/BEGIN CERT/{p=1} p{print} /END CERT/{p=0}' | \
   openssl x509 -noout -subject -issuer -dates
+
+
+  # Wylistuj wszystkie klucze w sekrecie
+oc get secret <nazwa-secretu> -n <namespace> -o jsonpath='{.data}' | python3 -m json.tool
+
+# Każdy klucz z osobna zdekoduj
+oc get secret <nazwa-secretu> -n <namespace> -o go-template='{{range $k,$v := .data}}{{$k}}{{"\n"}}{{$v | base64decode}}{{"\n---\n"}}{{end}}'
