@@ -18,3 +18,14 @@ oc -n openshift-console run -it diag --image=registry.access.redhat.com/ubi9/ubi
 oc -n openshift-ingress get pods -o wide
 ROUTER=$(oc -n openshift-ingress get pods -l ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default -o jsonpath='{.items[0].metadata.name}')
 oc -n openshift-ingress logs $ROUTER -c router --tail=200 | egrep -i "proxy|handshake|ssl|error|sni" || true
+
+
+
+# Sprawdź typ i zawartość secretu
+oc get secret gbw-pki -n openshift-ingress -o yaml
+
+# Wyciągnij certyfikat i sprawdź łańcuch
+oc get secret gbw-pki -n openshift-ingress -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -text | grep -E "Subject:|Issuer:|DNS:|CA:"
+
+# Sprawdź czy to CA czy leaf cert
+oc get secret gbw-pki -n openshift-ingress -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -text 2>/dev/null
