@@ -432,9 +432,7 @@ def main():
         help="Pomiń zasoby cluster-scoped (APIServer, IngressController, ETCD)"
     )
     args = parser.parse_args()
-
-    global WARN_DAYS_DEFAULT
-    WARN_DAYS_DEFAULT = args.warn_days
+    warn_days = args.warn_days
 
     # Sprawdź czy oc jest zalogowany
     whoami = run_oc_raw("whoami")
