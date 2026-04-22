@@ -8,3 +8,6 @@ metadata:
     kubernetes.io/service-account.name: NAZWA_TWOJEGO_SA
 type: kubernetes.io/service-account-token
 EOF
+
+
+oc get secret sa-long-lived-token -n TWOJA_NAZWA_NAMESPACE -o jsonpath='{.data.token}' | base64 --decode
