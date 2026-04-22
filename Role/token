@@ -1,0 +1,10 @@
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sa-long-lived-token
+  namespace: TWOJA_NAZWA_NAMESPACE
+  annotations:
+    kubernetes.io/service-account.name: NAZWA_TWOJEGO_SA
+type: kubernetes.io/service-account-token
+EOF
