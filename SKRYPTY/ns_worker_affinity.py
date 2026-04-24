@@ -573,6 +573,13 @@ def generate_html(usage, selectors, workers, namespaces,
 
     filter_info = (" &bull; ns: " + filter_ns) if filter_ns else ""
 
+    footer = (
+        '<footer>OCP NS-Worker Affinity Analyzer'
+        ' &bull; CPU warn: {:.0f}%'
+        ' &bull; MEM warn: {:.0f}%'
+        '</footer>'
+    ).format(warn_cpu, warn_mem)
+
     return (
         '<!DOCTYPE html>\n<html lang="pl">\n<head>\n'
         '<meta charset="UTF-8">'
@@ -608,13 +615,10 @@ def generate_html(usage, selectors, workers, namespaces,
         '</div>'
         + ns_blocks +
         '</div>\n'
-        '<footer>OCP NS-Worker Affinity Analyzer'
-        ' &bull; CPU warn: {wc:.0f}%'
-        ' &bull; MEM warn: {wm:.0f}%'
-        '</footer>'
+        + footer +
         '<script>' + HTML_JS + '</script>'
         '</body></html>\n'
-    ).format(wc=warn_cpu, wm=warn_mem)
+    )
 
 
 # --- Main ---
