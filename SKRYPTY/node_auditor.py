@@ -55,12 +55,15 @@ def get_oc_json(resource, all_namespaces=False):
         print("Blad: Brak polecenia 'oc' w PATH.")
         sys.exit(1)
 
-def get_nodes_data():
-    print("Pobieranie danych o nodach...")
+def get_nodes_data(workers_only=True):
+    print("Pobieranie danych o nodach" + (" (tylko worker)..." if workers_only else "..."))
     nodes_data = get_oc_json('nodes')
     node_metrics = {}
     for node in nodes_data.get('items', []):
         name   = node['metadata']['name']
+        labels = node['metadata'].get('labels', {})
+        if workers_only and 'node-role.kubernetes.io/worker' not in labels:
+            continue
         status = node.get('status', {})
         node_metrics[name] = {
             'allocatable_mib':   convert_memory_to_mib(status.get('allocatable', {}).get('memory', '0Mi')),
@@ -85,21 +88,22 @@ def get_pods_requests(node_metrics):
 
 # --- Raport ---
 
-def generate_report(target_unit='GiB', migration_buffer_pct=20):
+def generate_report(target_unit='GiB', migration_buffer_pct=20, workers_only=True):
     try:
         from tabulate import tabulate
     except ImportError:
         print("Wymagana biblioteka 'tabulate': pip install tabulate")
         sys.exit(1)
 
-    node_metrics = get_nodes_data()
+    node_metrics = get_nodes_data(workers_only=workers_only)
     node_metrics = get_pods_requests(node_metrics)
 
     unit_div  = 1024.0 if target_unit.upper() in ('GIB', 'GI') else 1.0
     unit_name = "GiB"  if target_unit.upper() in ('GIB', 'GI') else "MiB"
 
+    scope = "tylko worker" if workers_only else "wszystkie nody"
     print(f"\n{'='*78}")
-    print(f"   RAPORT NODOW: ALOKACJA VS COMMIT  (RAM: {unit_name} | CPU: cores)")
+    print(f"   RAPORT NODOW: ALOKACJA VS COMMIT  (RAM: {unit_name} | CPU: cores | {scope})")
     print(f"{'='*78}")
 
     report_data = []
@@ -195,7 +199,9 @@ if __name__ == "__main__":
                         help="Jednostka pamieci (MiB, GiB — domyslnie GiB)")
     parser.add_argument("--buffer", type=int, default=20,
                         help="Bufor migracji w %% (domyslnie 20)")
+    parser.add_argument("--all-nodes", action="store_true",
+                        help="Uwzglednij wszystkie nody (domyslnie tylko worker)")
     args = parser.parse_args()
 
     print("--- Audyt nodow: CPU + MEM ---")
-    generate_report(args.memory_unit, args.buffer)
+    generate_report(args.memory_unit, args.buffer, workers_only=not args.all_nodes)
