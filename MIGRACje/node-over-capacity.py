@@ -85,6 +85,14 @@ def fmt_cpu(mcores):
     return "{:.0f}m".format(mcores)
 
 
+def fmt_storage(gib):
+    if gib == 0.0:
+        return "-"
+    if gib >= 1024:
+        return "{:.1f} TiB".format(gib / 1024)
+    return "{:.0f} GiB".format(gib)
+
+
 def oc_get(resource, namespace=None):
     cmd = ["oc", "get", resource, "-o", "json"]
     if namespace:
@@ -103,6 +111,24 @@ def oc_get(resource, namespace=None):
     except json.JSONDecodeError as e:
         print(RED + "JSON error: " + str(e) + RESET, file=sys.stderr)
         return None
+
+
+# ── Pobierz PVC ──────────────────────────────────────────────────────────────
+
+def get_pvcs():
+    """Zwraca dict: (namespace, name) -> rozmiar w GiB."""
+    data = oc_get("persistentvolumeclaims")
+    if not data:
+        return {}
+    pvcs = {}
+    for item in data.get("items", []):
+        ns   = item["metadata"]["namespace"]
+        name = item["metadata"]["name"]
+        cap  = (item.get("status", {}).get("capacity", {}).get("storage")
+                or item.get("spec", {}).get("resources", {}).get("requests", {}).get("storage")
+                or "0")
+        pvcs[(ns, name)] = parse_memory_to_mib(cap) / 1024
+    return pvcs
 
 
 # ── Pobierz overcommit ratio z HyperConverged ────────────────────────────────
@@ -162,7 +188,9 @@ def get_nodes():
 
 # ── Pobierz VMI ──────────────────────────────────────────────────────────────
 
-def get_vmis(filter_ns=None):
+def get_vmis(filter_ns=None, pvcs=None):
+    if pvcs is None:
+        pvcs = {}
     data = oc_get("virtualmachineinstances", namespace=filter_ns)
     if not data:
         return []
@@ -183,13 +211,24 @@ def get_vmis(filter_ns=None):
             or resources.get("limits", {}).get("memory")
             or "0"
         )
+        ns = meta["namespace"]
+        storage_gib = 0.0
+        for vol in spec.get("volumes", []):
+            pvc_name = None
+            if "dataVolume" in vol:
+                pvc_name = vol["dataVolume"].get("name")
+            elif "persistentVolumeClaim" in vol:
+                pvc_name = vol["persistentVolumeClaim"].get("claimName")
+            if pvc_name:
+                storage_gib += pvcs.get((ns, pvc_name), 0.0)
         vmis.append({
-            "name":      meta["name"],
-            "namespace": meta["namespace"],
-            "node":      status.get("nodeName", "<unscheduled>"),
-            "phase":     status.get("phase", "Unknown"),
-            "cpu_m":     cpu_cores * 1000,
-            "mem_mib":   parse_memory_to_mib(memory_raw),
+            "name":        meta["name"],
+            "namespace":   meta["namespace"],
+            "node":        status.get("nodeName", "<unscheduled>"),
+            "phase":       status.get("phase", "Unknown"),
+            "cpu_m":       cpu_cores * 1000,
+            "mem_mib":     parse_memory_to_mib(memory_raw),
+            "storage_gib": storage_gib,
         })
     return vmis
 
@@ -197,17 +236,19 @@ def get_vmis(filter_ns=None):
 # ── Analiza overcommit ────────────────────────────────────────────────────────
 
 def analyze(vmis, nodes, filter_node=None):
-    node_data = defaultdict(lambda: {"cpu_m": 0.0, "mem_mib": 0.0, "vms": []})
-    ns_data   = defaultdict(lambda: {"cpu_m": 0.0, "mem_mib": 0.0, "vms": []})
+    node_data = defaultdict(lambda: {"cpu_m": 0.0, "mem_mib": 0.0, "storage_gib": 0.0, "vms": []})
+    ns_data   = defaultdict(lambda: {"cpu_m": 0.0, "mem_mib": 0.0, "storage_gib": 0.0, "vms": []})
     for vmi in vmis:
         node = vmi["node"]
         if filter_node and node != filter_node:
             continue
-        node_data[node]["cpu_m"]   += vmi["cpu_m"]
-        node_data[node]["mem_mib"] += vmi["mem_mib"]
+        node_data[node]["cpu_m"]       += vmi["cpu_m"]
+        node_data[node]["mem_mib"]     += vmi["mem_mib"]
+        node_data[node]["storage_gib"] += vmi["storage_gib"]
         node_data[node]["vms"].append(vmi)
-        ns_data[vmi["namespace"]]["cpu_m"]   += vmi["cpu_m"]
-        ns_data[vmi["namespace"]]["mem_mib"] += vmi["mem_mib"]
+        ns_data[vmi["namespace"]]["cpu_m"]       += vmi["cpu_m"]
+        ns_data[vmi["namespace"]]["mem_mib"]     += vmi["mem_mib"]
+        ns_data[vmi["namespace"]]["storage_gib"] += vmi["storage_gib"]
         ns_data[vmi["namespace"]]["vms"].append(vmi)
     return node_data, ns_data
 
@@ -290,24 +331,26 @@ def print_separator(char="─", width=120):
 
 
 def print_node_report(node_data, nodes, warn_cpu, warn_mem, overcommit_ratio):
-    print("\n" + BOLD + CYAN + "=" * 120 + RESET)
+    print("\n" + BOLD + CYAN + "=" * 136 + RESET)
     print(BOLD + CYAN + "  OVERCOMMIT + HEADROOM + DRAIN FEASIBILITY PER WORKER NODE" + RESET)
     print(BOLD + CYAN + "  memoryOvercommitPercentage: {:.0f}%".format(overcommit_ratio * 100) + RESET)
-    print(BOLD + CYAN + "=" * 120 + RESET)
+    print(BOLD + CYAN + "=" * 136 + RESET)
 
     hdr = ("{:<28} {:<14} {:>5}  "
            "{:>10} {:>10} {:>7}  "
            "{:>11} {:>11} {:>7}  "
            "{:>10} {:>11}  "
+           "{:>12}  "
            "{:<16}")
     print(BOLD + hdr.format(
         "NODE", "STATUS", "VMs",
         "CPU used", "CPU alloc", "CPU %",
         "MEM used", "MEM alloc", "MEM %",
         "Free CPU", "Free MEM",
+        "STORAGE",
         "Drain OK?"
     ) + RESET)
-    print_separator()
+    print_separator(width=136)
 
     all_nodes = sorted(set(nodes.keys()) | set(node_data.keys()))
 
@@ -316,11 +359,11 @@ def print_node_report(node_data, nodes, warn_cpu, warn_mem, overcommit_ratio):
         ni = nodes.get(node_name)
 
         if not ni:
-            print("{:<28} {:<14} {:>5}  {:>10} {:>10} {:>7}  {:>11} {:>11} {:>7}  {:>10} {:>11}  {:<16}".format(
+            print("{:<28} {:<14} {:>5}  {:>10} {:>10} {:>7}  {:>11} {:>11} {:>7}  {:>10} {:>11}  {:>12}  {:<16}".format(
                 node_name, "unknown", len(nd["vms"]),
                 fmt_cpu(nd["cpu_m"]), "?", "?",
                 fmt_mib(nd["mem_mib"]), "?", "?",
-                "?", "?", "?"))
+                "?", "?", fmt_storage(nd["storage_gib"]), "?"))
             continue
 
         alloc_cpu  = ni["allocatable_cpu_m"]
@@ -352,7 +395,7 @@ def print_node_report(node_data, nodes, warn_cpu, warn_mem, overcommit_ratio):
         else:
             status_str = GREEN + "Ready" + RESET
 
-        print("{:<28} {:<23} {:>5}  {:>10} {:>10} {:>17}  {:>11} {:>11} {:>17}  {:>10} {:>11}  {}".format(
+        print("{:<28} {:<23} {:>5}  {:>10} {:>10} {:>17}  {:>11} {:>11} {:>17}  {:>10} {:>11}  {:>12}  {}".format(
             node_name, status_str, len(nd["vms"]),
             fmt_cpu(nd["cpu_m"]), fmt_cpu(alloc_cpu),
             color_pct(cpu_pct, warn_cpu),
@@ -360,51 +403,55 @@ def print_node_report(node_data, nodes, warn_cpu, warn_mem, overcommit_ratio):
             fmt_mib(eff_mem) + ("*" if overcommit_ratio != 1.0 else ""),
             color_pct(mem_pct, warn_mem),
             fmt_cpu(free_cpu), fmt_mib(free_mem),
+            fmt_storage(nd["storage_gib"]),
             drain_str,
         ))
 
         for vmi in sorted(nd["vms"], key=lambda x: x["mem_mib"], reverse=True):
             phase_col = GREEN if vmi["phase"] == "Running" else YELLOW
-            print("  {} {:<28} {}{:<36}{}  CPU: {:<10} MEM: {}".format(
+            print("  {} {:<28} {}{:<36}{}  CPU: {:<10} MEM: {:<12} STOR: {}".format(
                 "+-", vmi["namespace"],
                 phase_col, vmi["name"], RESET,
-                fmt_cpu(vmi["cpu_m"]), fmt_mib(vmi["mem_mib"])))
+                fmt_cpu(vmi["cpu_m"]), fmt_mib(vmi["mem_mib"]),
+                fmt_storage(vmi["storage_gib"])))
 
     if overcommit_ratio != 1.0:
         print("\n" + CYAN + "  * efektywna pojemnosc RAM po overcommit ({:.0f}%)".format(
             overcommit_ratio * 100) + RESET)
-    print_separator()
+    print_separator(width=136)
 
 
 def print_namespace_report(ns_data):
     print("\n" + BOLD + CYAN + "=" * 120 + RESET)
     print(BOLD + CYAN + "  OVERCOMMIT PER NAMESPACE" + RESET)
     print(BOLD + CYAN + "=" * 120 + RESET)
-    print(BOLD + "{:<38} {:>6}  {:>12} {:>14}".format(
-        "NAMESPACE", "VMs", "CPU commit", "MEM commit") + RESET)
+    print(BOLD + "{:<38} {:>6}  {:>12} {:>14} {:>12}".format(
+        "NAMESPACE", "VMs", "CPU commit", "MEM commit", "STORAGE") + RESET)
     print_separator()
 
-    total_cpu = total_mem = 0.0
+    total_cpu = total_mem = total_stor = 0.0
     for ns in sorted(ns_data.keys()):
         nd = ns_data[ns]
-        total_cpu += nd["cpu_m"]
-        total_mem += nd["mem_mib"]
-        print("{:<38} {:>6}  {:>12} {:>14}".format(
+        total_cpu  += nd["cpu_m"]
+        total_mem  += nd["mem_mib"]
+        total_stor += nd["storage_gib"]
+        print("{:<38} {:>6}  {:>12} {:>14} {:>12}".format(
             ns, len(nd["vms"]),
-            fmt_cpu(nd["cpu_m"]), fmt_mib(nd["mem_mib"])))
+            fmt_cpu(nd["cpu_m"]), fmt_mib(nd["mem_mib"]), fmt_storage(nd["storage_gib"])))
         for vmi in sorted(nd["vms"], key=lambda x: x["mem_mib"], reverse=True):
             phase_col = GREEN if vmi["phase"] == "Running" else YELLOW
             node_info = ("@ " + vmi["node"] if vmi["node"] != "<unscheduled>"
                          else RED + "unscheduled" + RESET)
-            print("  {} {}{:<42}{}  CPU: {:<10} MEM: {:<14} {}".format(
+            print("  {} {}{:<42}{}  CPU: {:<10} MEM: {:<14} STOR: {:<10} {}".format(
                 "+-", phase_col, vmi["name"], RESET,
-                fmt_cpu(vmi["cpu_m"]), fmt_mib(vmi["mem_mib"]), node_info))
+                fmt_cpu(vmi["cpu_m"]), fmt_mib(vmi["mem_mib"]),
+                fmt_storage(vmi["storage_gib"]), node_info))
 
     print_separator()
-    print("{:<38} {:>6}  {:>12} {:>14}".format(
+    print("{:<38} {:>6}  {:>12} {:>14} {:>12}".format(
         "TOTAL",
         sum(len(nd["vms"]) for nd in ns_data.values()),
-        fmt_cpu(total_cpu), fmt_mib(total_mem)))
+        fmt_cpu(total_cpu), fmt_mib(total_mem), fmt_storage(total_stor)))
 
 
 def print_drain_summary(nodes, node_data, overcommit_ratio):
@@ -574,6 +621,7 @@ CSS = """
   .pct-cell.ok { color:var(--ok); } .pct-cell.warn { color:var(--warn); } .pct-cell.crit { color:var(--crit); }
   .drain-ok   { font-family:var(--mono); font-size:11px; color:var(--ok); font-weight:600; }
   .drain-fail { font-family:var(--mono); font-size:11px; color:var(--crit); font-weight:600; }
+  .mono { font-family:var(--mono); font-size:11px; }
   footer { padding:16px 32px; border-top:1px solid var(--border2);
            font-size:11px; color:var(--muted); font-family:var(--mono); }
 """
@@ -644,7 +692,7 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem,
                 '<td class="node-name">' + node_name + '</td>'
                 '<td>' + node_status_badge(None) + '</td>'
                 '<td>' + str(len(nd["vms"])) + '</td>'
-                '<td colspan="9">-</td>'
+                '<td colspan="10">-</td>'
                 '</tr>'
             )
             continue
@@ -698,7 +746,9 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem,
                 '<td>-</td><td>-</td>'
                 '<td>' + fmt_mib(vmi["mem_mib"]) + '</td>'
                 '<td>-</td><td>-</td>'
-                '<td>-</td><td>-</td><td>-</td>'
+                '<td>-</td><td>-</td>'
+                '<td class="mono">' + fmt_storage(vmi["storage_gib"]) + '</td>'
+                '<td>-</td>'
                 '</tr>'
             )
 
@@ -715,20 +765,22 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem,
             '<td>' + bar_html(mem_pct, warn_mem) + '</td>'
             '<td class="headroom ' + hcls_cpu + '">' + fmt_cpu(free_cpu) + '</td>'
             '<td class="headroom ' + hcls_mem + '">' + fmt_mib(free_mem) + '</td>'
+            '<td class="mono">' + fmt_storage(nd["storage_gib"]) + '</td>'
             '<td>' + drain_cell + '</td>'
             '</tr>'
             '<tr class="vm-group hidden">'
-            '<td colspan="12"><table class="vm-table">' + vm_rows + '</table></td>'
+            '<td colspan="13"><table class="vm-table">' + vm_rows + '</table></td>'
             '</tr>'
         )
 
     # ns table
     ns_rows   = ""
-    total_cpu = total_mem_ns = 0.0
+    total_cpu = total_mem_ns = total_stor_ns = 0.0
     for ns in sorted(ns_data.keys()):
         nd = ns_data[ns]
-        total_cpu    += nd["cpu_m"]
-        total_mem_ns += nd["mem_mib"]
+        total_cpu     += nd["cpu_m"]
+        total_mem_ns  += nd["mem_mib"]
+        total_stor_ns += nd["storage_gib"]
         vm_rows = ""
         for vmi in sorted(nd["vms"], key=lambda x: x["mem_mib"], reverse=True):
             node_txt = vmi["node"] if vmi["node"] != "<unscheduled>" else "&#9888; unscheduled"
@@ -738,6 +790,7 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem,
                 '<td>' + phase_badge(vmi["phase"]) + '</td>'
                 '<td>' + fmt_cpu(vmi["cpu_m"]) + '</td>'
                 '<td>' + fmt_mib(vmi["mem_mib"]) + '</td>'
+                '<td class="mono">' + fmt_storage(vmi["storage_gib"]) + '</td>'
                 '<td class="vm-node">' + node_txt + '</td>'
                 '</tr>'
             )
@@ -747,9 +800,10 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem,
             '<td>' + str(len(nd["vms"])) + '</td>'
             '<td>' + fmt_cpu(nd["cpu_m"]) + '</td>'
             '<td>' + fmt_mib(nd["mem_mib"]) + '</td>'
+            '<td class="mono">' + fmt_storage(nd["storage_gib"]) + '</td>'
             '</tr>'
             '<tr class="vm-group hidden">'
-            '<td colspan="4"><table class="vm-table">' + vm_rows + '</table></td>'
+            '<td colspan="5"><table class="vm-table">' + vm_rows + '</table></td>'
             '</tr>'
         )
     ns_rows += (
@@ -758,6 +812,7 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem,
         '<td>' + str(sum(len(nd["vms"]) for nd in ns_data.values())) + '</td>'
         '<td>' + fmt_cpu(total_cpu) + '</td>'
         '<td>' + fmt_mib(total_mem_ns) + '</td>'
+        '<td class="mono">' + fmt_storage(total_stor_ns) + '</td>'
         '</tr>'
     )
 
@@ -798,6 +853,7 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem,
         '<th>CPU used</th><th>CPU alloc</th><th>CPU %</th>'
         '<th>MEM used</th><th>MEM eff*</th><th>MEM %</th>'
         '<th>Free CPU</th><th>Free MEM</th>'
+        '<th>Storage</th>'
         '<th>Drain OK?</th>'
         '</tr></thead>'
         '<tbody>' + node_rows + '</tbody></table>'
@@ -808,7 +864,7 @@ def generate_html(node_data, ns_data, nodes, warn_cpu, warn_mem,
         '<div class="section">'
         '<div class="section-title">&#9632; Overcommit per namespace</div>'
         '<table><thead><tr>'
-        '<th>Namespace</th><th>VMs</th><th>CPU commit</th><th>MEM commit</th>'
+        '<th>Namespace</th><th>VMs</th><th>CPU commit</th><th>MEM commit</th><th>Storage</th>'
         '</tr></thead>'
         '<tbody>' + ns_rows + '</tbody></table>'
         '</div>\n'
@@ -845,7 +901,10 @@ def main():
         print(RED + "Nie udalo sie pobrac nodow." + RESET)
         sys.exit(1)
 
-    vmis = get_vmis(filter_ns=args.namespace)
+    pvcs = get_pvcs()
+    print("Znaleziono {} PVC.".format(len(pvcs)))
+
+    vmis = get_vmis(filter_ns=args.namespace, pvcs=pvcs)
     if not vmis:
         print(YELLOW + "Brak VMI w klastrze." + RESET)
         sys.exit(0)
