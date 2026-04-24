@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-OCP Namespace → Worker Affinity & Resource Usage Analyzer
+OCP nodeSelector → Worker Pool → Namespace Usage Analyzer
 
-Grupuje zuzycie CPU/MEM (requests) per namespace × worker node.
-Wykrywa mechanizm wiazania:
-  - adnotacja openshift.io/node-selector na namespace
-  - nodeSelector na podach
+Grupuje workery w pule wedlug labelek/nodeSelector,
+nastepnie pokazuje jakie namespacey korzystaja z kazdej puli
+i ile zasobow CPU/MEM zuzywa kazdy namespace na danej puli.
 
 Uzycie:
   python3 ns_worker_affinity.py
-  python3 ns_worker_affinity.py --namespace produkcja
   python3 ns_worker_affinity.py --min-pods 3
   python3 ns_worker_affinity.py --warn-cpu 60 --warn-mem 60
+  python3 ns_worker_affinity.py --html raport.html
 """
 
 import sys
@@ -68,7 +67,7 @@ def fmt_mib(mib):
         return "{:.1f} GiB".format(mib / 1024)
     return "{:.0f} MiB".format(mib)
 
-def color_pct(pct, warn=70, crit=90):
+def color_pct(pct, warn=70, crit=100):
     s = "{:.1f}%".format(pct)
     if pct >= crit:
         return RED + BOLD + s + RESET
@@ -106,7 +105,6 @@ def get_oc_json(resource, all_namespaces=False, namespace=None):
 # --- Pobieranie danych ---
 
 def get_worker_nodes():
-    """dict: node_name -> {allocatable_cpu_m, allocatable_mib, labels}"""
     print("Pobieranie worker nodow...")
     data = get_oc_json('nodes')
     workers = {}
@@ -116,18 +114,24 @@ def get_worker_nodes():
             continue
         name   = node['metadata']['name']
         status = node.get('status', {})
+        # zachowaj tylko "uzytkownicze" labele (pomijaj systemowe)
+        custom_labels = {
+            k: v for k, v in labels.items()
+            if not k.startswith('node-role.kubernetes.io/')
+            and not k.startswith('kubernetes.io/')
+            and not k.startswith('beta.kubernetes.io/')
+            and not k.startswith('node.kubernetes.io/')
+        }
         workers[name] = {
-            'allocatable_cpu_m': convert_cpu_to_mcores(status.get('allocatable', {}).get('cpu', '0')),
-            'allocatable_mib':   convert_memory_to_mib(status.get('allocatable', {}).get('memory', '0Mi')),
-            'labels': {k: v for k, v in labels.items()
-                       if not k.startswith('node-role.kubernetes.io/')
-                       and not k.startswith('kubernetes.io/')
-                       and not k.startswith('beta.kubernetes.io/')},
+            'allocatable_cpu_m': convert_cpu_to_mcores(
+                status.get('allocatable', {}).get('cpu', '0')),
+            'allocatable_mib': convert_memory_to_mib(
+                status.get('allocatable', {}).get('memory', '0Mi')),
+            'labels': custom_labels,
         }
     return workers
 
 def get_namespaces():
-    """dict: ns_name -> {node_selector (z adnotacji OCP)}"""
     print("Pobieranie namespace'ow...")
     data = get_oc_json('namespaces')
     result = {}
@@ -135,15 +139,11 @@ def get_namespaces():
         name        = item['metadata']['name']
         annotations = item['metadata'].get('annotations', {})
         result[name] = {
-            'node_selector': annotations.get('openshift.io/node-selector', ''),
+            'node_selector': annotations.get('openshift.io/node-selector', '').strip(),
         }
     return result
 
 def get_pods(filter_ns=None):
-    """
-    Lista podow (tylko Running/Pending na workerach) z polami:
-      namespace, node, cpu_req_m, mem_req_mib, node_selector
-    """
     print("Pobieranie podow{}...".format(
         " (ns: {})".format(filter_ns) if filter_ns else " (wszystkie ns)"))
     data = get_oc_json('pods',
@@ -157,16 +157,13 @@ def get_pods(filter_ns=None):
         phase = pod.get('status', {}).get('phase', '')
         if phase not in ('Running', 'Pending'):
             continue
-
         ns     = pod['metadata']['namespace']
         ns_sel = pod.get('spec', {}).get('nodeSelector', {})
-
         cpu_req = mem_req = 0.0
         for container in pod.get('spec', {}).get('containers', []):
             req      = container.get('resources', {}).get('requests', {})
             cpu_req += convert_cpu_to_mcores(req.get('cpu', ''))
             mem_req += convert_memory_to_mib(req.get('memory', ''))
-
         pods.append({
             'namespace':     ns,
             'node':          node_name,
@@ -179,11 +176,22 @@ def get_pods(filter_ns=None):
 
 # --- Analiza ---
 
+def parse_kv_string(s):
+    """'key=val, key2=val2' → dict"""
+    result = {}
+    for part in s.split(','):
+        part = part.strip()
+        if '=' in part:
+            k, v = part.split('=', 1)
+            result[k.strip()] = v.strip()
+        elif part:
+            result[part] = ''
+    return result
+
 def analyze(pods, workers):
     """
-    Zwraca:
-      usage[(ns, node)] = {cpu_m, mem_mib, pods}
-      selectors[ns]     = set of "key=value" strings (tylko niestandardowe)
+    usage[(ns, node)] = {cpu_m, mem_mib, pods}
+    selectors[ns]     = set of "key=value" strings z pod nodeSelector
     """
     usage     = defaultdict(lambda: {'cpu_m': 0.0, 'mem_mib': 0.0, 'pods': 0})
     selectors = defaultdict(set)
@@ -197,104 +205,186 @@ def analyze(pods, workers):
         usage[(ns, node)]['mem_mib'] += pod['mem_req_mib']
         usage[(ns, node)]['pods']    += 1
 
-        # zbieraj tylko niestandardowe nodeSelector (pomijaj node-role i kubernetes.io)
         for k, v in pod['node_selector'].items():
             if (not k.startswith('node-role.kubernetes.io/')
                     and not k.startswith('kubernetes.io/')
-                    and not k.startswith('beta.kubernetes.io/')):
+                    and not k.startswith('beta.kubernetes.io/')
+                    and not k.startswith('node.kubernetes.io/')):
                 selectors[ns].add("{}={}".format(k, v) if v else k)
 
     return usage, selectors
 
 
-# --- Raport ---
+def build_selector_groups(usage, selectors, namespaces, workers):
+    """
+    Grupuje namespacey po ich efektywnym nodeSelector.
+    Priorytet: ns annotation > pod nodeSelector > domyslny scheduler.
 
-SEP = "─" * 108
+    Zwraca posortowana liste grup:
+    [{ label, type, selector_dict, workers, pool_cpu_m, pool_mem_mib, namespaces }]
+    """
+    ns_set = sorted({ns for ns, _ in usage.keys()})
+    group_map = {}   # frozenset(kv_strings) -> group dict
 
-def print_report(usage, selectors, workers, namespaces,
-                 min_pods, warn_cpu, warn_mem, filter_ns):
+    for ns in ns_set:
+        ann      = namespaces.get(ns, {}).get('node_selector', '')
+        pod_sels = selectors.get(ns, set())
 
-    all_ns = sorted({ns for ns, _ in usage.keys()})
-    if filter_ns:
-        all_ns = [n for n in all_ns if n == filter_ns]
+        if ann:
+            sel_dict  = parse_kv_string(ann)
+            sel_label = ann
+            sel_type  = 'annotation'
+        elif pod_sels:
+            sel_dict = {}
+            for kv in pod_sels:
+                if '=' in kv:
+                    k, v = kv.split('=', 1)
+                    sel_dict[k] = v
+                else:
+                    sel_dict[kv] = ''
+            sel_label = ', '.join(sorted(pod_sels))
+            sel_type  = 'nodeSelector'
+        else:
+            sel_dict  = {}
+            sel_label = '(domyslny scheduler)'
+            sel_type  = 'default'
 
-    print("\n" + BOLD + CYAN + "=" * 108 + RESET)
-    print(BOLD + CYAN + "  NAMESPACE → WORKER: ZUZYCIE CPU/MEM (requests)" + RESET)
-    print(BOLD + CYAN + "=" * 108 + RESET)
+        key = frozenset("{}={}".format(k, v) for k, v in sel_dict.items())
+
+        if key not in group_map:
+            if sel_dict:
+                # workery pasujace do selectora (musza miec WSZYSTKIE labelki)
+                matching = sorted(
+                    wn for wn, wi in workers.items()
+                    if all(wi['labels'].get(k) == v for k, v in sel_dict.items())
+                )
+            else:
+                matching = []   # uzupelniamy po petli
+
+            group_map[key] = {
+                'label':        sel_label,
+                'type':         sel_type,
+                'selector_dict': sel_dict,
+                'workers':      matching,
+                'namespaces':   [],
+            }
+
+        group_map[key]['namespaces'].append(ns)
+
+    # Dla grupy "default" — workery ktore sa faktycznie uzywane przez te namespacey
+    default_key = frozenset()
+    if default_key in group_map:
+        default_ns = set(group_map[default_key]['namespaces'])
+        group_map[default_key]['workers'] = sorted({
+            node for (ns, node) in usage.keys()
+            if ns in default_ns and node in workers
+        })
+
+    # Oblicz pojemnosc puli
+    for grp in group_map.values():
+        grp['pool_cpu_m']   = sum(
+            workers[w]['allocatable_cpu_m'] for w in grp['workers'] if w in workers)
+        grp['pool_mem_mib'] = sum(
+            workers[w]['allocatable_mib']   for w in grp['workers'] if w in workers)
+
+    # Sortuj: annotation, nodeSelector, default
+    order = {'annotation': 0, 'nodeSelector': 1, 'default': 2}
+    return sorted(group_map.values(), key=lambda g: (order[g['type']], g['label']))
+
+
+# --- Terminal output ---
+
+def print_report(groups, usage, workers, min_pods, warn_cpu, warn_mem):
+    W = 110
+    print("\n" + BOLD + CYAN + "=" * W + RESET)
+    print(BOLD + CYAN + "  PULE WORKEROW (nodeSelector) → NAMESPACE: ZUZYCIE CPU/MEM" + RESET)
+    print(BOLD + CYAN + "=" * W + RESET)
+
+    type_label = {
+        'annotation':   'ns annotation (openshift.io/node-selector)',
+        'nodeSelector': 'pod nodeSelector',
+        'default':      'domyslny scheduler',
+    }
 
     grand_cpu = grand_mem = grand_pods = 0
 
-    for ns in all_ns:
-        nodes_for_ns = sorted(node for (n, node) in usage.keys() if n == ns)
-        total_pods = sum(usage[(ns, node)]['pods'] for node in nodes_for_ns)
+    for grp in groups:
+        pool_cpu = grp['pool_cpu_m']
+        pool_mem = grp['pool_mem_mib']
 
-        if total_pods < min_pods:
+        # filtruj namespacey po min_pods
+        ns_active = [
+            ns for ns in grp['namespaces']
+            if sum(usage.get((ns, w), {}).get('pods', 0)
+                   for w in grp['workers']) >= min_pods
+        ]
+        if not ns_active:
             continue
 
-        total_cpu = sum(usage[(ns, node)]['cpu_m']   for node in nodes_for_ns)
-        total_mem = sum(usage[(ns, node)]['mem_mib'] for node in nodes_for_ns)
-        grand_cpu  += total_cpu
-        grand_mem  += total_mem
-        grand_pods += total_pods
+        print("\n  " + BOLD + "nodeSelector: " + grp['label'] + RESET
+              + "  [" + type_label[grp['type']] + "]")
+        print("  " + "─" * (W - 2))
 
-        # --- nagłówek namespace ---
-        print("\n  " + BOLD + "{:<45}".format(ns) + RESET
-              + "  pods: {:>4}   CPU: {:>8}   MEM: {}".format(
-                  total_pods, fmt_cpu(total_cpu), fmt_mib(total_mem)))
-
-        # mechanizm bindingu
-        ns_ann = namespaces.get(ns, {}).get('node_selector', '')
-        ns_sel = selectors.get(ns, set())
-        if ns_ann:
-            print("  " + CYAN + "  [ns annotation]   openshift.io/node-selector: " + ns_ann + RESET)
-        if ns_sel:
-            print("  " + CYAN + "  [pod nodeSelector] " + ", ".join(sorted(ns_sel)) + RESET)
-        if not ns_ann and not ns_sel:
-            print("  " + CYAN + "  [brak explicit bindingu — domyslny scheduler]" + RESET)
-
-        # --- tabela per worker ---
-        print("  " + SEP)
-        print(BOLD + "  {:<32} {:>5}  {:>8}  {:>9}  {:>7}    {:>9}  {:>9}  {:>7}".format(
-            "WORKER", "PODS", "CPU req", "CPU alloc", "CPU%",
-            "MEM req", "MEM alloc", "MEM%"
-        ) + RESET)
-        print("  " + SEP)
-
-        for node in nodes_for_ns:
-            nd = usage[(ns, node)]
-            wi = workers.get(node)
+        # --- workery w puli ---
+        print("  " + CYAN + "Workers w puli ({})  |  pojemnosc puli: CPU {} | MEM {}".format(
+            len(grp['workers']), fmt_cpu(pool_cpu), fmt_mib(pool_mem)) + RESET)
+        for wname in grp['workers']:
+            wi = workers.get(wname)
             if not wi:
                 continue
+            lbl = ", ".join("{}={}".format(k, v) for k, v in sorted(wi['labels'].items()))
+            print("    {:<34}  CPU: {:>8}  MEM: {:>10}  {}".format(
+                wname, fmt_cpu(wi['allocatable_cpu_m']), fmt_mib(wi['allocatable_mib']),
+                "[" + lbl + "]" if lbl else ""))
 
-            cpu_pct = (nd['cpu_m']   / wi['allocatable_cpu_m'] * 100) if wi['allocatable_cpu_m'] > 0 else 0
-            mem_pct = (nd['mem_mib'] / wi['allocatable_mib']   * 100) if wi['allocatable_mib']   > 0 else 0
+        # --- namespacey ---
+        print()
+        print(BOLD + "  {:<42} {:>5}  {:>8}  {:>8}  {:>9}    {:>9}  {:>8}  {:>9}".format(
+            "NAMESPACE", "PODS", "CPU req", "CPU%",
+            "CPU% puli", "MEM req", "MEM%",
+            "MEM% puli") + RESET)
+        print("  " + "─" * (W - 2))
 
-            # znane labele workera (z-pominieciem node-role/k8s)
-            worker_tags = ", ".join(
-                "{}={}".format(k, v) for k, v in sorted(wi['labels'].items())
-            )
+        grp_cpu = grp_mem = grp_pods = 0.0
 
-            print("  {:<32} {:>5}  {:>8}  {:>9}  {:>17}    {:>9}  {:>9}  {:>17}".format(
-                node,
-                nd['pods'],
-                fmt_cpu(nd['cpu_m']),
-                fmt_cpu(wi['allocatable_cpu_m']),
-                color_pct(cpu_pct, warn_cpu),
-                fmt_mib(nd['mem_mib']),
-                fmt_mib(wi['allocatable_mib']),
-                color_pct(mem_pct, warn_mem),
-            ))
-            if worker_tags:
-                print("  " + " " * 32 + CYAN + "  labels: " + worker_tags + RESET)
+        for ns in sorted(ns_active):
+            ns_cpu  = sum(usage.get((ns, w), {}).get('cpu_m', 0)   for w in grp['workers'])
+            ns_mem  = sum(usage.get((ns, w), {}).get('mem_mib', 0) for w in grp['workers'])
+            ns_pods = sum(usage.get((ns, w), {}).get('pods', 0)    for w in grp['workers'])
+            grp_cpu  += ns_cpu
+            grp_mem  += ns_mem
+            grp_pods += ns_pods
 
-        print("  " + SEP)
+            # % wzgledem puli (ile workery tej puli "zjada" ten namespace)
+            cpu_pool_pct = ns_cpu / pool_cpu * 100 if pool_cpu > 0 else 0
+            mem_pool_pct = ns_mem / pool_mem * 100 if pool_mem > 0 else 0
 
-    # --- TOTAL ---
-    print("\n" + BOLD + "─" * 108 + RESET)
-    print(BOLD + "  TOTAL   pods: {:>5}   CPU commit: {:>9}   MEM commit: {}".format(
-        grand_pods, fmt_cpu(grand_cpu), fmt_mib(grand_mem)) + RESET)
-    print(BOLD + "─" * 108 + RESET)
-    print()
+            print("  {:<42} {:>5}  {:>8}  {:>18}  {:>19}".format(
+                ns, int(ns_pods),
+                fmt_cpu(ns_cpu),
+                color_pct(cpu_pool_pct, warn_cpu),
+                fmt_mib(ns_mem),
+            ) + "  " + color_pct(mem_pool_pct, warn_mem))
+
+        print("  " + "─" * (W - 2))
+
+        tot_cpu_pct = grp_cpu / pool_cpu * 100 if pool_cpu > 0 else 0
+        tot_mem_pct = grp_mem / pool_mem * 100 if pool_mem > 0 else 0
+        print(BOLD + "  {:<42} {:>5}  {:>8}  {:>18}  {:>19}".format(
+            "LAZNIE PULA", int(grp_pods),
+            fmt_cpu(grp_cpu),
+            color_pct(tot_cpu_pct, warn_cpu),
+            fmt_mib(grp_mem),
+        ) + "  " + color_pct(tot_mem_pct, warn_mem) + RESET)
+
+        grand_cpu  += grp_cpu
+        grand_mem  += grp_mem
+        grand_pods += grp_pods
+
+    print("\n" + BOLD + "=" * W + RESET)
+    print(BOLD + "  GRAND TOTAL   pods: {}   CPU: {}   MEM: {}".format(
+        int(grand_pods), fmt_cpu(grand_cpu), fmt_mib(grand_mem)) + RESET)
+    print(BOLD + "=" * W + RESET + "\n")
 
 
 # --- HTML ---
@@ -314,7 +404,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans);
        font-size:13px; line-height:1.5; }
 header { background:var(--bg2); border-bottom:1px solid var(--border);
          padding:20px 32px 16px; display:flex; align-items:flex-start;
-         justify-content:space-between; gap:16px; }
+         justify-content:space-between; gap:16px; flex-wrap:wrap; }
 .header-left h1 { font-family:var(--mono); font-size:18px; font-weight:600; color:var(--accent); }
 .header-left h1 span { color:var(--muted); }
 .header-meta { margin-top:6px; font-size:11px; color:var(--muted); font-family:var(--mono); }
@@ -325,20 +415,27 @@ header { background:var(--bg2); border-bottom:1px solid var(--border);
 .card { background:var(--bg2); border:1px solid var(--border); border-radius:8px;
         padding:14px 20px; min-width:130px; }
 .card-val { font-family:var(--mono); font-size:24px; font-weight:600; color:var(--text); line-height:1.2; }
+.card-val.sm { font-size:17px; }
 .card-lbl { font-size:11px; color:var(--muted); margin-top:2px; }
 
-.content { padding:24px 32px; }
-.ns-block { margin-bottom:12px; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
-.ns-header { background:var(--bg2); padding:12px 16px; cursor:pointer; display:flex;
-             align-items:center; gap:10px; flex-wrap:wrap; transition:background 0.15s; }
-.ns-header:hover { background:var(--bg3); }
-.ns-header.open { border-bottom:1px solid var(--border); }
+.content { padding:20px 32px; }
+.toolbar { margin-bottom:14px; display:flex; gap:8px; }
+.btn { background:var(--bg2); color:var(--text); border:1px solid var(--border);
+       border-radius:4px; padding:4px 12px; cursor:pointer;
+       font-family:var(--mono); font-size:11px; }
+.btn:hover { background:var(--bg3); }
+
+.pool-block { margin-bottom:14px; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+
+.pool-header { background:var(--bg2); padding:12px 16px; cursor:pointer;
+               display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+               transition:background 0.15s; }
+.pool-header:hover { background:var(--bg3); }
+.pool-header.open { border-bottom:1px solid var(--border); }
 .chevron { font-size:9px; color:var(--muted); transition:transform 0.2s; flex-shrink:0; }
-.ns-header.open .chevron { transform:rotate(90deg); }
-.ns-name { font-family:var(--mono); font-size:13px; font-weight:600; color:var(--text); flex:1; min-width:180px; }
-.ns-stats { font-family:var(--mono); font-size:11px; color:var(--muted); margin-left:auto; white-space:nowrap; }
-.ns-body { background:var(--bg); display:none; }
-.ns-body.open { display:block; }
+.pool-header.open .chevron { transform:rotate(90deg); }
+.sel-label { font-family:var(--mono); font-size:13px; font-weight:600; color:var(--text); flex:1; min-width:200px; }
+.pool-stats { font-family:var(--mono); font-size:11px; color:var(--muted); margin-left:auto; white-space:nowrap; }
 
 .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:10px;
          font-weight:600; font-family:var(--mono); white-space:nowrap; }
@@ -348,23 +445,33 @@ header { background:var(--bg2); border-bottom:1px solid var(--border);
 .badge-lbl  { background:#1a2030; color:#79c0ff; border:1px solid #1f4070;
               font-size:9px; padding:1px 6px; margin:1px; }
 
-.binding-row { padding:8px 16px; font-size:11px; color:var(--muted); font-family:var(--mono);
-               border-bottom:1px solid var(--border2); background:var(--bg2); }
-.binding-row span { color:var(--text); }
+.pool-body { background:var(--bg); display:none; }
+.pool-body.open { display:block; }
+
+.workers-section { padding:12px 16px; border-bottom:1px solid var(--border2);
+                   background:var(--bg2); }
+.workers-title { font-family:var(--mono); font-size:10px; color:var(--muted);
+                 text-transform:uppercase; letter-spacing:1px; margin-bottom:8px; }
+.worker-row { display:flex; align-items:center; gap:16px; padding:4px 0;
+              font-family:var(--mono); font-size:11px; flex-wrap:wrap; }
+.worker-name { color:var(--text); font-weight:600; min-width:220px; }
+.worker-cap { color:var(--muted); }
+.worker-labels { display:flex; flex-wrap:wrap; gap:2px; }
 
 table { width:100%; border-collapse:collapse; font-size:12px; }
 th { background:var(--bg3); color:var(--muted); font-family:var(--mono); font-size:10px;
      font-weight:600; text-transform:uppercase; letter-spacing:0.8px; padding:8px 12px;
      text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
+th.r { text-align:right; }
 td { padding:7px 12px; border-bottom:1px solid var(--border2); vertical-align:middle; }
+td.r { text-align:right; font-family:var(--mono); font-size:11px; }
 tr:last-child td { border-bottom:none; }
 tr:hover td { background:var(--bg3); }
+.ns-name { font-family:var(--mono); font-size:12px; font-weight:600; }
+.total-row td { font-family:var(--mono); font-weight:600; color:var(--text);
+                background:var(--bg3); border-top:2px solid var(--border); }
 
-.node-name { font-family:var(--mono); font-size:12px; font-weight:600; white-space:nowrap; }
-.mono { font-family:var(--mono); font-size:11px; }
-.labels-cell { min-width:140px; }
-
-.bar-wrap { display:inline-block; width:60px; height:6px; background:var(--bg3);
+.bar-wrap { display:inline-block; width:55px; height:6px; background:var(--bg3);
             border-radius:3px; overflow:hidden; vertical-align:middle; margin-right:5px;
             border:1px solid var(--border2); }
 .bar { height:100%; border-radius:3px; }
@@ -376,63 +483,49 @@ tr:hover td { background:var(--bg3); }
 .pct.warn { color:var(--warn); }
 .pct.crit { color:var(--crit); }
 
-.total-row td { font-family:var(--mono); font-weight:600; color:var(--text);
-                background:var(--bg3); border-top:2px solid var(--border); }
-
 footer { padding:16px 32px; border-top:1px solid var(--border2);
          font-size:11px; color:var(--muted); font-family:var(--mono); }
 """
 
 HTML_JS = """
-function toggleNs(el) {
+function togglePool(el) {
   el.classList.toggle('open');
   var body = el.nextElementSibling;
-  while (body && !body.classList.contains('ns-body')) {
-    body = body.nextElementSibling;
-  }
+  while (body && !body.classList.contains('pool-body')) body = body.nextElementSibling;
   if (body) body.classList.toggle('open');
 }
-function expandAll() {
-  document.querySelectorAll('.ns-header').forEach(function(h) {
-    h.classList.add('open');
+function expandAll()   { toggle(true);  }
+function collapseAll() { toggle(false); }
+function toggle(open) {
+  document.querySelectorAll('.pool-header').forEach(function(h) {
+    open ? h.classList.add('open') : h.classList.remove('open');
     var b = h.nextElementSibling;
-    while (b && !b.classList.contains('ns-body')) b = b.nextElementSibling;
-    if (b) b.classList.add('open');
-  });
-}
-function collapseAll() {
-  document.querySelectorAll('.ns-header').forEach(function(h) {
-    h.classList.remove('open');
-    var b = h.nextElementSibling;
-    while (b && !b.classList.contains('ns-body')) b = b.nextElementSibling;
-    if (b) b.classList.remove('open');
+    while (b && !b.classList.contains('pool-body')) b = b.nextElementSibling;
+    if (b) open ? b.classList.add('open') : b.classList.remove('open');
   });
 }
 """
 
 
-def _pct_cls(pct, warn, crit=100):
-    if pct >= crit: return "crit"
+def _pct_cls(pct, warn):
+    if pct >= 100: return "crit"
     if pct >= warn: return "warn"
     return "ok"
 
-def _bar(pct, warn):
+def _bar_html(pct, warn):
     cls   = _pct_cls(pct, warn)
     width = min(pct, 100)
     return (
-        '<div class="bar-wrap"><div class="bar {cls}" style="width:{w:.1f}%"></div></div>'
-        '<span class="pct {cls}">{p:.1f}%</span>'
-    ).format(cls=cls, w=width, p=pct)
+        '<div class="bar-wrap"><div class="bar {c}" style="width:{w:.1f}%"></div></div>'
+        '<span class="pct {c}">{p:.1f}%</span>'
+    ).format(c=cls, w=width, p=pct)
 
-def _binding_badges(ns_ann, ns_sel):
-    badges = []
-    if ns_ann:
-        badges.append('<span class="badge badge-ann">ns annotation</span>')
-    if ns_sel:
-        badges.append('<span class="badge badge-sel">pod nodeSelector</span>')
-    if not ns_ann and not ns_sel:
-        badges.append('<span class="badge badge-def">domyslny scheduler</span>')
-    return " ".join(badges)
+def _type_badge(t):
+    if t == 'annotation':
+        return '<span class="badge badge-ann">ns annotation</span>'
+    if t == 'nodeSelector':
+        return '<span class="badge badge-sel">pod nodeSelector</span>'
+    return '<span class="badge badge-def">domyslny scheduler</span>'
 
 def _label_badges(labels_dict):
     return "".join(
@@ -441,137 +534,159 @@ def _label_badges(labels_dict):
     )
 
 
-def generate_html(usage, selectors, workers, namespaces,
-                  min_pods, warn_cpu, warn_mem, filter_ns):
-    now    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    all_ns = sorted({ns for ns, _ in usage.keys()})
-    if filter_ns:
-        all_ns = [n for n in all_ns if n == filter_ns]
+def generate_html(groups, usage, workers, min_pods, warn_cpu, warn_mem):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    grand_cpu = grand_mem = grand_pods = 0
-    ns_blocks = ""
+    total_pools = 0
+    total_ns    = set()
+    grand_cpu   = grand_mem = grand_pods = 0.0
 
-    for ns in all_ns:
-        nodes_for_ns = sorted(node for (n, node) in usage.keys() if n == ns)
-        total_pods   = sum(usage[(ns, node)]['pods']    for node in nodes_for_ns)
-        if total_pods < min_pods:
+    pool_blocks = ""
+
+    for grp in groups:
+        ns_active = [
+            ns for ns in grp['namespaces']
+            if sum(usage.get((ns, w), {}).get('pods', 0)
+                   for w in grp['workers']) >= min_pods
+        ]
+        if not ns_active:
             continue
 
-        total_cpu = sum(usage[(ns, node)]['cpu_m']   for node in nodes_for_ns)
-        total_mem = sum(usage[(ns, node)]['mem_mib'] for node in nodes_for_ns)
-        grand_cpu  += total_cpu
-        grand_mem  += total_mem
-        grand_pods += total_pods
+        total_pools += 1
+        total_ns.update(ns_active)
 
-        ns_ann  = namespaces.get(ns, {}).get('node_selector', '')
-        ns_sel  = selectors.get(ns, set())
-        binding = _binding_badges(ns_ann, ns_sel)
+        pool_cpu = grp['pool_cpu_m']
+        pool_mem = grp['pool_mem_mib']
 
-        stats = (
-            '<span class="ns-stats">pods: {p} &nbsp;|&nbsp; '
-            'CPU: {c} &nbsp;|&nbsp; MEM: {m}</span>'
-        ).format(p=total_pods, c=fmt_cpu(total_cpu), m=fmt_mib(total_mem))
-
-        # binding detail row
-        detail_parts = []
-        if ns_ann:
-            detail_parts.append(
-                'openshift.io/node-selector: <span>{}</span>'.format(ns_ann))
-        if ns_sel:
-            detail_parts.append(
-                'pod nodeSelector: <span>{}</span>'.format(
-                    ", ".join(sorted(ns_sel))))
-        binding_row = ""
-        if detail_parts:
-            binding_row = (
-                '<div class="binding-row">' +
-                " &nbsp;&bull;&nbsp; ".join(detail_parts) +
-                '</div>'
-            )
-
-        # worker rows
-        worker_rows = ""
-        for node in nodes_for_ns:
-            nd = usage[(ns, node)]
-            wi = workers.get(node)
+        # --- workers section ---
+        workers_html = ""
+        for wname in grp['workers']:
+            wi = workers.get(wname)
             if not wi:
                 continue
-            cpu_pct = (nd['cpu_m']   / wi['allocatable_cpu_m'] * 100) if wi['allocatable_cpu_m'] > 0 else 0
-            mem_pct = (nd['mem_mib'] / wi['allocatable_mib']   * 100) if wi['allocatable_mib']   > 0 else 0
-            worker_rows += (
+            workers_html += (
+                '<div class="worker-row">'
+                '<span class="worker-name">{name}</span>'
+                '<span class="worker-cap">CPU: {cpu} &nbsp;|&nbsp; MEM: {mem}</span>'
+                '<span class="worker-labels">{labels}</span>'
+                '</div>'
+            ).format(
+                name=wname,
+                cpu=fmt_cpu(wi['allocatable_cpu_m']),
+                mem=fmt_mib(wi['allocatable_mib']),
+                labels=_label_badges(wi['labels']),
+            )
+
+        # --- namespace rows ---
+        ns_rows = ""
+        grp_cpu = grp_mem = grp_pods = 0.0
+
+        for ns in sorted(ns_active):
+            ns_cpu  = sum(usage.get((ns, w), {}).get('cpu_m', 0)   for w in grp['workers'])
+            ns_mem  = sum(usage.get((ns, w), {}).get('mem_mib', 0) for w in grp['workers'])
+            ns_pods = sum(usage.get((ns, w), {}).get('pods', 0)    for w in grp['workers'])
+            grp_cpu  += ns_cpu
+            grp_mem  += ns_mem
+            grp_pods += ns_pods
+
+            cpu_pct = ns_cpu / pool_cpu * 100 if pool_cpu > 0 else 0
+            mem_pct = ns_mem / pool_mem * 100 if pool_mem > 0 else 0
+
+            ns_rows += (
                 '<tr>'
-                '<td class="node-name">{node}</td>'
-                '<td class="labels-cell">{labels}</td>'
-                '<td class="mono">{pods}</td>'
-                '<td class="mono">{cpu_req}</td>'
-                '<td class="mono">{cpu_alloc}</td>'
+                '<td class="ns-name">{ns}</td>'
+                '<td class="r">{pods}</td>'
+                '<td class="r">{cpu}</td>'
                 '<td>{cpu_bar}</td>'
-                '<td class="mono">{mem_req}</td>'
-                '<td class="mono">{mem_alloc}</td>'
+                '<td class="r">{mem}</td>'
                 '<td>{mem_bar}</td>'
                 '</tr>'
             ).format(
-                node=node,
-                labels=_label_badges(wi['labels']),
-                pods=nd['pods'],
-                cpu_req=fmt_cpu(nd['cpu_m']),
-                cpu_alloc=fmt_cpu(wi['allocatable_cpu_m']),
-                cpu_bar=_bar(cpu_pct, warn_cpu),
-                mem_req=fmt_mib(nd['mem_mib']),
-                mem_alloc=fmt_mib(wi['allocatable_mib']),
-                mem_bar=_bar(mem_pct, warn_mem),
+                ns=ns, pods=int(ns_pods),
+                cpu=fmt_cpu(ns_cpu), cpu_bar=_bar_html(cpu_pct, warn_cpu),
+                mem=fmt_mib(ns_mem), mem_bar=_bar_html(mem_pct, warn_mem),
             )
 
-        ns_blocks += (
-            '<div class="ns-block">'
-            '<div class="ns-header" onclick="toggleNs(this)">'
+        tot_cpu_pct = grp_cpu / pool_cpu * 100 if pool_cpu > 0 else 0
+        tot_mem_pct = grp_mem / pool_mem * 100 if pool_mem > 0 else 0
+
+        ns_rows += (
+            '<tr class="total-row">'
+            '<td>LAZNIE PULA</td>'
+            '<td class="r">{pods}</td>'
+            '<td class="r">{cpu}</td>'
+            '<td>{cpu_bar}</td>'
+            '<td class="r">{mem}</td>'
+            '<td>{mem_bar}</td>'
+            '</tr>'
+        ).format(
+            pods=int(grp_pods),
+            cpu=fmt_cpu(grp_cpu), cpu_bar=_bar_html(tot_cpu_pct, warn_cpu),
+            mem=fmt_mib(grp_mem), mem_bar=_bar_html(tot_mem_pct, warn_mem),
+        )
+
+        grand_cpu  += grp_cpu
+        grand_mem  += grp_mem
+        grand_pods += grp_pods
+
+        pool_stats = (
+            'workers: {nw} &nbsp;|&nbsp; pula: CPU {cpu} | MEM {mem} '
+            '&nbsp;|&nbsp; ns: {nns}'
+        ).format(
+            nw=len(grp['workers']),
+            cpu=fmt_cpu(pool_cpu), mem=fmt_mib(pool_mem),
+            nns=len(ns_active),
+        )
+
+        pool_blocks += (
+            '<div class="pool-block">'
+            '<div class="pool-header" onclick="togglePool(this)">'
             '<span class="chevron">&#9654;</span>'
-            '<span class="ns-name">{ns}</span>'
-            '{binding}'
-            '{stats}'
+            '<span class="sel-label">{label}</span>'
+            '{badge}'
+            '<span class="pool-stats">{stats}</span>'
             '</div>'
-            '{binding_row}'
-            '<div class="ns-body">'
+            '<div class="pool-body">'
+            '<div class="workers-section">'
+            '<div class="workers-title">Workers w puli &mdash; pojemnosc</div>'
+            '{workers}'
+            '</div>'
             '<table>'
             '<thead><tr>'
-            '<th>Worker</th><th>Labels</th><th>Pods</th>'
-            '<th>CPU req</th><th>CPU alloc</th><th>CPU %</th>'
-            '<th>MEM req</th><th>MEM alloc</th><th>MEM %</th>'
+            '<th>Namespace</th><th class="r">Pods</th>'
+            '<th class="r">CPU req</th><th>CPU % puli</th>'
+            '<th class="r">MEM req</th><th>MEM % puli</th>'
             '</tr></thead>'
-            '<tbody>{rows}</tbody>'
+            '<tbody>{ns_rows}</tbody>'
             '</table>'
             '</div>'
             '</div>'
         ).format(
-            ns=ns, binding=binding, stats=stats,
-            binding_row=binding_row, rows=worker_rows,
+            label=grp['label'],
+            badge=_type_badge(grp['type']),
+            stats=pool_stats,
+            workers=workers_html,
+            ns_rows=ns_rows,
         )
 
-    total_ns = len([ns for ns in all_ns
-                    if sum(usage[(ns, node)]['pods']
-                           for node in (node for (n, node) in usage.keys() if n == ns))
-                    >= min_pods])
-
+    # cards
     cards = (
         '<div class="cards">'
+        '<div class="card"><div class="card-val">{pools}</div>'
+        '<div class="card-lbl">Pul (nodeSelector)</div></div>'
         '<div class="card"><div class="card-val">{ns}</div>'
         '<div class="card-lbl">Namespace\'ow</div></div>'
         '<div class="card"><div class="card-val">{pods}</div>'
         '<div class="card-lbl">Podow (Running/Pending)</div></div>'
-        '<div class="card"><div class="card-val" style="font-size:18px">{cpu}</div>'
-        '<div class="card-lbl">CPU commit (requests)</div></div>'
-        '<div class="card"><div class="card-val" style="font-size:18px">{mem}</div>'
-        '<div class="card-lbl">MEM commit (requests)</div></div>'
-        '<div class="card"><div class="card-val">{workers}</div>'
-        '<div class="card-lbl">Worker nodow</div></div>'
+        '<div class="card"><div class="card-val sm">{cpu}</div>'
+        '<div class="card-lbl">CPU commit</div></div>'
+        '<div class="card"><div class="card-val sm">{mem}</div>'
+        '<div class="card-lbl">MEM commit</div></div>'
         '</div>'
     ).format(
-        ns=total_ns, pods=grand_pods,
+        pools=total_pools, ns=len(total_ns), pods=int(grand_pods),
         cpu=fmt_cpu(grand_cpu), mem=fmt_mib(grand_mem),
-        workers=len(workers),
     )
-
-    filter_info = (" &bull; ns: " + filter_ns) if filter_ns else ""
 
     footer = (
         '<footer>OCP NS-Worker Affinity Analyzer'
@@ -584,36 +699,29 @@ def generate_html(usage, selectors, workers, namespaces,
         '<!DOCTYPE html>\n<html lang="pl">\n<head>\n'
         '<meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
-        '<title>OCP NS-Worker Affinity Report</title>'
+        '<title>OCP Worker Pool Report</title>'
         '<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600'
         '&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">'
         '<style>' + HTML_CSS + '</style>'
         '</head>\n<body>\n'
         '<header>'
         '<div class="header-left">'
-        '<h1>OCP<span>/</span>Namespace &rarr; Worker &mdash; Affinity &amp; Usage</h1>'
-        '<div class="header-meta">Wygenerowano: ' + now + filter_info + '</div>'
+        '<h1>OCP<span>/</span>Worker Pools &mdash; Namespace Usage</h1>'
+        '<div class="header-meta">Wygenerowano: ' + now + '</div>'
         '</div>'
         '<div class="legend">'
         '<span><span class="legend-dot" style="background:var(--ann)"></span>ns annotation</span>'
         '<span><span class="legend-dot" style="background:var(--sel)"></span>pod nodeSelector</span>'
         '<span><span class="legend-dot" style="background:var(--def)"></span>domyslny scheduler</span>'
-        '<span><span class="legend-dot" style="background:var(--ok)"></span>ok</span>'
-        '<span><span class="legend-dot" style="background:var(--warn)"></span>warn</span>'
-        '<span><span class="legend-dot" style="background:var(--crit)"></span>crit</span>'
         '</div>'
         '</header>\n'
         + cards +
         '<div class="content">'
-        '<div style="margin-bottom:12px;display:flex;gap:8px;">'
-        '<button onclick="expandAll()" style="background:var(--bg2);color:var(--text);'
-        'border:1px solid var(--border);border-radius:4px;padding:4px 12px;'
-        'cursor:pointer;font-family:var(--mono);font-size:11px;">Rozwin wszystko</button>'
-        '<button onclick="collapseAll()" style="background:var(--bg2);color:var(--text);'
-        'border:1px solid var(--border);border-radius:4px;padding:4px 12px;'
-        'cursor:pointer;font-family:var(--mono);font-size:11px;">Zwij wszystko</button>'
+        '<div class="toolbar">'
+        '<button class="btn" onclick="expandAll()">Rozwin wszystko</button>'
+        '<button class="btn" onclick="collapseAll()">Zwij wszystko</button>'
         '</div>'
-        + ns_blocks +
+        + pool_blocks +
         '</div>\n'
         + footer +
         '<script>' + HTML_JS + '</script>'
@@ -625,38 +733,36 @@ def generate_html(usage, selectors, workers, namespaces,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OCP Namespace-Worker affinity & resource usage analyzer")
-    parser.add_argument('--namespace', '-n',  help="Filtruj po namespace")
-    parser.add_argument('--min-pods',  type=int, default=1,
+        description="OCP nodeSelector → Worker Pool → Namespace usage analyzer")
+    parser.add_argument('--min-pods', type=int, default=1,
                         help="Pomin namespace z mniej niz N podami (domyslnie 1)")
-    parser.add_argument('--warn-cpu',  type=float, default=70,
-                        help="Prog ostrzezenia CPU %% (domyslnie 70)")
-    parser.add_argument('--warn-mem',  type=float, default=70,
-                        help="Prog ostrzezenia MEM %% (domyslnie 70)")
+    parser.add_argument('--warn-cpu', type=float, default=70,
+                        help="Prog ostrzezenia CPU %% puli (domyslnie 70)")
+    parser.add_argument('--warn-mem', type=float, default=70,
+                        help="Prog ostrzezenia MEM %% puli (domyslnie 70)")
     parser.add_argument('--html', metavar='PLIK.html',
                         help="Zapisz raport HTML do pliku")
     args = parser.parse_args()
 
     workers    = get_worker_nodes()
     namespaces = get_namespaces()
-    pods       = get_pods(filter_ns=args.namespace)
+    pods       = get_pods()
 
-    print("Znaleziono {} worker nodow, {} podow.".format(len(workers), len(pods)))
+    print("Znaleziono {} worker nodow, {} podow.\n".format(len(workers), len(pods)))
 
     usage, selectors = analyze(pods, workers)
+    groups           = build_selector_groups(usage, selectors, namespaces, workers)
 
-    print_report(usage, selectors, workers, namespaces,
+    print_report(groups, usage, workers,
                  min_pods=args.min_pods,
                  warn_cpu=args.warn_cpu,
-                 warn_mem=args.warn_mem,
-                 filter_ns=args.namespace)
+                 warn_mem=args.warn_mem)
 
     if args.html:
-        html = generate_html(usage, selectors, workers, namespaces,
+        html = generate_html(groups, usage, workers,
                              min_pods=args.min_pods,
                              warn_cpu=args.warn_cpu,
-                             warn_mem=args.warn_mem,
-                             filter_ns=args.namespace)
+                             warn_mem=args.warn_mem)
         with open(args.html, "w", encoding="utf-8") as f:
             f.write(html)
         print(GREEN + BOLD + "Raport HTML: " + RESET + os.path.abspath(args.html))
