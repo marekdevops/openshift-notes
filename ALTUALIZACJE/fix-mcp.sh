@@ -49,22 +49,22 @@ echo ""
 
 [[ -z "$DESIRED" ]] && error "Brak annotacji desiredConfig na nodzie — sprawdź stan MCO"
 
-# ─── Krok 1: Usuń currentConfig żeby wymusić re-sync ─────────────────────────
-info "Krok 1/3 — Usuwam annotację currentConfig z noda '$NODE'..."
+# ─── Krok 1: Wyrównaj currentConfig → desiredConfig ──────────────────────────
+info "Krok 1/2 — Ustawiam currentConfig = desiredConfig ('${DESIRED}')..."
 oc annotate node "$NODE" \
-  machineconfiguration.openshift.io/currentConfig- \
+  machineconfiguration.openshift.io/currentConfig="${DESIRED}" \
   --overwrite
-ok "Annotacja currentConfig usunięta"
+ok "currentConfig ustawiony na: ${DESIRED}"
 
 # ─── Krok 2: Re-set desiredConfig (wymusza MCO re-trigger) ───────────────────
-info "Krok 2/3 — Wymuszam re-set desiredConfig na '$DESIRED'..."
+info "Krok 2/2 — Wymuszam re-set desiredConfig na '${DESIRED}'..."
 oc annotate node "$NODE" \
   machineconfiguration.openshift.io/desiredConfig="${DESIRED}" \
   --overwrite
 ok "desiredConfig ustawiony na: ${DESIRED}"
 
 # ─── Krok 3: Obserwacja logów MCD ────────────────────────────────────────────
-info "Krok 3/3 — Szukam poda machine-config-daemon na nodzie '$NODE'..."
+info "Krok 3 — Szukam poda machine-config-daemon na nodzie '$NODE'..."
 
 MCD_POD=$(oc get pod -n openshift-machine-config-operator \
   -l k8s-app=machine-config-daemon \
