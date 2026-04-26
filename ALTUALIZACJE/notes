@@ -1,0 +1,53 @@
+# Stan nodów i MCP
+oc get nodes
+oc get mcp
+
+# Szczegóły błędu na problematycznym nodzie
+oc get node <node-name> -o yaml | grep -A 20 "conditions:"
+
+# Stan MCO i jego logi
+oc get co machine-config
+oc logs -n openshift-machine-config-operator \
+  deployment/machine-config-operator --tail=100
+
+# Który rendered MC jest aktualnie "desired" vs "current" na nodzie
+oc get node <node-name> -o jsonpath=\
+  '{.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig}{"\n"}'
+oc get node <node-name> -o jsonpath=\
+  '{.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig}{"\n"}'
+
+
+
+
+  # Na samym nodzie (przez debug pod) — sprawdź rzeczywistą zawartość pliku
+oc debug node/<node-name>
+chroot /host
+cat /etc/systemd/system/kubelet.service
+sha256sum /etc/systemd/system/kubelet.service
+
+# Porównaj z tym czego oczekuje rendered MC
+oc get mc rendered-master-XXXXXXXXXXXX -o jsonpath=\
+  '{.spec.config.storage.files[?(@.path=="/etc/systemd/system/kubelet.service")].contents.source}' \
+  | python3 -c "import sys,urllib.parse; \
+    d=sys.stdin.read(); \
+    print(urllib.parse.unquote(d.split(',',1)[1]))"
+
+
+    --------------------------------------------
+    # Wymuś MCO żeby ponownie spróbował zaaplikować config na nodzie
+oc annotate node <node-name> \
+  machineconfiguration.openshift.io/currentConfig- \
+  --overwrite
+
+# Lub wymuszenie przez usunięcie i re-set desired config
+DESIRED=$(oc get node <node-name> -o jsonpath=\
+  '{.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig}')
+
+oc annotate node <node-name> \
+  machineconfiguration.openshift.io/desiredConfig="${DESIRED}" \
+  --overwrite
+
+  oc logs -n openshift-machine-config-operator \
+  -l k8s-app=machine-config-daemon \
+  --field-selector spec.nodeName=<node-name> \
+  --tail=50 -f
