@@ -1,45 +1,14 @@
-apiVersion: v1
-  kind: Secret
-  metadata:
-    name: quay-config-bundle
-    namespace: quay-registry                                                                                                                                                                                                                           
-  stringData:
-    config.yaml: |                                                                                                                                                                                                                                     
-      DISTRIBUTED_STORAGE_CONFIG:                           
-        default:
-          - LocalStorage
-          - storage_path: /datastorage/registry
-      DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS: []                                                                                                                                                                                                        
-      DISTRIBUTED_STORAGE_PREFERENCE:
-        - default                                                                                                                                                                                                                                      
-                                                            
+kind: ImageSetConfiguration                                                                                                                                                                                                                          
+  apiVersion: mirror.openshift.io/v2alpha1
+  mirror:                                                                                                                                                                                                                                              
+    platform:                                               
+      channels:                                                                                                                                                                                                                                        
+        - name: stable-4.21                                 
+          minVersion: 4.21.7
+          type: ocp
+
   ---
-  Krok 3 — QuayRegistry
-
-  apiVersion: quay.redhat.com/v1
-  kind: QuayRegistry                                                                                                                                                                                                                                   
-  metadata:
-    name: quay                                                                                                                                                                                                                                         
-    namespace: quay-registry                                
-  spec:
-    configBundleSecret: quay-config-bundle
-    components:
-      - kind: objectstorage
-        managed: false                                                                                                                                                                                                                                 
-      - kind: postgres
-        managed: true                                                                                                                                                                                                                                  
-      - kind: redis                                         
-        managed: true
-      - kind: route
-        managed: true
-      - kind: quay
-        managed: true                                                                                                                                                                                                                                  
-        overrides:
-          volumeMounts:                                                                                                                                                                                                                                
-            - name: quay-storage                            
-              mountPath: /datastorage/registry
-          volumes:                                                                                                                                                                                                                                     
-            - name: quay-storage
-              persistentVolumeClaim:                                                                                                                                                                                                                   
-                claimName: quay-storage                     
-
+  Krok 2 — Uruchom mirror (podstaw swój hostname bastionu)
+                                                                                                                                                                                                                                                       
+  oc mirror --config=imageset-config.yaml \
+    docker://<HO
