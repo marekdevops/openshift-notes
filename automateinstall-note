@@ -1,0 +1,18 @@
+  # Zakoduj login:haslo w base64                                                                                                                                                                                                                       
+  echo -n "init:<HASLO>" | base64                                                                                                                                                                                                                      
+   
+  # Dodaj do pull-secret.json nowy wpis dla lokalnego mirror                                                                                                                                                                                           
+  cat ~/.openshift/pull-secret.json | python3 -c "          
+  import json, sys                                                                                                                                                                                                                                     
+  ps = json.load(sys.stdin)                                 
+  ps['auths']['oshift-ansible.ad.sgb.pl:8443'] = {'auth': '<BASE64-Z-POWYZSZEGO>'}                                                                                                                                                                     
+  print(json.dumps(ps))                                                                                                                                                                                                                                
+  " > ~/.openshift/pull-secret-mirror.json                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                       
+  # Sprawdź czy poprawnie dodano                                                                                                                                                                                                                       
+  cat ~/.openshift/pull-secret-mirror.json | python3 -m json.tool | grep -A2 "oshift-ansible"
+                                                                                                                                                                                                                                                       
+  Potem zaktualizuj clusters/ocp1.yml żeby używał nowego pull secret:                                                                                                                                                                                  
+                                                                                                                                                                                                                                                       
+  pull_secret_file: ~/.openshift/pull-secret-mirror.json                                                                                                                                                                                               
+                                                            
