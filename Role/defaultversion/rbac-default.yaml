@@ -2,17 +2,19 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  # Nazwa roli opisująca jej funkcję
   name: version-reader-cluster-role
 rules:
 - apiGroups: ["apps"]
-  # Dostęp do Deploymentów i StatefulSetów, gdzie zaszyte są wersje obrazów
+  # Dostęp do wersji oprogramowania
   resources: ["deployments", "statefulsets"]
   verbs: ["get", "list", "watch"]
 - apiGroups: [""]
-  # Dodatkowo dostęp do listowania projektów (namespaces), 
-  # aby skrypt wiedział, jakie projekty istnieją na klastrze
+  # Standardowe namespaces (K8s)
   resources: ["namespaces"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["project.openshift.io"]
+  # Projekty widoczne dla komendy 'oc get projects' (OpenShift)
+  resources: ["projects"]
   verbs: ["get", "list", "watch"]
 
 ---
@@ -22,10 +24,8 @@ metadata:
   name: read-versions-globally-binding
 subjects:
 - kind: ServiceAccount
-  # TUTAJ WPISZ NAZWĘ SWOJEGO SERVICE ACCOUNT
-  name: default
-  # TUTAJ WPISZ PROJEKT (NAMESPACE), W KTÓRYM JEST TEN SERVICE ACCOUNT
-  namespace: default
+  name: version-collector        # Upewnij się, że nazwa jest poprawna
+  namespace: monitoring-tools    # Upewnij się, że projekt jest poprawny
 roleRef:
   kind: ClusterRole
   name: version-reader-cluster-role
