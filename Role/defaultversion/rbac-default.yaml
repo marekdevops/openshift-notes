@@ -25,7 +25,7 @@ subjects:
   # TUTAJ WPISZ NAZWĘ SWOJEGO SERVICE ACCOUNT
   name: default
   # TUTAJ WPISZ PROJEKT (NAMESPACE), W KTÓRYM JEST TEN SERVICE ACCOUNT
-  namespace: monitoring-tools
+  namespace: default
 roleRef:
   kind: ClusterRole
   name: version-reader-cluster-role
