@@ -27,3 +27,6 @@ roleRef:
   kind: ClusterRole
   name: version-scanner-role
   apiGroup: rbac.authorization.k8s.io
+
+
+oc auth can-i list deployments --all-namespaces --as=system:serviceaccount:default:default
