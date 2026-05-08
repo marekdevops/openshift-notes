@@ -12,3 +12,14 @@ kind: ImageSetConfiguration
                                                                                                                                                                                                                                                        
   oc mirror --config=imageset-config.yaml \
     docker://<HO
+
+
+
+       1  - name: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:480b04a55b7b86e80cc79c6695ab39b68a9714588eaa2d2c7264481541015651
+   15     - name: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:ee64c1f14ae6605b2988fdd63ad68c827606846c0d9071479f99df7a7c498175
+   16     
+   17     # Obrazy Assisted Service (MCE 2.11) - ABI ich bezwzględnie wymaga
+   18     - name: registry.redhat.io/multicluster-engine/assisted-service-rhel9:v2.11
+   19     - name: registry.redhat.io/multicluster-engine/assisted-installer-agent-rhel9:v2.11
+   20     - name: registry.redhat.io/multicluster-engine/assisted-installer-rhel9:v2.11
+
