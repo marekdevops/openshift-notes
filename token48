@@ -1,0 +1,9 @@
+# 1. Stwórz ServiceAccount w projekcie
+oc -n <twój-projekt> create serviceaccount tmp-admin
+
+# 2. Nadaj cluster-admin
+oc adm policy add-cluster-role-to-user cluster-admin \
+  -z tmp-admin -n <twój-projekt>
+
+# 3. Wygeneruj token z TTL 48h (172800 sekund)
+oc -n <twój-projekt> create token tmp-admin --duration=172800s
