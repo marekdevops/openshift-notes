@@ -27,6 +27,16 @@
             name: "{{ sa_name }}"
             namespace: "{{ sa_namespace }}"
 
+    - name: "FORCE: Usuwanie istniejącego RoleBinding (zmiana roli)"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        name: "{{ sa_name }}-binding"
+        namespace: "{{ sa_namespace }}"
+        wait: true
+      when: force_recreate
+
     - name: "Przypisanie roli: {{ role_name }}"
       kubernetes.core.k8s:
         state: present
