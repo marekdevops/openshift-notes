@@ -9,6 +9,7 @@
     sa_namespace: "{{ ns | default('default') }}"
     sa_name: "{{ name | default('') }}"
     role_name: "{{ role | default('view') }}"
+    force_recreate: "{{ force | default(false) | bool }}"
 
   tasks:
     - name: Sprawdzenie czy podano nazwę SA
@@ -43,6 +44,16 @@
             kind: ClusterRole # Używamy ClusterRole jako źródła (np. view, edit, admin)
             name: "{{ role_name }}"
             apiGroup: rbac.authorization.k8s.io
+
+    - name: "FORCE: Usuwanie istniejącego Secretu (regeneracja tokenu)"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "{{ sa_name }}-token"
+        namespace: "{{ sa_namespace }}"
+        wait: true
+      when: force_recreate
 
     - name: "Tworzenie Secretu dla trwałego tokenu"
       kubernetes.core.k8s:
