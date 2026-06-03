@@ -179,7 +179,7 @@ data = {
   'cluster_name': '$CLUSTER_NAME',
   'ocp_version':  '$OCP_VERSION',
   'timestamp':    '$TIMESTAMP',
-  'metrics_available': $METRICS_OK,
+  'metrics_available': '$METRICS_OK' == 'true',
   'nodes': {
     'total':   $NODES_TOTAL,
     'ready':   $NODES_READY,
