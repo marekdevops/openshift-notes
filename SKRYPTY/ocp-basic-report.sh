@@ -263,14 +263,20 @@ document.getElementById("pods-failed").textContent  = D.pods.failed;
 HTML_EOF
 
 # Inject JSON data into the placeholder
-python3 - << PYEOF
-import json, re
-with open('${OUTPUT}', 'r') as f:
+_JSON_TMP=$(mktemp /tmp/ocp_json_data_XXXXXX.json)
+echo "${JSON_DATA}" > "$_JSON_TMP"
+python3 - "$_JSON_TMP" "${OUTPUT}" << 'PYEOF'
+import sys, json
+json_file, html_file = sys.argv[1], sys.argv[2]
+with open(json_file) as f:
+    json_str = f.read().strip()
+with open(html_file) as f:
     html = f.read()
-html = html.replace('DATA_PLACEHOLDER', '''${JSON_DATA}''')
-with open('${OUTPUT}', 'w') as f:
+html = html.replace('DATA_PLACEHOLDER', json_str)
+with open(html_file, 'w') as f:
     f.write(html)
 PYEOF
+rm -f "$_JSON_TMP"
 
 log "Done. Report saved: ${OUTPUT}"
 echo "${OUTPUT}"
