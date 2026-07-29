@@ -30,6 +30,7 @@ Przykłady:
   python3 deployment_worker_scheduler_estimator.py -n my-ns -d my-app
   python3 deployment_worker_scheduler_estimator.py -n my-ns -d my-app --details
   python3 deployment_worker_scheduler_estimator.py -n my-ns -d my-app --replicas 6
+  python3 deployment_worker_scheduler_estimator.py -n my-ns --all-deployments
 """
 
 import argparse
@@ -149,6 +150,11 @@ def get_namespace(namespace):
 
 def get_deployment(namespace, name):
     return oc_json(["get", "deployment", name, "-n", namespace])
+
+
+def get_deployments(namespace):
+    data = oc_json(["get", "deployments", "-n", namespace])
+    return data.get("items", [])
 
 
 def get_worker_nodes():
@@ -408,49 +414,30 @@ def print_node_table(eligible_nodes, blocked_nodes, show_details):
             )
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Szacuje na ilu i na jakich workerach OpenShift moze uruchomic pody z Deploymentu."
-    )
-    parser.add_argument("-n", "--namespace", required=True, help="Namespace projektu.")
-    parser.add_argument("-d", "--deployment", required=True, help="Nazwa Deploymentu.")
-    parser.add_argument(
-        "--replicas",
-        type=int,
-        help="Opcjonalne nadpisanie liczby replik do estymacji. Domyslnie bierze spec.replicas.",
-    )
-    parser.add_argument(
-        "--details",
-        action="store_true",
-        help="Pokaz dodatkowe szczegoly wykorzystania CPU/RAM na workerach.",
-    )
-    args = parser.parse_args()
-
-    namespace_data = get_namespace(args.namespace)
-    deployment_data = get_deployment(args.namespace, args.deployment)
-    worker_nodes = get_worker_nodes()
-    active_pods = get_active_pods()
-
+def analyze_deployment(
+    namespace,
+    deployment_data,
+    namespace_selector,
+    worker_nodes,
+    usage,
+    replicas_override=None,
+    show_details=False,
+):
+    deployment_name = deployment_data.get("metadata", {}).get("name", "<unknown>")
     deployment_spec = deployment_data.get("spec", {})
     pod_spec = deployment_spec.get("template", {}).get("spec", {})
-    namespace_selector = parse_selector(
-        namespace_data.get("metadata", {})
-        .get("annotations", {})
-        .get("openshift.io/node-selector", "")
-    )
     deployment_selector = pod_spec.get("nodeSelector", {}) or {}
     effective_selector, selector_conflicts = merge_selectors(
         namespace_selector, deployment_selector
     )
     req_cpu_m, req_mem_mib = pod_requests(pod_spec)
-    replicas = args.replicas if args.replicas is not None else deployment_spec.get("replicas", 1)
+    replicas = replicas_override if replicas_override is not None else deployment_spec.get("replicas", 1)
     affinity = pod_spec.get("affinity", {}) or {}
     tolerations = pod_spec.get("tolerations", []) or []
-    usage = build_node_usage(active_pods)
 
     print_summary(
-        args.namespace,
-        args.deployment,
+        namespace,
+        deployment_name,
         replicas,
         effective_selector,
         req_cpu_m,
@@ -463,7 +450,16 @@ def main():
             print(
                 f"- {key}: namespace wymusza '{ns_value}', deployment wymusza '{dep_value}'"
             )
-        die("Wynik: 0 workerow. Pod nie bedzie schedulowalny.")
+        print("Wynik: 0 workerow. Pod nie bedzie schedulowalny.")
+        return {
+            "deployment": deployment_name,
+            "requested_replicas": replicas,
+            "eligible_nodes": [],
+            "blocked_nodes": [],
+            "total_capacity": 0,
+            "schedulable": False,
+            "conflict": True,
+        }
 
     if affinity.get("podAffinity") or affinity.get("podAntiAffinity"):
         print(
@@ -515,7 +511,109 @@ def main():
         )
     )
 
-    print_node_table(eligible_nodes, blocked_nodes, args.details)
+    print_node_table(eligible_nodes, blocked_nodes, show_details)
+
+    return {
+        "deployment": deployment_name,
+        "requested_replicas": replicas,
+        "eligible_nodes": eligible_nodes,
+        "blocked_nodes": blocked_nodes,
+        "total_capacity": total_capacity,
+        "schedulable": schedulable,
+        "conflict": False,
+    }
+
+
+def print_namespace_summary(namespace, results):
+    print("\n=== Podsumowanie namespace ===")
+    print(f"Namespace: {namespace}")
+    print(f"Liczba przeanalizowanych deploymentow: {len(results)}")
+
+    ok_count = sum(1 for item in results if item["schedulable"])
+    failed = [item for item in results if not item["schedulable"]]
+    print(f"Schedulowalne: {ok_count}")
+    print(f"Nieschedulowalne: {len(failed)}")
+
+    if failed:
+        print("\nDeploymenty wymagajace uwagi:")
+        for item in failed:
+            print(
+                f"- {item['deployment']}: potrzebne {item['requested_replicas']}, "
+                f"szacowana pojemnosc {item['total_capacity']}"
+                + (" (konflikt selectorow)" if item["conflict"] else "")
+            )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Szacuje na ilu i na jakich workerach OpenShift moze uruchomic pody z Deploymentu."
+    )
+    parser.add_argument("-n", "--namespace", required=True, help="Namespace projektu.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-d", "--deployment", help="Nazwa Deploymentu.")
+    group.add_argument(
+        "--all-deployments",
+        action="store_true",
+        help="Przeanalizuj wszystkie Deploymenty w namespace.",
+    )
+    parser.add_argument(
+        "--replicas",
+        type=int,
+        help="Opcjonalne nadpisanie liczby replik do estymacji. Dziala tylko dla pojedynczego deploymentu.",
+    )
+    parser.add_argument(
+        "--details",
+        action="store_true",
+        help="Pokaz dodatkowe szczegoly wykorzystania CPU/RAM na workerach.",
+    )
+    args = parser.parse_args()
+
+    namespace_data = get_namespace(args.namespace)
+    namespace_selector = parse_selector(
+        namespace_data.get("metadata", {})
+        .get("annotations", {})
+        .get("openshift.io/node-selector", "")
+    )
+    worker_nodes = get_worker_nodes()
+    active_pods = get_active_pods()
+    usage = build_node_usage(active_pods)
+
+    if args.all_deployments and args.replicas is not None:
+        die("Opcja --replicas moze byc uzyta tylko razem z --deployment.")
+
+    if args.deployment:
+        deployment_data = get_deployment(args.namespace, args.deployment)
+        analyze_deployment(
+            namespace=args.namespace,
+            deployment_data=deployment_data,
+            namespace_selector=namespace_selector,
+            worker_nodes=worker_nodes,
+            usage=usage,
+            replicas_override=args.replicas,
+            show_details=args.details,
+        )
+        return
+
+    deployments = get_deployments(args.namespace)
+    if not deployments:
+        die(f"Brak deploymentow w namespace {args.namespace}.", code=0)
+
+    results = []
+    for deployment_data in sorted(
+        deployments, key=lambda item: item.get("metadata", {}).get("name", "")
+    ):
+        results.append(
+            analyze_deployment(
+                namespace=args.namespace,
+                deployment_data=deployment_data,
+                namespace_selector=namespace_selector,
+                worker_nodes=worker_nodes,
+                usage=usage,
+                show_details=args.details,
+            )
+        )
+
+    print_namespace_summary(args.namespace, results)
 
 
 if __name__ == "__main__":
