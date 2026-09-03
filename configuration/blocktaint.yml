@@ -1,0 +1,47 @@
+NODES="worker05 worker06"
+NS="<namespace-z-kafka>"
+TAINT_KEY="dedicated"
+TAINT_VALUE="kafka"
+STRIMZI_KAFKA_CR="<nazwa-cr-kafka>"   # z: oc get kafka -n $NS
+
+
+#dodanie adnotacji
+oc annotate namespace "$NS" \
+  scheduler.alpha.kubernetes.io/defaultTolerations='[{"key":"'"$TAINT_KEY"'","operator":"Equal","value":"'"$TAINT_VALUE"'","effect":"NoSchedule"}]' \
+  scheduler.alpha.kubernetes.io/tolerationsWhitelist='[{"key":"'"$TAINT_KEY"'","operator":"Equal","value":"'"$TAINT_VALUE"'","effect":"NoSchedule"}]'
+
+
+oc get namespace "$NS" -o jsonpath='{.metadata.annotations}' | jq .
+
+#taint
+for n in $NODES; do
+  oc adm taint nodes "$n" ${TAINT_KEY}=${TAINT_VALUE}:NoSchedule
+done
+
+#weryfikacja
+for n in $NODES; do
+  echo "--- $n ---"
+  oc get node "$n" -o jsonpath='{.spec.taints}' ; echo
+done
+
+
+
+#weryfikacja podow:
+oc get pods -n "$NS" -l strimzi.io/name=kafka-terefere \
+  -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.spec.tolerations}{"\n"}{end}'
+
+
+
+
+
+rollback
+
+# Usuń taint z nodów (odblokowuje scheduling dla wszystkich)
+for n in $NODES; do
+  oc adm taint nodes "$n" ${TAINT_KEY}=${TAINT_VALUE}:NoSchedule-
+done
+
+# Usuń adnotacje z namespace
+oc annotate namespace "$NS" \
+  scheduler.alpha.kubernetes.io/defaultTolerations- \
+  scheduler.alpha.kubernetes.io/tolerationsWhitelist-
