@@ -45,3 +45,11 @@ done
 oc annotate namespace "$NS" \
   scheduler.alpha.kubernetes.io/defaultTolerations- \
   scheduler.alpha.kubernetes.io/tolerationsWhitelist-
+
+
+
+########################
+error
+oc get kafka <nazwa-cr> -n kafka-ifd-test3 -o jsonpath='{.spec.kafka.template.pod.tolerations}' | jq .
+oc get namespace kafka-ifd-test3 -o jsonpath='{.metadata.annotations.scheduler\.alpha\.kubernetes\.io/defaultTolerations}' | jq .
+oc get namespace kafka-ifd-test3 -o jsonpath='{.metadata.annotations.scheduler\.alpha\.kubernetes\.io/tolerationsWhitelist}' | jq .
