@@ -46,3 +46,7 @@ spec:
 
 
 oc label namespace <twoj-projekt> argocd.argoproj.io/managed-by=openshift-gitops
+
+
+oc patch secret <nazwa-sekretu> -n argocd --type=json \
+  -p='[{"op": "add", "path": "/data/clusterResources", "value": "dHJ1ZQ=="}]'
