@@ -98,3 +98,13 @@ oc describe node <node-name> | sed -n '/Non-terminated Pods:/,/Allocated resourc
 
 oc get vmim -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.spec.vmiName}{"\t"}{.status.phase}{"\t"}{.status.migrationPolicyName}{"\n"}{end}' | grep -E "Running|Pending"
 oc get vmim -A -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.namespace}{"\t"}{.spec.vmiName}{"\t"}{.status.phase}{"\t"}{.status.migrationPolicyName}{"\n"}{end}'
+
+
+
+python3 lib/yaml2json.py /data/oc-mirror/results/latest/cluster-resources/*.yaml \
+ | jq -c 'select(.kind=="ConfigMap") | {name:.metadata.name, ns:.metadata.namespace, labels:.metadata.labels, data:((.data//{})|keys), bin:((.binaryData//{})|keys)}'
+
+oc get cm -n openshift-config-managed -l release.openshift.io/verification-signatures \
+ -o json | jq -c '.items[] | {name:.metadata.name, keys:(((.binaryData//{})+(.data//{}))|keys)}'
+
+oc get clusterimagepolicy 2>&1 | head
