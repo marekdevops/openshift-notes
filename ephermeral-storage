@@ -1,0 +1,3 @@
+oc run test-emptydir --image=registry.access.redhat.com/ubi9/ubi-minimal \
+  --overrides='{"spec":{"volumes":[{"name":"s","emptyDir":{"sizeLimit":"1Gi"}}],"containers":[{"name":"c","image":"registry.access.redhat.com/ubi9/ubi-minimal","command":["sleep","3600"],"volumeMounts":[{"name":"s","mountPath":"/data"}]}]}}'
+oc exec test-emptydir -- df -h /data
