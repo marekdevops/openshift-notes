@@ -4,3 +4,8 @@
 oc rsh <pod> sh -c 'tr "\0" " " < /proc/$(pgrep -f beam.smp | head -1)/cmdline; echo
   ls /proc/$(pgrep -f beam.smp | head -1)/task | wc -l'
 oc rsh <pod> rabbitmqctl eval '{erlang:system_info(schedulers), erlang:system_info(dirty_cpu_schedulers), erlang:system_info(dirty_io_schedulers)}.'
+
+oc rsh <pod> env RABBITMQ_CTL_ERL_ARGS="+S 1:1 +SDcpu 1:1 +SDio 1 +A 4" \
+  rabbitmqctl eval '{erlang:system_info(schedulers), erlang:system_info(dirty_cpu_schedulers)}.'
+
+oc rsh <pod> sh -c 'cat /sys/fs/cgroup/pids.max /sys/fs/cgroup/pids.current; nproc; ulimit -u'
