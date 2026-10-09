@@ -1,2 +1,6 @@
   oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.cpu}{"\n"}{end}'                                                                                                                                                                                                                                                                               
   oc get nodes -o custom-columns="NAME:.metadata.name,CPU-MANAGER:.metadata.labels.cpumanager"
+
+oc rsh <pod> sh -c 'tr "\0" " " < /proc/$(pgrep -f beam.smp | head -1)/cmdline; echo
+  ls /proc/$(pgrep -f beam.smp | head -1)/task | wc -l'
+oc rsh <pod> rabbitmqctl eval '{erlang:system_info(schedulers), erlang:system_info(dirty_cpu_schedulers), erlang:system_info(dirty_io_schedulers)}.'
