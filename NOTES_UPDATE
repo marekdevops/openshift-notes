@@ -1,1 +1,12 @@
 oc get clusterversion version -o json | jq '.status.conditionalUpdates[] | select(.release.version=="4.22.15") | {risks: [.risks[].name], conditions}'
+
+oc get clusterversion version -o json | jq '.status.conditionalUpdates[] | select(.release.version=="4.22.15") | .risks[] | {name, matchingRules}'
+
+oc get clusterversion version -o jsonpath='{.status.conditions[?(@.type=="ReleaseAccepted")].message}{"\n"}'
+
+oc adm release info $(oc get clusterversion version -o jsonpath='{.status.desired.image}') -o json | jq '.metadata.metadata'
+
+oc image info -a <(oc extract secret/pull-secret -n openshift-config --to=- 2>/dev/null) \
+  $(oc get clusterversion version -o jsonpath='{.status.desired.image}')
+
+  oc get nodes -L kubernetes.io/arch
