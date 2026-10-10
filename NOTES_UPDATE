@@ -1,0 +1,1 @@
+oc get clusterversion version -o json | jq '.status.conditionalUpdates[] | select(.release.version=="4.22.15") | {risks: [.risks[].name], conditions}'
