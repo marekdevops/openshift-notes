@@ -95,3 +95,19 @@ for h in $API oauth-openshift.apps.<cluster>:443; do
   echo -n "$h: "
   echo | openssl s_client -connect $h -servername ${h%:*} -CAfile /tmp/kc-ca.pem 2>/dev/null | grep 'Verify return code'
 done
+
+
+
+# 1. Zagregowane API niedostępne?
+oc get apiservices | grep -E 'oauth|user'
+
+# 2. Cert w secrecie: nowy czy stary?
+oc get secret aggregator-client -n openshift-kube-apiserver -o jsonpath='{.data.tls\.crt}' \
+  | base64 -d | openssl x509 -noout -subject -enddate -ext authorityKeyIdentifier
+
+# 3. Cert, którego kube-apiserver faktycznie używa na dysku (na każdym masterze)
+ssh core@<master> sudo openssl x509 -noout -enddate -ext authorityKeyIdentifier \
+  -in /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/aggregator-client/tls.crt
+
+# 4. Stan operatora
+oc get co kube-apiserver
