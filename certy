@@ -76,3 +76,22 @@ oc get secrets -A --field-selector type=kubernetes.io/tls -o json \
     end=$(echo "$crt" | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
     [ -n "$end" ] && echo "$(date -d "$end" +%F) $ns/$name"
   done | sort | head -30
+
+
+
+  API=api.<cluster>:6443
+
+# kto podpisał cert serwowany przez API
+echo | openssl s_client -connect $API -servername ${API%:*} 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+
+# jakie CA masz zapisane w kubeconfigu dla tego klastra
+oc config view --raw -o jsonpath="{.clusters[?(@.cluster.server==\"https://$API\")].cluster.certificate-authority-data}" \
+  | base64 -d > /tmp/kc-ca.pem
+openssl crl2pkcs7 -nocrl -certfile /tmp/kc-ca.pem | openssl pkcs7 -print_certs -noout
+
+# czy to CA weryfikuje API i route oauth
+for h in $API oauth-openshift.apps.<cluster>:443; do
+  echo -n "$h: "
+  echo | openssl s_client -connect $h -servername ${h%:*} -CAfile /tmp/kc-ca.pem 2>/dev/null | grep 'Verify return code'
+done
