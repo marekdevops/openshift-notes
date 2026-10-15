@@ -59,3 +59,20 @@ oc get secret <nazwa-secretu> -n <namespace> -o jsonpath='{.data}' | python3 -m 
 
 # Każdy klucz z osobna zdekoduj
 oc get secret <nazwa-secretu> -n <namespace> -o go-template='{{range $k,$v := .data}}{{$k}}{{"\n"}}{{$v | base64decode}}{{"\n---\n"}}{{end}}'
+
+
+######################################################
+srawdzanie
+
+for h in api.<cluster>:6443 oauth-openshift.apps.<cluster>:443 console-openshift-console.apps.<cluster>:443; do
+  echo "== $h"
+  echo | openssl s_client -connect $h -servername ${h%:*} 2>/dev/null \
+    | openssl x509 -noout -subject -issuer -dates
+done
+
+oc get secrets -A --field-selector type=kubernetes.io/tls -o json \
+| jq -r '.items[] | [.metadata.namespace, .metadata.name, .data["tls.crt"]] | @tsv' \
+| while IFS=$'\t' read ns name crt; do
+    end=$(echo "$crt" | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+    [ -n "$end" ] && echo "$(date -d "$end" +%F) $ns/$name"
+  done | sort | head -30
