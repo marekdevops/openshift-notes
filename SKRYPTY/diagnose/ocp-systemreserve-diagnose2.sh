@@ -1,70 +1,41 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  ocp-sysreserved-sizing.sh  v2
-#  Analiza SystemMemoryExceedsReservation, dobór systemReserved per profil
-#  nodów oraz kondycja kubeleta/crio i warstwy wirtualizacji.
-#
-#  TYLKO ODCZYT — skrypt niczego nie wdraża ani nie zmienia w klastrze.
-#  Proponowane YAML-e i polecenia są wyłącznie WYPISYWANE (opcjonalnie
-#  zapisywane do lokalnego katalogu OUT_DIR).
+#  ocp-node-diag.sh — diagnostyka workera OpenShift (TYLKO ODCZYT)
 #
 #  Użycie:
-#     ./ocp-sysreserved-sizing.sh [pula]
+#     ./ocp-node-diag.sh <node-problematyczny> [node-referencyjny]
 #
-#  Przykłady:
-#     ./ocp-sysreserved-sizing.sh worker
-#     DAYS=7 ./ocp-sysreserved-sizing.sh worker
-#     OUT_DIR=./propozycja ./ocp-sysreserved-sizing.sh worker
-#     ANONYMIZE=1 ./ocp-sysreserved-sizing.sh
+#  Przykład:
+#     ./ocp-node-diag.sh worker-01.cluster.example.com worker-02.cluster.example.com
 #
-#  Zmienne (opcjonalne):
-#     DAYS=14            maks. okres analizy (skracany automatycznie do retencji)
-#     MARGIN=1.5         zapas nad szczytem pamięci / p99 CPU
-#     MIN_MEM_GIB=2      minimalna rekomendowana rezerwacja pamięci
-#     MIN_CPU_M=500      minimalna rekomendowana rezerwacja CPU
-#     NEAR_PCT=85        próg ostrzeżenia „blisko alertu” (alert: 95%)
-#     GROWTH_DAYS=3      okno liczenia trendu (ostatnie N dni)
-#     WARMUP_DAYS=2      ile dni po reboocie pomijać (rozgrzewanie kubelet/crio)
-#     LEAK_PCT_DAY=5     wzrost %/dobę uznawany za podejrzenie wycieku
-#     PROFILE_STEP=1.25  nody różniące się RAM-em o więcej niż ×1.25 trafiają
-#                        do różnych profili
-#     STEAL_WARN=5       próg steal time (%)
-#     PLEG_WARN=0.5      próg p99 PLEG relist (s)
-#     RT_WARN=1          próg p99 operacji runtime/crio (s)
-#     RESTART_WARN=50    próg restartów kontenerów na nodzie na dobę
-#     OUT_DIR=           katalog lokalny na proponowane YAML-e (domyślnie brak)
-#     ANONYMIZE=1        zamaskuj nazwy nodów, domenę, użytkownika
+#  Zmienne środowiskowe (opcjonalne):
+#     LOG_HOURS=6           ile godzin wstecz przeszukiwać logi kernela i kubeleta
+#     RESTART_THRESHOLD=5   od ilu restartów pod jest uznawany za podejrzany
+#     DEBUG_IMAGE=<obraz>   obraz dla `oc debug node` (środowiska disconnected)
+#     SKIP_ALERTS=1         pomiń odpytywanie Prometheusa o aktywne alerty
 #
-#  Wymaga: oc (cluster-admin lub cluster-monitoring-view + odczyt nodów/podów),
-#          jq, dostęp `oc exec` do prometheus-k8s-0.
+#  Skrypt niczego nie zmienia na nodzie ani w klastrze. Jedyny efekt uboczny
+#  to tymczasowy pod tworzony przez `oc debug node/...` (usuwany automatycznie)
+#  oraz `oc exec` do prometheus-k8s-0 w celu odczytu alertów (wymaga jq).
+#  Wymaga uprawnień cluster-admin (oc debug node).
 # =============================================================================
 set -o pipefail
+WORK=$(mktemp -d) || exit 2
+trap 'rm -rf "$WORK"' EXIT
 
-POOL_FILTER=${1:-}
-DAYS=${DAYS:-14}
-MARGIN=${MARGIN:-1.5}
-MIN_MEM_GIB=${MIN_MEM_GIB:-2}
-MIN_CPU_M=${MIN_CPU_M:-500}
-NEAR_PCT=${NEAR_PCT:-85}
-GROWTH_DAYS=${GROWTH_DAYS:-3}
-WARMUP_DAYS=${WARMUP_DAYS:-2}
-LEAK_PCT_DAY=${LEAK_PCT_DAY:-5}
-PROFILE_STEP=${PROFILE_STEP:-1.25}
-STEAL_WARN=${STEAL_WARN:-5}
-PLEG_WARN=${PLEG_WARN:-0.5}
-RT_WARN=${RT_WARN:-1}
-RESTART_WARN=${RESTART_WARN:-50}
-OUT_DIR=${OUT_DIR:-}
-ANONYMIZE=${ANONYMIZE:-0}
+NODE=${1:-}
+REF=${2:-}
+LOG_HOURS=${LOG_HOURS:-6}
+RESTART_THRESHOLD=${RESTART_THRESHOLD:-5}
+DEBUG_IMAGE=${DEBUG_IMAGE:-}
+SKIP_ALERTS=${SKIP_ALERTS:-0}
 
+# --------------------------------------------------------------------------- UI
 if [[ -t 1 ]]; then
   R=$'\e[31m'; Y=$'\e[33m'; G=$'\e[32m'; B=$'\e[34m'; C=$'\e[36m'; BOLD=$'\e[1m'; N=$'\e[0m'
 else
   R=''; Y=''; G=''; B=''; C=''; BOLD=''; N=''
 fi
-
-TMP=$(mktemp -d) || exit 2
-trap 'rm -rf "$TMP"' EXIT
 
 declare -a F_CRIT=() F_WARN=() F_INFO=()
 crit() { F_CRIT+=("$*"); printf '  %s[CRIT]%s %s\n' "$R" "$N" "$*"; }
@@ -74,536 +45,639 @@ ok()   { printf '  %s[ OK ]%s %s\n' "$G" "$N" "$*"; }
 line() { printf '         %s\n' "$*"; }
 hdr()  { printf '\n%s== %s ==%s\n' "$BOLD$B" "$*" "$N"; }
 die()  { printf '%sBŁĄD:%s %s\n' "$R" "$N" "$*" >&2; exit 2; }
-usage() { sed -n '3,45p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
-# ------------------------------------------------------------------ PromQL
-# prom "<zapytanie>" <plik> [jq-wyrażenie klucza]
-prom() {
-  local q=$1 out=$2 key=${3:-'(.metric.node // .metric.instance // "")'}
-  oc -n openshift-monitoring exec -c prometheus prometheus-k8s-0 -- \
-     curl -sG --data-urlencode "query=$q" http://localhost:9090/api/v1/query 2>/dev/null \
-  | jq -r ".data.result[]? | select(.value[1] != \"NaN\" and .value[1] != \"+Inf\") | \"\($key)|\(.value[1])\"" >"$out" 2>/dev/null
-  [[ -s $out ]]
+usage() {
+  sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
 }
-getv() { awk -F'|' -v n="$1" '$1==n{print $2; exit}' "$2"; }
 
-# ----------------------------------------------------------------- formaty
-gib()  { awk -v b="${1:-0}" 'BEGIN{ printf "%.2f", (b+0)/1073741824 }'; }
-mcore(){ awk -v c="${1:-0}" 'BEGIN{ printf "%.0f", (c+0)*1000 }'; }
-f1()   { awk -v v="${1:-0}" 'BEGIN{ printf "%.1f", v+0 }'; }
-fgt()  { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{ exit !(a+0 > b+0) }'; }
-fge()  { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{ exit !(a+0 >= b+0) }'; }
-short(){ local s=${1%%.*}; echo "${s:0:${2:-18}}"; }
-rec_mem() { awk -v b="${1:-0}" -v m="$MARGIN" -v min="$MIN_MEM_GIB" 'BEGIN{
-  g=b*m/1073741824; r=int(g*2); if (r < g*2) r++; r=r/2; if (r<min) r=min; printf "%g", r }'; }
-rec_cpu() { awk -v c="${1:-0}" -v m="$MARGIN" -v min="$MIN_CPU_M" 'BEGIN{
-  v=c*1000*m; r=int(v/100); if (r*100 < v) r++; r=r*100; if (r<min) r=min; printf "%d", r }'; }
+# ---------------------------------------------------------------------- helpery
+# Kubernetes quantity (pamięć) -> MiB
+to_mib() {
+  local v=${1:-0}
+  case $v in
+    *Ki) echo $(( ${v%Ki} / 1024 )) ;;
+    *Mi) echo $(( ${v%Mi} )) ;;
+    *Gi) echo $(( ${v%Gi} * 1024 )) ;;
+    *Ti) echo $(( ${v%Ti} * 1024 * 1024 )) ;;
+    *k)  echo $(( ${v%k} * 1000 / 1048576 )) ;;
+    *M)  echo $(( ${v%M} * 1000000 / 1048576 )) ;;
+    *G)  echo $(( ${v%G} * 1000000000 / 1048576 )) ;;
+    ''|*[!0-9]*) echo 0 ;;
+    *)   echo $(( v / 1048576 )) ;;
+  esac
+}
+# Kubernetes quantity (CPU) -> millicores
+to_milli() {
+  local v=${1:-0}
+  case $v in
+    *m) echo "${v%m}" ;;
+    ''|*[!0-9]*) echo 0 ;;
+    *)  echo $(( v * 1000 )) ;;
+  esac
+}
+pct()   { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{ if (b+0==0) print 0; else printf "%.0f", a*100/b }'; }
+fgt()   { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{ exit !(a+0 > b+0) }'; }
+gib()   { awk -v m="${1:-0}" 'BEGIN{ printf "%.1f GiB", m/1024 }'; }          # MiB -> GiB
+kb_gib(){ awk -v k="${1:-0}" 'BEGIN{ printf "%.1f GiB", k/1048576 }'; }       # kB  -> GiB
+num()   { [[ ${1:-} =~ ^[0-9]+$ ]]; }
 
-# =============================================================================
-main() {
-  [[ $POOL_FILTER == -h || $POOL_FILTER == --help ]] && usage
-  command -v oc >/dev/null 2>&1 || die "brak polecenia oc w PATH"
-  command -v jq >/dev/null 2>&1 || die "brak jq w PATH (wymagane)"
-  oc whoami >/dev/null 2>&1     || die "brak zalogowania do klastra (oc login)"
+# ------------------------------------------------------------- skrypt na hoście
+# Wykonywany przez `oc debug node/X -- chroot /host bash -c`.
+# Tylko odczyt: sysctl -n, /proc, /sys, journalctl, df, systemctl is-active.
+# Każda wartość wypisywana jako linia "K:klucz=wartość".
+read -r -d '' HOST_SCRIPT <<'EOS'
+kv() { printf 'K:%s=%s\n' "$1" "$2"; }
+SINCE="-${HOURS:-6}h"
 
-  printf '%sAnaliza rezerwacji systemowej i kondycji nodów (v2)%s%s\n' "$BOLD" "$N" "${POOL_FILTER:+ — pula: $POOL_FILTER}"
-  printf 'Klaster: %s   użytkownik: %s   %s\n' "$(oc whoami --show-server 2>/dev/null)" "$(oc whoami 2>/dev/null)" "$(date '+%F %T')"
-  printf '%sTryb tylko do odczytu — nic nie jest wdrażane.%s\n' "$BOLD" "$N"
-  printf '\nZbieranie danych (kilkadziesiąt zapytań do Prometheusa, do 1–2 minut)...\n'
+for s in vm.overcommit_memory vm.overcommit_ratio vm.max_map_count kernel.pid_max kernel.threads-max vm.swappiness; do
+  kv "$s" "$(sysctl -n "$s" 2>/dev/null)"
+done
 
-  # ---------------------------------------------------------------- API
-  oc get nodes -o json >"$TMP/nodes.json" 2>/dev/null || die "nie udało się pobrać nodów"
-  oc get kubeletconfig -o json >"$TMP/kc.json" 2>/dev/null || echo '{"items":[]}' >"$TMP/kc.json"
-  oc get mcp -o json >"$TMP/mcp.json" 2>/dev/null || echo '{"items":[]}' >"$TMP/mcp.json"
-  oc get pods -A -o json >"$TMP/pods.json" 2>/dev/null || echo '{"items":[]}' >"$TMP/pods.json"
+while read -r k v _; do
+  case $k in
+    MemTotal:|MemAvailable:|CommitLimit:|Committed_AS:|SwapTotal:|HugePages_Total:) kv "${k%:}" "$v" ;;
+  esac
+done < /proc/meminfo
 
-  local JQMEM='def mem: tostring |
-      if test("Ki$") then (.[:-2]|tonumber)*1024
-      elif test("Mi$") then (.[:-2]|tonumber)*1048576
-      elif test("Gi$") then (.[:-2]|tonumber)*1073741824
-      elif test("Ti$") then (.[:-2]|tonumber)*1099511627776
-      elif test("k$") then (.[:-1]|tonumber)*1000
-      elif test("M$") then (.[:-1]|tonumber)*1000000
-      elif test("G$") then (.[:-1]|tonumber)*1000000000
-      elif test("m$") then (.[:-1]|tonumber)/1000
-      else tonumber end;
-    def cpu: tostring | if test("m$") then (.[:-1]|tonumber) else (tonumber*1000) end;'
+kv nproc "$(nproc)"
+kv kernel_running "$(uname -r)"
+kv loadavg "$(cut -d' ' -f1-3 /proc/loadavg)"
+kv threads "$(awk '{split($4,a,"/"); print a[2]}' /proc/loadavg)"
+kv uptime_h "$(awk '{printf "%.0f", $1/3600}' /proc/uptime)"
 
-  # node|pula|capMem|allocMem|capCpu(m)|allocCpu(m)
-  jq -r "$JQMEM"'
-    .items[] |
-    [ .metadata.name,
-      ((.metadata.annotations["machineconfiguration.openshift.io/desiredConfig"] // "none") | sub("^rendered-";"") | sub("-[0-9a-f]+$";"")),
-      (.status.capacity.memory | mem), (.status.allocatable.memory | mem),
-      (.status.capacity.cpu | cpu), (.status.allocatable.cpu | cpu)
-    ] | map(tostring) | join("|")' "$TMP/nodes.json" >"$TMP/nodes.txt"
+for r in memory cpu io; do
+  f=/proc/pressure/$r
+  [ -r "$f" ] || continue
+  kv "psi_${r}_some" "$(awk '/^some/{split($3,a,"="); print a[2]}' "$f")"
+  kv "psi_${r}_full" "$(awk '/^full/{split($3,a,"="); print a[2]}' "$f")"
+done
 
-  # requests pamięci per node
-  jq -r "$JQMEM"'
-    [ .items[] | select(.spec.nodeName != null and .status.phase != "Succeeded" and .status.phase != "Failed")
-      | {n: .spec.nodeName, r: ([.spec.containers[]?.resources.requests.memory // "0" | mem] | add // 0)} ]
-    | group_by(.n)[] | "\(.[0].n)|\(map(.r) | add)"' "$TMP/pods.json" >"$TMP/req.txt" 2>/dev/null
+thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
+thp=${thp#*\[}; kv thp "${thp%%\]*}"
+kv tuned "$(cat /etc/tuned/active_profile 2>/dev/null)"
 
-  # liczba probe typu exec per node
-  jq -r '
-    [ .items[] | select(.spec.nodeName != null and .status.phase == "Running")
-      | {n: .spec.nodeName, e: ([.spec.containers[]? | (.livenessProbe.exec, .readinessProbe.exec, .startupProbe.exec) | select(. != null)] | length)} ]
-    | group_by(.n)[] | "\(.[0].n)|\(map(.e) | add)"' "$TMP/pods.json" >"$TMP/exec.txt" 2>/dev/null
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  kv cgroup v2
+  SS=/sys/fs/cgroup/system.slice
+  kv sys_slice_current "$(cat "$SS/memory.current" 2>/dev/null)"
+  kv sys_slice_anon "$(awk '$1=="anon"{print $2}' "$SS/memory.stat" 2>/dev/null)"
+  for d in "$SS"/*.service; do
+    [ -r "$d/memory.current" ] && printf '%s %s\n' "$(cat "$d/memory.current")" "${d##*/}"
+  done | sort -rn | head -6 | while read -r b n; do kv svc "$n=$b"; done
+  kv kubepods_pids "$(cat /sys/fs/cgroup/kubepods.slice/pids.current 2>/dev/null)"
+  kv kubepods_pids_max "$(cat /sys/fs/cgroup/kubepods.slice/pids.max 2>/dev/null)"
+else
+  kv cgroup v1
+  M=/sys/fs/cgroup/memory/system.slice
+  kv sys_slice_current "$(cat "$M/memory.usage_in_bytes" 2>/dev/null)"
+  kv sys_slice_anon "$(awk '$1=="total_rss"{print $2}' "$M/memory.stat" 2>/dev/null)"
+fi
 
-  # ---------------------------------------------------------- okno danych
-  local SEL='container_memory_rss{id="/system.slice"}'
-  local SELC='container_cpu_usage_seconds_total{id="/system.slice"}'
-  local SVC='container_memory_rss{id=~"/system.slice/[^/]+[.]service"}'
-  local now earliest avail EFF
-  now=$(date +%s)
-  prom "min_over_time(timestamp(count($SEL))[${DAYS}d:1h])" "$TMP/earliest.txt" '"x"' || true
-  earliest=$(cut -d'|' -f2 "$TMP/earliest.txt" 2>/dev/null)
-  if [[ -n $earliest ]]; then
-    avail=$(awk -v n="$now" -v e="$earliest" 'BEGIN{ printf "%d", (n-e)/86400 }')
-  else avail=$DAYS; fi
-  EFF=$DAYS; (( avail < EFF )) && EFF=$avail; (( EFF < 1 )) && EFF=1
-  local GD=$GROWTH_DAYS; (( GD > EFF )) && GD=$EFF
+found=0
+for f in /etc/node-sizing-enabled.env /etc/node-sizing.env; do
+  [ -r "$f" ] || continue
+  found=1
+  while IFS= read -r l; do [ -n "$l" ] && kv sizing "$l"; done < "$f"
+done
+[ "$found" = 1 ] || kv sizing "BRAK_PLIKOW_NODE_SIZING"
 
-  # ---------------------------------------------------------- metryki
-  prom "sum by (node) ($SEL)" "$TMP/cur.txt" || die "brak danych z Prometheusa (container_memory_rss /system.slice) — sprawdź dostęp do prometheus-k8s-0"
-  prom "max_over_time(sum by (node) ($SEL)[${EFF}d:10m])" "$TMP/peak.txt"
-  prom "quantile_over_time(0.99, sum by (node) (rate(${SELC}[5m]))[${EFF}d:10m])" "$TMP/cpup99.txt"
-  prom "max_over_time(sum by (node) (rate(${SELC}[5m]))[${EFF}d:10m])" "$TMP/cpumax.txt"
-  prom 'count by (node) (ALERTS{alertname="SystemMemoryExceedsReservation",alertstate="firing"})' "$TMP/alerts.txt"
-  prom '(time() - node_boot_time_seconds) / 86400' "$TMP/uptime.txt"
-  prom "deriv(sum by (node) ($SEL)[${GD}d:30m])" "$TMP/deriv.txt"
-  prom 'max by (node) (kubelet_running_pods)' "$TMP/pods_now.txt"
-  prom "deriv(max by (node) (kubelet_running_pods)[${GD}d:30m])" "$TMP/pods_deriv.txt"
-  prom 'max by (node) (kubelet_running_containers{container_state="running"})' "$TMP/cont.txt"
-  prom "max by (node, id) ($SVC)" "$TMP/svc_now.txt" '"\(.metric.node)|\(.metric.id | sub("^/system.slice/";""))"'
-  prom "deriv(max by (node, id) ($SVC)[${GD}d:30m])" "$TMP/svc_deriv.txt" '"\(.metric.node)|\(.metric.id | sub("^/system.slice/";""))"'
-  prom "topk(40, max by (node, id) (rate(container_cpu_usage_seconds_total{id=~\"/system.slice/[^/]+[.]service\"}[1h])))" "$TMP/svc_cpu.txt" '"\(.metric.node)|\(.metric.id | sub("^/system.slice/";""))"'
-  # wydajność
-  prom 'histogram_quantile(0.99, sum by (node, le) (rate(kubelet_pleg_relist_duration_seconds_bucket[1h])))' "$TMP/pleg.txt"
-  prom 'histogram_quantile(0.99, sum by (node, operation_type, le) (rate(kubelet_runtime_operations_duration_seconds_bucket{operation_type!~".*image.*"}[1h])))' "$TMP/rt.txt" '"\(.metric.node)|\(.metric.operation_type)"'
-  prom 'histogram_quantile(0.99, sum by (node, le) (rate(kubelet_pod_start_sli_duration_seconds_bucket[1d])))' "$TMP/podstart.txt"
-  prom 'sum by (node) (increase(kube_pod_container_status_restarts_total[1d]) * on (namespace, pod) group_left(node) topk by (namespace, pod) (1, kube_pod_info))' "$TMP/restarts.txt"
-  prom 'topk(5, sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total[1d])) > 10)' "$TMP/toprestart.txt" '"\(.metric.namespace)/\(.metric.pod)"'
-  prom 'max_over_time((avg by (instance) (rate(node_cpu_seconds_total{mode="steal"}[5m])))[1d:5m]) * 100' "$TMP/steal_max.txt"
-  prom 'avg_over_time((avg by (instance) (rate(node_cpu_seconds_total{mode="steal"}[5m])))[1d:5m]) * 100' "$TMP/steal_avg.txt"
-  prom 'avg_over_time((1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))[1d:5m]) * 100' "$TMP/cpu_avg.txt"
-  prom 'max_over_time((1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))[1d:5m]) * 100' "$TMP/cpu_max.txt"
+KLOG=$(journalctl -k --since "$SINCE" --no-pager -q -o short-iso 2>/dev/null)
+kv oom_count "$(grep -ci 'invoked oom-killer' <<<"$KLOG")"
 
-  # najgorsza operacja runtime per node
-  awk -F'|' '{ if (!($1 in m) || $3+0 > m[$1]+0) { m[$1]=$3; o[$1]=$2 } } END{ for (k in m) print k "|" m[k] "|" o[k] }' "$TMP/rt.txt" >"$TMP/rt_max.txt"
-
-  # ---------------------------------------------------------- wiersze
-  # node|pool|capMem|allocMem|capCpu|allocCpu|resMem|resCpu|cur|peak|p99|cpumax|alert|uptime|growth%d|pods%d|pct
-  : >"$TMP/rows.txt"
-  local n pool cm am cc ac res resc cur peak p99 cmx al up dv gr pn pd pg pct
-  while IFS='|' read -r n pool cm am cc ac; do
-    [[ -n $POOL_FILTER && $pool != "$POOL_FILTER" ]] && continue
-    peak=$(getv "$n" "$TMP/peak.txt"); [[ -z $peak ]] && continue
-    res=$(awk -v a="$cm" -v b="$am" 'BEGIN{printf "%.0f", a-b}')
-    resc=$(awk -v a="$cc" -v b="$ac" 'BEGIN{printf "%.0f", a-b}')
-    cur=$(getv "$n" "$TMP/cur.txt"); p99=$(getv "$n" "$TMP/cpup99.txt"); cmx=$(getv "$n" "$TMP/cpumax.txt")
-    al=$(getv "$n" "$TMP/alerts.txt"); up=$(getv "$n" "$TMP/uptime.txt")
-    dv=$(getv "$n" "$TMP/deriv.txt"); pn=$(getv "$n" "$TMP/pods_now.txt"); pd=$(getv "$n" "$TMP/pods_deriv.txt")
-    gr="?"; pg="?"
-    if [[ -n $up && -n $dv && -n $cur ]] && fge "$up" $((GD + WARMUP_DAYS)); then
-      gr=$(awk -v d="$dv" -v c="$cur" 'BEGIN{ if (c<=0) print "?"; else printf "%.1f", d*86400/c*100 }')
-      [[ -n $pd && -n $pn ]] && pg=$(awk -v d="$pd" -v c="$pn" 'BEGIN{ if (c<=0) print "?"; else printf "%.1f", d*86400/c*100 }')
-    fi
-    pct=$(awk -v p="$peak" -v r="$res" 'BEGIN{ if (r<=0) print 0; else printf "%.0f", p*100/r }')
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-      "$n" "$pool" "$cm" "$am" "$cc" "$ac" "$res" "$resc" "${cur:-0}" "$peak" "${p99:-0}" "${cmx:-0}" "${al:+1}" "${up:-?}" "$gr" "$pg" "$pct" >>"$TMP/rows.txt"
-  done <"$TMP/nodes.txt"
-  [[ -s $TMP/rows.txt ]] || die "brak nodów z danymi dla wybranej puli"
-  sort -t'|' -k2,2 -k3,3n -k1,1 "$TMP/rows.txt" -o "$TMP/rows.txt"
-
-  local okno="ostatnie $EFF dni"
-  (( EFF < DAYS )) && okno="$okno (retencja Prometheusa: ok. $avail dni; żądano $DAYS)"
-  line "Okno danych: $okno   trend: ostatnie $GD dni   margines ×$MARGIN"
-
-  # ================================================ 1. KONFIGURACJA
-  hdr "1. Obecna konfiguracja rezerwacji"
-  local kcs
-  kcs=$(jq -r '.items[] | "\(.metadata.name)|\(.spec.machineConfigPoolSelector.matchLabels // {} | to_entries | map(.key | sub("pools.operator.machineconfiguration.openshift.io/";"")) | join(","))|\(.spec.autoSizingReserved // false)|\(.spec.kubeletConfig.systemReserved // {} | tojson)"' "$TMP/kc.json")
-  if [[ -z $kcs ]]; then
-    info "Brak KubeletConfig w klastrze — wszystkie pule mają domyślną rezerwację (ok. 1 GiB pamięci, 500m CPU)"
-  else
-    while IFS='|' read -r kn kp ka ksr; do
-      line "KubeletConfig $kn → pule: ${kp:-?}   autoSizingReserved=$ka   systemReserved=$ksr"
-    done <<<"$kcs"
-  fi
-
-  # ================================================ 2. TABELA
-  hdr "2. system.slice względem rezerwacji (per node)"
-  printf '  %s%-18s %-9s %4s %7s %5s %6s %6s %5s %5s %5s %5s %5s %6s %2s%s\n' "$BOLD" \
-    "NODE" "PULA" "CPU" "RAM" "REZ" "TERAZ" "SZCZYT" "SZC%" "CPUrz" "CPUp99" "CPUmx" "UPd" "TR%/d" "AL" "$N"
-  printf '  %-18s %-9s %4s %7s %5s %6s %6s %5s %5s %5s %5s %5s %6s %2s\n' "" "" "" "GiB" "GiB" "GiB" "GiB" "" "m" "m" "m" "" "" ""
-  while IFS='|' read -r n pool cm am cc ac res resc cur peak p99 cmx al up gr pg pct; do
-    local mark=''
-    (( pct >= 95 )) && mark="$R" || { (( pct >= NEAR_PCT )) && mark="$Y"; }
-    printf '  %-18s %-9s %4s %7s %5s %6s %6s %s%4s%%%s %5s %5s %5s %5s %6s %2s\n' \
-      "$(short "$n")" "${pool:0:9}" "$((cc / 1000))" "$(f1 "$(gib "$cm")")" "$(gib "$res")" "$(gib "$cur")" "$(gib "$peak")" \
-      "$mark" "$pct" "$N" "$resc" "$(mcore "$p99")" "$(mcore "$cmx")" "$( [[ $up == "?" ]] && echo '?' || f1 "$up")" \
-      "$( [[ $gr == "?" ]] && echo '?' || echo "${gr}")" "$( [[ $al == 1 ]] && echo '!' || echo '-')"
-  done <"$TMP/rows.txt"
-  line "SZC% = szczyt RSS system.slice / rezerwacja (alert >95%, ostrzeżenie ≥${NEAR_PCT}%). CPUp99/CPUmx = p99/maks. CPU system.slice."
-  line "UPd = dni od rebootu. TR%/d = trend pamięci system.slice z ostatnich $GD dni (liczony tylko gdy UPd ≥ $((GD + WARMUP_DAYS)))."
-
-  local n95 nnear nal
-  n95=$(awk -F'|' '$17>=95' "$TMP/rows.txt" | wc -l)
-  nnear=$(awk -F'|' -v t="$NEAR_PCT" '$17>=t && $17<95' "$TMP/rows.txt" | wc -l)
-  nal=$(awk -F'|' '$13==1' "$TMP/rows.txt" | wc -l)
-  (( n95 ))   && warn "Szczyt powyżej 95% rezerwacji — nodów: $n95 (alert aktywny teraz: $nal)"
-  (( nnear )) && warn "Szczyt w przedziale ${NEAR_PCT}–95% (blisko alertu) — nodów: $nnear"
-  (( n95 + nnear == 0 )) && ok "Wszystkie nody poniżej ${NEAR_PCT}% rezerwacji pamięci"
-
-  # ================================================ 3. TREND
-  hdr "3. Trend — wyciek czy normalna praca"
-  local eligible leak
-  eligible=$(awk -F'|' '$15!="?"' "$TMP/rows.txt" | wc -l)
-  if (( eligible == 0 )); then
-    info "Trend nieoceniony — żaden node nie działa ≥ $((GD + WARMUP_DAYS)) dni od rebootu lub brak danych"
-    leak=""
-  else
-    leak=$(awk -F'|' -v t="$LEAK_PCT_DAY" '$15!="?" && $15+0 >= t { pg=($16=="?"?0:$16+0); if ($15+0 - pg >= t) print $1" (+"$15"%/d, pody "($16=="?"?"?":$16"%/d")")" }' "$TMP/rows.txt")
-    local grow_pods
-    grow_pods=$(awk -F'|' -v t="$LEAK_PCT_DAY" '$15!="?" && $15+0 >= t { pg=($16=="?"?0:$16+0); if ($15+0 - pg < t) print $1 }' "$TMP/rows.txt")
-    if [[ -n $leak ]]; then
-      local cnt; cnt=$(grep -c . <<<"$leak")
-      warn "Podejrzenie wycieku (nodów: $cnt) — pamięć system.slice rośnie ≥${LEAK_PCT_DAY}%/dobę bez wzrostu liczby podów"
-      while IFS= read -r l; do line "   $(short "${l%% *}" 30) ${l#* }"; done <<<"$leak"
-    fi
-    if [[ -n $grow_pods ]]; then
-      info "Wzrost pamięci system.slice (nodów: $(grep -c . <<<"$grow_pods")) wynika ze wzrostu liczby podów — to nie wyciek"
-    fi
-    [[ -z $leak && -z $grow_pods ]] && ok "Zużycie stabilne (ocenionych nodów: $eligible) — brak oznak wycieku"
-    local young; young=$(awk -F'|' '$15=="?"' "$TMP/rows.txt" | wc -l)
-    (( young )) && line "Pominięte nody (świeży reboot lub brak danych): $young"
-  fi
-
-  # per usługa
-  if [[ -s $TMP/svc_now.txt ]]; then
-    printf '\n'
-    line "${BOLD}Usługi w system.slice${N} (teraz; trend z nodów z uptime ≥ $((GD + WARMUP_DAYS)) d; CPU z ostatniej godziny):"
-    printf '         %-30s %9s %9s %9s %9s\n' "usługa" "śr. GiB" "maks GiB" "trend%/d" "CPU maks"
-    awk -F'|' -v gd="$((GD + WARMUP_DAYS))" '
-      FILENAME==ARGV[1] { up[$1]=$14; next }
-      FILENAME==ARGV[2] { k=$1"|"$2; now[k]=$3; if (!($1 in up)) next; s[$2]+=$3; c[$2]++; if ($3>m[$2]) m[$2]=$3; next }
-      FILENAME==ARGV[3] { k=$1"|"$2; if (!($1 in up) || up[$1]=="?" || up[$1]+0 < gd || now[k]+0 <= 0) next; g[$2]+=$3*86400/now[k]*100; gc[$2]++; next }
-      FILENAME==ARGV[4] { if (!($1 in up)) next; if ($3>cp[$2]) cp[$2]=$3 }
-      END { for (k in s) printf "%.0f|%.0f|%s|%s|%s\n", s[k]/c[k], m[k], (gc[k]? sprintf("%+.1f", g[k]/gc[k]) : "?"), (k in cp ? sprintf("%.0fm", cp[k]*1000) : "-"), k }
-    ' "$TMP/rows.txt" "$TMP/svc_now.txt" "$TMP/svc_deriv.txt" "$TMP/svc_cpu.txt" 2>/dev/null \
-    | sort -t'|' -k1,1nr | head -8 >"$TMP/svc_sum.txt"
-    while IFS='|' read -r avg mx tr cp sv; do
-      printf '         %-30s %9s %9s %9s %9s\n' "${sv:0:30}" "$(gib "$avg")" "$(gib "$mx")" "$tr" "$cp"
-      if [[ $tr != "?" ]] && fge "$tr" "$LEAK_PCT_DAY"; then
-        warn "Usługa $sv rośnie średnio ${tr}%/dobę — kandydat na wyciek (sprawdź errata/KCS dla swojej wersji OCP)"
-      fi
-    done <"$TMP/svc_sum.txt"
-    local udev; udev=$(awk -F'|' '$5=="systemd-udevd.service"{print $1}' "$TMP/svc_sum.txt")
-    [[ -n $udev ]] && fgt "$udev" 157286400 && \
-      info "systemd-udevd zajmuje średnio $(gib "$udev") GiB (typowo kilkadziesiąt MB) — dużo zdarzeń udev: veth podów, wolumeny CSI/multipath"
-  fi
-
-  # ================================================ 4. WYDAJNOŚĆ
-  hdr "4. Kondycja kubelet/crio i warstwy wirtualizacji (ostatnia doba / godzina)"
-  printf '  %s%-18s %5s %5s %5s %7s %7s %-16s %7s %7s %7s%s\n' "$BOLD" "NODE" "PODY" "KONT" "EXEC" "REST/d" "PLEGp99" "RUNTIME p99" "START" "STEAL" "CPU%" "$N"
-  printf '  %-18s %5s %5s %5s %7s %7s %-16s %7s %7s %7s\n' "" "" "" "" "" "s" "s (operacja)" "p99 s" "mx/śr%" "śr/mx"
-  local -a perf_pleg=() perf_rt=() perf_steal=() perf_rest=()
-  while IFS='|' read -r n pool _rest; do
-    local pods cont ex rs pl rtv rto ps stm sta cpa cpm
-    pods=$(getv "$n" "$TMP/pods_now.txt"); cont=$(getv "$n" "$TMP/cont.txt"); ex=$(getv "$n" "$TMP/exec.txt")
-    rs=$(getv "$n" "$TMP/restarts.txt"); pl=$(getv "$n" "$TMP/pleg.txt")
-    IFS='|' read -r _ rtv rto < <(awk -F'|' -v n="$n" '$1==n' "$TMP/rt_max.txt")
-    ps=$(getv "$n" "$TMP/podstart.txt"); stm=$(getv "$n" "$TMP/steal_max.txt"); sta=$(getv "$n" "$TMP/steal_avg.txt")
-    cpa=$(getv "$n" "$TMP/cpu_avg.txt"); cpm=$(getv "$n" "$TMP/cpu_max.txt")
-    printf '  %-18s %5s %5s %5s %7s %7s %-16s %7s %7s %7s\n' "$(short "$n")" \
-      "${pods:--}" "${cont:--}" "${ex:-0}" "$( [[ -n $rs ]] && printf '%.0f' "$rs" || echo -)" \
-      "$( [[ -n $pl ]] && printf '%.2f' "$pl" || echo -)" \
-      "$( [[ -n $rtv ]] && printf '%.2f %s' "$rtv" "${rto:0:10}" || echo -)" \
-      "$( [[ -n $ps ]] && printf '%.1f' "$ps" || echo -)" \
-      "$( [[ -n $stm ]] && printf '%.0f/%.0f' "$stm" "${sta:-0}" || echo -)" \
-      "$( [[ -n $cpa ]] && printf '%.0f/%.0f' "$cpa" "${cpm:-0}" || echo -)"
-    [[ -n $pl ]]  && fge "$pl" "$PLEG_WARN"   && perf_pleg+=("$(short "$n") ($(printf '%.2f' "$pl") s)")
-    [[ -n $rtv ]] && fge "$rtv" "$RT_WARN"    && perf_rt+=("$(short "$n") (${rto} $(printf '%.2f' "$rtv") s)")
-    [[ -n $stm ]] && fge "$stm" "$STEAL_WARN" && perf_steal+=("$(short "$n") (maks $(printf '%.0f' "$stm")%, śr $(printf '%.1f' "${sta:-0}")%)")
-    [[ -n $rs ]]  && fge "$rs" "$RESTART_WARN" && perf_rest+=("$(short "$n") ($(printf '%.0f' "$rs")/d)")
-  done <"$TMP/rows.txt"
-  line "EXEC = liczba probe typu exec (każda uruchamia proces przez crio). REST/d = restarty kontenerów z doby."
-  line "RUNTIME = najwolniejsza operacja crio (bez pobierania obrazów). START = p99 startu poda bez pobierania obrazu."
-
-  if (( ${#perf_steal[@]} )); then
-    warn "Steal time ≥${STEAL_WARN}% na: ${perf_steal[*]} — VM-ki czekają na fizyczne CPU hosta (warstwa wirtualizacji)"
-  else ok "Steal time poniżej ${STEAL_WARN}% — warstwa wirtualizacji nie dławi CPU nodów"; fi
-  if (( ${#perf_pleg[@]} )); then
-    warn "Wolny PLEG relist (p99 ≥ ${PLEG_WARN} s) na: ${perf_pleg[*]} — kubelet nie nadąża z obsługą kontenerów"
-  else [[ -s $TMP/pleg.txt ]] && ok "PLEG relist w normie"; fi
-  if (( ${#perf_rt[@]} )); then
-    warn "Wolne operacje crio (p99 ≥ ${RT_WARN} s) na: ${perf_rt[*]}"
-  else [[ -s $TMP/rt_max.txt ]] && ok "Operacje runtime (crio) w normie"; fi
-  if (( ${#perf_rest[@]} )); then
-    warn "Duża rotacja kontenerów (≥${RESTART_WARN} restartów/dobę) na: ${perf_rest[*]}"
-  fi
-  if [[ -s $TMP/toprestart.txt ]]; then
-    line "Najczęściej restartujące pody (doba):"
-    sort -t'|' -k2,2nr "$TMP/toprestart.txt" | while IFS='|' read -r p v; do line "   $(printf '%-60s %5.0f' "${p:0:60}" "$v")"; done
-  fi
-  local exec_top
-  exec_top=$(sort -t'|' -k2,2nr "$TMP/exec.txt" | head -1)
-  if [[ -n $exec_top ]] && fge "${exec_top#*|}" 100; then
-    info "Dużo probe typu exec (do ${exec_top#*|} na nodzie $(short "${exec_top%%|*}")) — zwiększają CPU crio/kubeleta; httpGet/tcpSocket są tańsze"
-  fi
-  [[ -s $TMP/podstart.txt ]] || line "(metryka kubelet_pod_start_sli_duration_seconds niedostępna w tej wersji — kolumna START pusta)"
-
-  # ================================================ 5. REKOMENDACJE
-  hdr "5. Rekomendacja per pula i profil nodów"
-  : >"$TMP/yaml.txt"; : >"$TMP/steps.txt"
-  local -a pool_list=()
-  mapfile -t pool_list < <(cut -d'|' -f2 "$TMP/rows.txt" | sort -u)
-  local any_change=0 p
-  for p in "${pool_list[@]}"; do
-    # grupowanie po RAM: g|minCap|maxCap|count|nodes|maxPeak|maxP99|n95|nnear|maxCpuCores
-    awk -F'|' -v p="$p" -v step="$PROFILE_STEP" '$2==p' "$TMP/rows.txt" | sort -t'|' -k3,3n | awk -F'|' -v step="$PROFILE_STEP" -v near="$NEAR_PCT" '
-      { if (NR==1 || $3 > base*step) { g++; base=$3; mn[g]=$3 }
-        mx[g]=$3; c[g]++; nodes[g]=nodes[g] (nodes[g]?",":"") $1
-        if ($10>pk[g]) pk[g]=$10; if ($11>p9[g]) p9[g]=$11
-        if ($17>=95) o[g]++; else if ($17>=near) nr[g]++
-        if ($5>cpu[g]) cpu[g]=$5 }
-      END { for (i=1;i<=g;i++) printf "%d|%s|%s|%d|%s|%s|%s|%d|%d|%s\n", i, mn[i], mx[i], c[i], nodes[i], pk[i]+0, p9[i]+0, o[i], nr[i], cpu[i] }' >"$TMP/groups_raw.txt"
-
-    # rekomendacje i scalanie sąsiednich grup o tej samej rekomendacji
-    : >"$TMP/groups.txt"
-    local prev="" gid=0
-    while IFS='|' read -r g mn mx c nodes pk p9 o nr cpu; do
-      local rm rc
-      rm=$(rec_mem "$pk"); rc=$(rec_cpu "$p9")
-      if [[ "$rm|$rc" == "$prev" ]]; then
-        awk -F'|' -v OFS='|' -v mx="$mx" -v c="$c" -v nodes="$nodes" -v pk="$pk" -v p9="$p9" -v o="$o" -v nr="$nr" -v cpu="$cpu" '
-          NR==FNR { last=FNR; next }
-          FNR==last { $3=mx; $4=$4+c; $5=$5","nodes; if (pk>$6) $6=pk; if (p9>$7) $7=p9; $8=$8+o; $9=$9+nr; if (cpu>$12) $12=cpu }
-          { print }' "$TMP/groups.txt" "$TMP/groups.txt" >"$TMP/g2.txt" && mv "$TMP/g2.txt" "$TMP/groups.txt"
-      else
-        gid=$((gid + 1))
-        printf '%d|%s|%s|%d|%s|%s|%s|%d|%d|%s|%s|%s\n' "$gid" "$mn" "$mx" "$c" "$nodes" "$pk" "$p9" "$o" "$nr" "$rm" "$rc" "$cpu" >>"$TMP/groups.txt"
-      fi
-      prev="$rm|$rc"
-    done <"$TMP/groups_raw.txt"
-
-    local cnt curres curresc pool_o pool_nr pool_cpu_need
-    cnt=$(awk -F'|' -v p="$p" '$2==p' "$TMP/rows.txt" | wc -l)
-    curres=$(awk -F'|' -v p="$p" '$2==p{print $7; exit}' "$TMP/rows.txt")
-    curresc=$(awk -F'|' -v p="$p" '$2==p{print $8; exit}' "$TMP/rows.txt")
-    pool_o=$(awk -F'|' '{s+=$8} END{print s+0}' "$TMP/groups.txt")
-    pool_nr=$(awk -F'|' '{s+=$9} END{print s+0}' "$TMP/groups.txt")
-    pool_cpu_need=$(awk -F'|' -v r="$curresc" '$7*1000 > r' "$TMP/groups.txt" | wc -l)
-    local ngroups; ngroups=$(wc -l <"$TMP/groups.txt")
-
-    printf '\n  %sPula %s%s (%d nodów, obecnie %s GiB / %sm)\n' "$BOLD" "$p" "$N" "$cnt" "$(gib "$curres")" "$curresc"
-    printf '         %-12s %-14s %5s %9s %9s %6s  %-10s %s\n' "PROFIL" "RAM GiB" "NODY" "szczyt" "CPU p99" ">95/≥$NEAR_PCT" "REKOM." ""
-    local base_g base_c=0
-    while IFS='|' read -r g mn mx c nodes pk p9 o nr rm rc cpu; do
-      if (( c > base_c )); then base_g=$g; base_c=$c; fi
-    done <"$TMP/groups.txt"
-
-    # nazwy profili względem bazowej grupy
-    declare -A GNAME=()
-    local -a up_names=(large xlarge xxlarge) down_names=(small xsmall xxsmall)
-    while IFS='|' read -r g _; do
-      if (( g == base_g )); then GNAME[$g]=$p
-      elif (( g > base_g )); then GNAME[$g]="$p-${up_names[$((g - base_g - 1))]:-g$g}"
-      else GNAME[$g]="$p-${down_names[$((base_g - g - 1))]:-g$g}"; fi
-    done <"$TMP/groups.txt"
-
-    while IFS='|' read -r g mn mx c nodes pk p9 o nr rm rc cpu; do
-      local rng
-      rng=$(awk -v a="$mn" -v b="$mx" 'BEGIN{ a/=1073741824; b/=1073741824; if (b-a<1) printf "%.0f", b; else printf "%.0f–%.0f", a, b }')
-      printf '         %-12s %-14s %5s %9s %9s %6s  %-10s\n' "${GNAME[$g]#"$p"-}" "$rng" "$c" "$(gib "$pk")" "$(mcore "$p9")m" "$o/$nr" "${rm}Gi/${rc}m"
-      if (( ngroups > 1 )); then
-        local nl=""; IFS=',' read -ra arr <<<"$nodes"; for x in "${arr[@]}"; do nl+="$(short "$x" 30) "; done
-        line "   nody: $nl"
-      fi
-    done <"$TMP/groups.txt"
-    [[ ${GNAME[$base_g]} == "$p" && $ngroups -gt 1 ]] && line "(${p} = profil z największą liczbą nodów, zostaje w puli $p)"
-
-    if (( pool_o + pool_nr == 0 && pool_cpu_need == 0 )); then
-      ok "Pula $p: rezerwacje wystarczają (pamięć < ${NEAR_PCT}%, CPU p99 ≤ ${curresc}m) — zmiana niepotrzebna"
-      unset GNAME; continue
-    fi
-    any_change=1
-    local why=()
-    (( pool_o ))  && why+=("szczyt pamięci >95% — nodów: $pool_o")
-    (( pool_nr )) && why+=("blisko progu — nodów: $pool_nr")
-    (( pool_cpu_need )) && why+=("CPU p99 system.slice powyżej rezerwacji ${curresc}m")
-    warn "Pula $p wymaga zmiany rezerwacji: $(IFS=';'; echo "${why[*]}" | sed 's/;/; /g')"
-
-    local is_worker_based=1
-    [[ $p == master || $p == control-plane || $p == arbiter ]] && is_worker_based=0
-    if (( ngroups > 1 && is_worker_based == 0 )); then
-      warn "Pula $p ma nody różnej wielkości, ale nie da się jej podzielić na pule niestandardowe — użyj wartości dla największego profilu"
-      local rmM rcM
-      rmM=$(awk -F'|' '{if($10+0>m)m=$10+0} END{print m}' "$TMP/groups.txt"); rcM=$(awk -F'|' '{if($11+0>m)m=$11+0} END{print m}' "$TMP/groups.txt")
-      echo "1|0|0|0|all|0|0|0|0|$rmM|$rcM|0" >"$TMP/groups.txt"; base_g=1; GNAME[1]=$p; ngroups=1
-    fi
-    if (( ngroups > 1 )); then
-      info "Pula $p: różne profile nodów potrzebują różnych rezerwacji — propozycja podziału na $ngroups pule (niżej)"
-    fi
-
-    # ostrzeżenie o istniejącym KubeletConfig dla puli bazowej
-    local existing
-    existing=$(jq -r --arg p "$p" '.items[] | select((.spec.machineConfigPoolSelector.matchLabels // {}) | has("pools.operator.machineconfiguration.openshift.io/" + $p)) | .metadata.name' "$TMP/kc.json" | head -1)
-    if [[ -n $existing && $ngroups -gt 1 ]]; then
-      warn "Pula $p ma KubeletConfig $existing — nody przeniesione do nowych pul go NIE odziedziczą; nowe KubeletConfig muszą zawierać także jego pozostałe ustawienia"
-    fi
-
-    # sprawdzenie allocatable + YAML
-    local -a tight=()
-    while IFS='|' read -r g mn mx c nodes pk p9 o nr rm rc cpu; do
-      local pname=${GNAME[$g]}
-      IFS=',' read -ra arr <<<"$nodes"
-      for x in "${arr[@]}"; do
-        [[ $x == all ]] && continue
-        local am rs rq newal delta
-        am=$(awk -F'|' -v n="$x" '$1==n{print $4}' "$TMP/rows.txt"); rs=$(awk -F'|' -v n="$x" '$1==n{print $7}' "$TMP/rows.txt")
-        rq=$(getv "$x" "$TMP/req.txt"); rq=${rq:-0}
-        delta=$(awk -v r="$rm" -v c="$rs" 'BEGIN{printf "%.0f", r*1073741824 - c}')
-        newal=$(awk -v a="$am" -v d="$delta" 'BEGIN{printf "%.0f", a-d}')
-        awk -v q="$rq" -v a="$newal" 'BEGIN{exit !(q > a*0.9)}' && tight+=("$(short "$x") ($(gib "$rq")/$(gib "$newal") GiB)")
-      done
-
-      if [[ $pname != "$p" ]]; then
-        cat >>"$TMP/yaml.txt" <<YAML
-# ---- nowa pula $pname (dziedziczy całą konfigurację puli $p)
-apiVersion: machineconfiguration.openshift.io/v1
-kind: MachineConfigPool
-metadata:
-  name: $pname
-  labels:
-    pools.operator.machineconfiguration.openshift.io/$pname: ""
-spec:
-  maxUnavailable: 1
-  machineConfigSelector:
-    matchExpressions:
-      - key: machineconfiguration.openshift.io/role
-        operator: In
-        values: [$p, $pname]
-  nodeSelector:
-    matchLabels:
-      node-role.kubernetes.io/$pname: ""
----
-YAML
-        {
-          printf '# pula %s — oznaczenie nodów (przeniesienie bez zmiany konfiguracji = bez rebootu)\n' "$pname"
-          for x in "${arr[@]}"; do printf 'oc label node %s node-role.kubernetes.io/%s=""\n' "$x" "$pname"; done
-          printf 'oc get mcp %s   # poczekaj na UPDATED=True, MACHINECOUNT=%d\n\n' "$pname" "${#arr[@]}"
-        } >>"$TMP/steps.txt"
-      fi
-      local kcname="${pname}-system-reserved"
-      [[ $pname == "$p" && -n $existing ]] && kcname=$existing
-      cat >>"$TMP/yaml.txt" <<YAML
-# ---- rezerwacja dla puli $pname$( [[ $pname == "$p" && -n $existing ]] && echo "  (ISTNIEJE KubeletConfig $existing — dopisz systemReserved do niego)")
-apiVersion: machineconfiguration.openshift.io/v1
-kind: KubeletConfig
-metadata:
-  name: $kcname
-spec:
-  machineConfigPoolSelector:
-    matchLabels:
-      pools.operator.machineconfiguration.openshift.io/$pname: ""
-  kubeletConfig:
-    systemReserved:
-      memory: ${rm}Gi
-      cpu: ${rc}m
----
-YAML
-    done <"$TMP/groups.txt"
-    if (( ${#tight[@]} )); then
-      warn "Pula $p: po zmianie requests pamięci przekroczą 90% nowego allocatable na: ${tight[*]}"
-    else
-      ok "Pula $p: requests pamięci zmieszczą się w nowym allocatable na wszystkich nodach"
-    fi
-    {
-      printf '# rezerwacje — dopiero PO przeniesieniu nodów do nowych pul (inaczej przeniesione nody zrestartują się dwa razy)\n'
-      printf '# KAŻDY KubeletConfig wywoła rolling reboot nodów swojej puli\n'
-      while IFS='|' read -r g _; do
-        printf '#   pula %s: oc patch mcp %s --type merge -p '"'"'{"spec":{"paused":true}}'"'"'  → oc apply -f <KubeletConfig> → odpauzowanie w oknie\n' "${GNAME[$g]}" "${GNAME[$g]}"
-      done <"$TMP/groups.txt"
-      printf '\n'
-    } >>"$TMP/steps.txt"
-    unset GNAME
+# Zdarzenia OOM: czas|typ|oom_memcg|task_memcg|zabitych|największy proces|anon-rss kB|oom_score_adj|grupowo|wywołujący
+OOMEV=$(printf '%s\n' "$KLOG" | awk '
+  function flush() {
+    if (ev) printf "%s|%s|%s|%s|%d|%s|%d|%s|%d|%s\n", ts, type, om, tm, kn, tc, ta, tadj, grp, inv
+  }
+  /invoked oom-killer/ {
+    flush(); ev++; ts=$1; type="?"; om=""; tm=""; kn=0; tc=""; ta=-1; tadj=""; grp=0
+    inv=$0; sub(/ invoked oom-killer.*/, "", inv); sub(/.*kernel: /, "", inv); next
+  }
+  /oom-kill:constraint=/ {
+    l=$0
+    if (l ~ /global_oom/) type="global"
+    if (match(l, /oom_memcg=[^,]*/))  om=substr(l, RSTART+10, RLENGTH-10)
+    if (match(l, /task_memcg=[^,]*/)) tm=substr(l, RSTART+11, RLENGTH-11)
+    if (type != "global") {
+      if (om ~ /\.scope$/) type="container"
+      else if (om ~ /-pod[0-9a-f_]+\.slice$/) type="pod"
+      else if (om ~ /^\/kubepods\.slice(\/kubepods-(burstable|besteffort)\.slice)?$/) type="allocatable"
+      else if (om ~ /^\/system\.slice/) type="system"
+      else type="other"
+    }
+    next
+  }
+  /memory\.oom\.group/ { grp=1; next }
+  /Killed process/ {
+    if (!ev) { ev++; ts=$1; type=($0 ~ /Memory cgroup/) ? "container" : "global"; ta=-1 }
+    kn++
+    c=""; if (match($0, /Killed process [0-9]+ \([^)]*\)/)) { c=substr($0, RSTART, RLENGTH); sub(/Killed process [0-9]+ \(/, "", c); sub(/\)$/, "", c) }
+    a=0;  if (match($0, /anon-rss:[0-9]+kB/)) a=substr($0, RSTART+9, RLENGTH-11)+0
+    j=""; if (match($0, /oom_score_adj:-?[0-9]+/)) j=substr($0, RSTART+14, RLENGTH-14)
+    if (a > ta) { ta=a; tc=c; tadj=j }
+    next
+  }
+  END { flush() }')
+if [ -n "$OOMEV" ]; then
+  kv oom_events "$(printf '%s\n' "$OOMEV" | grep -c .)"
+  for t in container pod allocatable global system other; do
+    kv "oom_t_$t" "$(printf '%s\n' "$OOMEV" | awk -F'|' -v t="$t" '$2==t' | grep -c .)"
   done
+  printf '%s\n' "$OOMEV" | tail -60 | while IFS= read -r l; do kv oomev "$l"; done
+  # kontener -> namespace/pod/kontener (o ile kontener jeszcze istnieje w crio)
+  printf '%s\n' "$OOMEV" | awk -F'|' '{ s=$4; if (match(s, /crio-[0-9a-f]+\.scope/)) print substr(s, RSTART+5, RLENGTH-11) }' \
+    | sort -u | head -40 | while read -r cid; do
+      y=$(crictl ps -a --id "$cid" -o yaml 2>/dev/null)
+      ns=$(printf '%s\n' "$y" | awk '/io.kubernetes.pod.namespace:/{print $2; exit}')
+      pn=$(printf '%s\n' "$y" | awk '/io.kubernetes.pod.name:/{print $2; exit}')
+      cn=$(printf '%s\n' "$y" | awk '/io.kubernetes.container.name:/{print $2; exit}')
+      [ -n "$pn" ] && kv oomctr "$cid|$ns|$pn|$cn"
+    done
+fi
+kv segfault_count "$(grep -ci 'segfault' <<<"$KLOG")"
+kv hung_count "$(grep -ci 'blocked for more than' <<<"$KLOG")"
 
-  # ================================================ 6. YAML
-  if (( any_change )); then
-    hdr "6. Propozycja (NIC nie zostało wdrożone)"
-    printf '  %sYAML:%s\n' "$BOLD" "$N"
-    sed 's/^/    /' "$TMP/yaml.txt"
-    printf '\n  %sKolejność ręcznych kroków (do wykonania samodzielnie, w oknie serwisowym):%s\n' "$BOLD" "$N"
-    printf '    # 0. ./ocp-mcp-diag.sh <pula> — pula Updated=True, brak blokujących PDB\n'
-    sed 's/^/    /' "$TMP/steps.txt"
-    if [[ -n $OUT_DIR ]]; then
-      mkdir -p "$OUT_DIR" || die "nie mogę utworzyć $OUT_DIR"
-      cp "$TMP/yaml.txt" "$OUT_DIR/proposed-sysreserved.yaml"
-      cp "$TMP/steps.txt" "$OUT_DIR/proposed-steps.txt"
-      line "Zapisano lokalnie: $OUT_DIR/proposed-sysreserved.yaml, $OUT_DIR/proposed-steps.txt"
-    fi
-  fi
+journalctl -u kubelet --since "$SINCE" --no-pager -q -o cat 2>/dev/null | awk '
+  /eviction manager: (attempting to reclaim|must evict)/ {e++}
+  /PLEG is not healthy/                                  {p++}
+  END { printf "K:evict_count=%d\nK:pleg_count=%d\n", e, p }'
 
-  # ================================================ WNIOSKI
-  hdr "WNIOSKI"
-  if (( ${#F_CRIT[@]} )); then printf '%s%sKRYTYCZNE (%d):%s\n' "$BOLD" "$R" "${#F_CRIT[@]}" "$N"; for f in "${F_CRIT[@]}"; do printf '  • %s\n' "$f"; done; fi
-  if (( ${#F_WARN[@]} )); then printf '%s%sOSTRZEŻENIA (%d):%s\n' "$BOLD" "$Y" "${#F_WARN[@]}" "$N"; for f in "${F_WARN[@]}"; do printf '  • %s\n' "$f"; done; fi
-  if (( ${#F_INFO[@]} )); then printf '%s%sINFORMACJE (%d):%s\n' "$BOLD" "$C" "${#F_INFO[@]}" "$N"; for f in "${F_INFO[@]}"; do printf '  • %s\n' "$f"; done; fi
+kv kubelet_active "$(systemctl is-active kubelet 2>/dev/null)"
+kv crio_active "$(systemctl is-active crio 2>/dev/null)"
 
-  printf '\n%sDalsze kroki:%s\n' "$BOLD" "$N"
-  local i=1
-  if [[ -n $leak ]]; then
-    printf '  %d. Wyjaśnij podejrzenie wycieku (sekcja 3) — większa rezerwacja go nie naprawi, tylko odsunie alert.\n' $i; i=$((i+1))
-  fi
-  if (( ${#perf_steal[@]} )); then
-    printf '  %d. Steal time: przyczyna wydajności leży na hostach (gęstość VM-ek, topologia vCPU, profil BIOS) — nie w OpenShifcie.\n' $i; i=$((i+1))
-  fi
-  if (( ${#perf_pleg[@]} + ${#perf_rt[@]} + ${#perf_rest[@]} )); then
-    printf '  %d. Kubelet/crio są przeciążone — ogranicz rotację (pody w CrashLoopBackOff, nieudane joby) i probe typu exec;\n' $i
-    printf '     wyższa rezerwacja CPU (sekcja 5) zabezpieczy je przed podami, ale nie usunie źródła obciążenia.\n'; i=$((i+1))
-  fi
-  if (( any_change )); then
-    printf '  %d. Wdróż rezerwacje z sekcji 6: najpierw jeden node / preprod, potem pule w oknie serwisowym.\n' $i; i=$((i+1))
-    printf '  %d. Po kilku dniach uruchom skrypt ponownie — SZC%% powinno spaść poniżej %d%%.\n' $i "$NEAR_PCT"
-  else
-    printf '  %d. Rezerwacje są wystarczające — zmiana KubeletConfig nie jest potrzebna.\n' $i
-  fi
+for m in /var /var/lib/containers; do
+  key=$(echo "$m" | tr '/' '_')
+  p=$(df -P "$m" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+  i=$(df -iP "$m" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+  kv "disk${key}" "$p"
+  kv "inode${key}" "$i"
+done
+kv HOST_DONE 1
+EOS
 
-  (( ${#F_CRIT[@]} )) && return 2
-  (( ${#F_WARN[@]} )) && return 1
+# ---------------------------------------------------------- zbieranie danych
+declare -A NA=() RA=() NH=() RH=()   # API i host: node problematyczny / referencyjny
+
+load_api() {
+  local n=$1; local -n A=$2
+  local raw cc cm cp ac am kv os kl us cur des st
+  raw=$(oc get node "$n" -o jsonpath='{.status.capacity.cpu}{"|"}{.status.capacity.memory}{"|"}{.status.capacity.pods}{"|"}{.status.allocatable.cpu}{"|"}{.status.allocatable.memory}{"|"}{.status.nodeInfo.kernelVersion}{"|"}{.status.nodeInfo.osImage}{"|"}{.status.nodeInfo.kubeletVersion}{"|"}{.spec.unschedulable}{"|"}{.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig}{"|"}{.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig}{"|"}{.metadata.annotations.machineconfiguration\.openshift\.io/state}') || return 1
+  IFS='|' read -r cc cm cp ac am kv os kl us cur des st <<<"$raw"
+  A[cap_cpu]=$cc; A[cap_mem]=$cm; A[cap_pods]=$cp; A[alloc_cpu]=$ac; A[alloc_mem]=$am
+  A[kernel]=$kv; A[os]=$os; A[kubelet]=$kl; A[unsched]=$us
+  A[mc_cur]=$cur; A[mc_des]=$des; A[mc_state]=$st
+  A[pool]=$(sed -E 's/^rendered-//; s/-[0-9a-f]+$//' <<<"$cur")
+  A[conditions]=$(oc get node "$n" -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}')
+  A[res_mem_mib]=$(( $(to_mib "$cm") - $(to_mib "$am") ))
+  A[res_cpu_m]=$(( $(to_milli "$cc") - $(to_milli "$ac") ))
+}
+
+load_host() {
+  local n=$1; local -n H=$2
+  local out l k v
+  local -a img=()
+  [[ -n $DEBUG_IMAGE ]] && img=(--image="$DEBUG_IMAGE")
+  out=$(oc debug "node/$n" "${img[@]}" -- chroot /host /bin/bash -c "HOURS=$LOG_HOURS; $HOST_SCRIPT" 2>/dev/null)
+  while IFS= read -r l; do
+    l=${l%$'\r'}
+    [[ $l == K:* ]] || continue
+    l=${l#K:}; k=${l%%=*}; v=${l#*=}
+    case $k in
+      svc|sizing|oomline|oomev|oomctr) H[$k]+="${H[$k]:+$'\n'}$v" ;;
+      *) H[$k]=$v ;;
+    esac
+  done <<<"$out"
+  [[ ${H[HOST_DONE]:-} == 1 ]]
+}
+
+# ------------------------------------------------------------- analiza OOM
+# Rozkłada zdarzenia OOM z logu kernela na: kontener / pod / allocatable noda /
+# globalny / system.slice, przypisuje je do podów i formułuje wnioski.
+oom_report() {
+  local total=${NH[oom_events]:-0}
+  local tc=${NH[oom_t_container]:-0} tp=${NH[oom_t_pod]:-0} ta=${NH[oom_t_allocatable]:-0}
+  local tg=${NH[oom_t_global]:-0} ts=${NH[oom_t_system]:-0} to=${NH[oom_t_other]:-0}
+  local f="$WORK/oom_ev.txt" m="$WORK/oom_map.txt" u="$WORK/oom_uid.txt"
+  printf '%s\n' "${NH[oomev]:-}" | grep . >"$f"
+  printf '%s\n' "${NH[oomctr]:-}" | grep . >"$m"
+  oc get pods -A -o jsonpath='{range .items[*]}{.metadata.uid}{"|"}{.metadata.namespace}{"|"}{.metadata.name}{"\n"}{end}' >"$u" 2>/dev/null
+
+  line "Zdarzenia OOM w kernelu: $total  →  kontener: $tc   pod: $tp   allocatable noda: $ta   globalne: $tg   system.slice: $ts   inne: $to"
+  line "(jedno zdarzenie przy memory.oom.group zabija wszystkie procesy kontenera — każdy ma osobny wpis „Killed process”)"
+
+  # wiersze: czas|typ|ns/pod|kontener|zabitych|proces|anonKB|adj|grupa
+  awk -F'|' -v OFS='|' '
+    FILENAME==ARGV[1] { ctr[$1]=$2 "/" $3 "|" $4; next }
+    FILENAME==ARGV[2] { uid[$1]=$2 "/" $3; next }
+    {
+      who="-"; cn="-"; s=$4; if (s=="") s=$3
+      if (match(s, /crio-[0-9a-f]+\.scope/)) { id=substr(s, RSTART+5, RLENGTH-11); if (id in ctr) { split(ctr[id], x, "|"); who=x[1]; cn=x[2] } }
+      if (who=="-" && match(s, /pod[0-9a-f_]+\.slice/)) { p=substr(s, RSTART+3, RLENGTH-9); gsub(/_/, "-", p); who=(p in uid) ? uid[p] : "pod " substr(p,1,8) ".. (usunięty)" }
+      if ($2=="global" || $2=="system") who=(who=="-") ? "(proces systemowy)" : who
+      print $1, $2, who, cn, $5, $6, $7, $8, $9
+    }' "$m" "$u" "$f" >"$WORK/oom_rows.txt"
+
+  printf '         %-19s %-11s %-40s %-14s %4s %-16s %9s %5s\n' "CZAS" "TYP" "NAMESPACE/POD" "KONTENER" "ZAB." "NAJW. PROCES" "anon-rss" "ADJ"
+  tail -15 "$WORK/oom_rows.txt" | while IFS='|' read -r t ty who cn kn pc ak adj grp; do
+    printf '         %-19s %-11s %-40s %-14s %4s %-16s %9s %5s\n' "${t:0:19}" "$ty" "${who:0:40}" "${cn:0:14}" "$kn" "${pc:0:16}" \
+      "$(awk -v k="$ak" 'BEGIN{ if (k>=1048576) printf "%.1fG", k/1048576; else if (k>=1024) printf "%.0fM", k/1024; else printf "%dk", k }')" "$adj"
+  done
+  (( total > 15 )) && line "… pokazano ostatnie 15 z $total zdarzeń"
+
+  # agregacja per pod
+  line "Najczęściej zabijane pody:"
+  awk -F'|' '$2=="container" || $2=="pod" { c[$3]++; if ($7>m[$3]) m[$3]=$7 } END { for (k in c) printf "%d|%s|%d\n", c[k], k, m[k] }' "$WORK/oom_rows.txt" \
+    | sort -t'|' -k1,1nr | head -5 | while IFS='|' read -r c who mx; do
+      line "   $(printf '%-50s %3d× (największy proces: %s)' "${who:0:50}" "$c" "$(awk -v k="$mx" 'BEGIN{ if (k>=1048576) printf "%.1f GiB", k/1048576; else printf "%.0f MiB", k/1024 }')")"
+    done
+
+  # wnioski
+  if (( tc + tp > 0 )); then
+    local npods; npods=$(awk -F'|' '$2=="container" || $2=="pod" {print $3}' "$WORK/oom_rows.txt" | sort -u | grep -c .)
+    warn "OOM kontenerów/podów (zdarzeń: $((tc + tp)), podów: $npods) — kontenery przekroczyły WŁASNY limit pamięci (strona aplikacji: limit za niski vs zużycie). Node miał pamięć."
+  fi
+  if (( ta > 0 )); then
+    crit "OOM na poziomie allocatable noda ($ta): wszystkie pody RAZEM wyczerpały pamięć przeznaczoną dla podów — requesty dużo niższe niż realne zużycie albo za mała pojemność noda"
+  fi
+  if (( tg > 0 )); then
+    crit "Globalny OOM noda ($tg): zabrakło pamięci na całym nodzie (system + pody) — sprawdź rezerwację systemową, realne zużycie podów vs requesty i MemAvailable"
+  fi
+  if (( ts > 0 )); then
+    crit "OOM w system.slice ($ts): zabijane usługi systemowe — ryzyko utraty kubeleta/crio; rezerwacja systemowa do poprawy"
+  fi
+  local tiny; tiny=$(awk -F'|' '$7>0 && $7<65536 && $5>1' "$WORK/oom_rows.txt" | grep -c .)
+  (( tiny > 0 )) && line "Uwaga: małe procesy (<64 MiB) w wynikach to zwykle wrappery/powłoki zabite grupowo razem z właściwym procesem kontenera."
   return 0
 }
 
-# ------------------------------------------------------------- anonimizacja
-build_anon_sed() {
-  local api dom user i=0 n role short
-  : >"$TMP/anon.map"
-  api=$(oc whoami --show-server 2>/dev/null | sed -E 's#^https?://##; s#:[0-9]+$##')
-  dom=${api#api.}
-  user=$(oc whoami 2>/dev/null)
-  while IFS= read -r n; do
-    [[ -z $n ]] && continue
-    i=$((i + 1)); short=${n%%.*}
-    case $short in master*|*control*) role=master;; infra*) role=infra;; worker*|*wrk*) role=worker;; *) role=node;; esac
-    printf '%s %s\n' "$n" "$(printf '%s-%02d.cluster.example.com' "$role" "$i")" >>"$TMP/anon.map"
-    [[ $short != "$n" ]] && printf '%s %s\n' "$short" "$(printf '%s-%02d' "$role" "$i")" >>"$TMP/anon.map"
-  done < <(oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
-  [[ -n $api ]] && printf '%s %s\n' "$api" "api.cluster.example.com" >>"$TMP/anon.map"
-  [[ -n $dom && $dom != "$api" ]] && printf '%s %s\n' "$dom" "cluster.example.com" >>"$TMP/anon.map"
-  [[ -n $user ]] && printf '%s %s\n' "$user" "user" >>"$TMP/anon.map"
-  awk '{print length($1), $0}' "$TMP/anon.map" | sort -rn | cut -d' ' -f2- | while read -r from to; do
-    printf 's/\\b%s\\b/%s/g\n' "$(sed 's/[.[\*^$/]/\\&/g' <<<"$from")" "$to"
-  done >"$TMP/anon.sed"
-}
-
-if [[ $ANONYMIZE == 1 ]]; then
-  build_anon_sed
-  main | sed -f "$TMP/anon.sed"
-  exit "${PIPESTATUS[0]}"
-else
-  main
-  exit $?
+# ------------------------------------------------------------------ preflight
+[[ -z $NODE || $NODE == -h || $NODE == --help ]] && usage
+command -v oc >/dev/null 2>&1 || die "brak polecenia oc w PATH"
+oc whoami >/dev/null 2>&1      || die "brak zalogowania do klastra (oc login)"
+oc get node "$NODE" >/dev/null 2>&1 || die "node $NODE nie istnieje"
+if [[ -n $REF ]]; then
+  oc get node "$REF" >/dev/null 2>&1 || die "node referencyjny $REF nie istnieje"
 fi
+HAVE_JQ=0; command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+
+printf '%sDiagnostyka noda:%s %s' "$BOLD" "$N" "$NODE"
+[[ -n $REF ]] && printf '   (porównanie z: %s)' "$REF"
+printf '\nKlaster: %s   użytkownik: %s   %s\n' "$(oc whoami --show-server 2>/dev/null)" "$(oc whoami 2>/dev/null)" "$(date '+%F %T')"
+
+printf '\nZbieranie danych z API...\n'
+load_api "$NODE" NA || die "nie udało się odczytać noda $NODE z API"
+[[ -n $REF ]] && { load_api "$REF" RA || die "nie udało się odczytać noda $REF z API"; }
+
+printf 'Zbieranie danych z hosta %s (oc debug)...\n' "$NODE"
+HOST_OK=1
+load_host "$NODE" NH || HOST_OK=0
+REF_HOST_OK=0
+if [[ -n $REF ]]; then
+  printf 'Zbieranie danych z hosta %s (oc debug)...\n' "$REF"
+  load_host "$REF" RH && REF_HOST_OK=1
+fi
+
+# =============================================================== 1. STAN NODA
+hdr "1. Stan noda (API, MCO)"
+line "Kernel: ${NA[kernel]}   OS: ${NA[os]}   kubelet: ${NA[kubelet]}"
+line "CPU: ${NA[cap_cpu]}   RAM: $(gib "$(to_mib "${NA[cap_mem]}")")   max podów: ${NA[cap_pods]}"
+
+if [[ ${NA[conditions]} == *"Ready=True"* ]]; then ok "Node Ready"; else crit "Node NIE jest Ready (${NA[conditions]})"; fi
+for c in MemoryPressure DiskPressure PIDPressure; do
+  if [[ ${NA[conditions]} == *"$c=True"* ]]; then crit "Kondycja $c=True — kubelet sygnalizuje realny brak zasobu"
+  else ok "$c=False"; fi
+done
+[[ ${NA[unsched]} == true ]] && info "Node jest cordoned (SchedulingDisabled)"
+
+if [[ ${NA[mc_state]} != Done ]]; then
+  warn "Stan MCO na nodzie: '${NA[mc_state]}' (oczekiwane Done)"
+else
+  ok "MCO state=Done"
+fi
+if [[ -n ${NA[mc_cur]} && ${NA[mc_cur]} != "${NA[mc_des]}" ]]; then
+  warn "Node w trakcie zmiany konfiguracji MCO: current=${NA[mc_cur]} desired=${NA[mc_des]}"
+fi
+if [[ -n ${NA[pool]} ]]; then
+  read -r deg upd < <(oc get mcp "${NA[pool]}" -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status} {.status.conditions[?(@.type=="Updating")].status}' 2>/dev/null)
+  line "Pula MCP: ${NA[pool]}  (Degraded=${deg:-?} Updating=${upd:-?})"
+  [[ $deg == True ]] && warn "Pula MCP ${NA[pool]} jest Degraded"
+  [[ $upd == True ]] && info "Pula MCP ${NA[pool]} jest w trakcie aktualizacji"
+fi
+
+# =================================================== 2. REZERWACJE I ALOKACJA
+hdr "2. Rezerwacje systemowe i alokacja zasobów"
+res_mib=${NA[res_mem_mib]}
+line "Rezerwacja (capacity − allocatable): pamięć $(gib "$res_mib"), CPU ${NA[res_cpu_m]}m"
+
+if (( HOST_OK )); then
+  sizing=${NH[sizing]:-}
+  if [[ $sizing == *BRAK_PLIKOW* ]]; then
+    info "Brak /etc/node-sizing*.env — rezerwacje ustawione inaczej (sprawdź KubeletConfig)"
+  else
+    line "node-sizing: $(tr '\n' ' ' <<<"$sizing")"
+    [[ $sizing == *NODE_SIZING_ENABLED=true* ]] && info "Auto-sizing rezerwacji WŁĄCZONY"
+  fi
+
+  anon=${NH[sys_slice_anon]:-0}; cur=${NH[sys_slice_current]:-0}
+  anon_mib=$(( ${anon:-0} / 1048576 )); cur_mib=$(( ${cur:-0} / 1048576 ))
+  p=$(pct "$anon_mib" "$res_mib")
+  line "system.slice: anon/RSS $(gib "$anon_mib") (z cache: $(gib "$cur_mib")) = ${p}% rezerwacji"
+  if (( p >= 95 )); then
+    warn "system.slice zużywa ${p}% rezerwacji — warunek alertu SystemMemoryExceedsReservation spełniony; rezerwacja za mała dla tego noda"
+  else
+    ok "system.slice mieści się w rezerwacji (${p}%)"
+  fi
+  if [[ -n ${NH[svc]:-} ]]; then
+    line "Top usługi w system.slice:"
+    while IFS='=' read -r s b; do line "   $(printf '%-32s %s' "$s" "$(gib $(( b / 1048576 )))")"; done <<<"${NH[svc]}"
+  fi
+fi
+
+alloc=$(oc describe node "$NODE" 2>/dev/null | awk '
+  /^Allocated resources:/ {f=1; next}
+  f && $1=="cpu"    {gsub(/[()%]/,"",$3); gsub(/[()%]/,"",$5); print "cpu", $2, $3, $4, $5}
+  f && $1=="memory" {gsub(/[()%]/,"",$3); gsub(/[()%]/,"",$5); print "memory", $2, $3, $4, $5; exit}')
+read -r _ cpu_req cpu_req_p cpu_lim cpu_lim_p < <(grep '^cpu' <<<"$alloc")
+read -r _ mem_req mem_req_p mem_lim mem_lim_p < <(grep '^memory' <<<"$alloc")
+line "Requests: CPU ${cpu_req:-?} (${cpu_req_p:-?}%)  pamięć ${mem_req:-?} (${mem_req_p:-?}%)"
+line "Limits:   CPU ${cpu_lim:-?} (${cpu_lim_p:-?}%)  pamięć ${mem_lim:-?} (${mem_lim_p:-?}%)"
+if num "${cpu_req_p:-}"; then (( cpu_req_p >= 90 )) && warn "Requests CPU = ${cpu_req_p}% allocatable — brak miejsca na nowe pody"; fi
+if num "${mem_req_p:-}"; then (( mem_req_p >= 90 )) && warn "Requests pamięci = ${mem_req_p}% allocatable — brak miejsca na nowe pody"; fi
+if num "${cpu_lim_p:-}"; then (( cpu_lim_p > 100 )) && info "Limity CPU = ${cpu_lim_p}% (overcommit limitów — throttling tylko przy realnym obciążeniu)"; fi
+if num "${mem_lim_p:-}"; then
+  if (( mem_lim_p > 100 )); then warn "Limity pamięci = ${mem_lim_p}% — przy pełnym zużyciu możliwe OOM/eviction"
+  elif (( mem_lim_p >= 75 )); then info "Limity pamięci = ${mem_lim_p}% allocatable (zbliżają się do pojemności)"; fi
+fi
+
+# ============================================================== 3. PODY
+hdr "3. Pody na nodzie"
+declare -A NODE_NS=()
+declare -a BAD=() OOMP=() RESTARTP=()
+pods_raw=$(oc get pods -A --field-selector "spec.nodeName=$NODE" -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.containerStatuses[*]}{.restartCount}{","}{.state.waiting.reason}{","}{.lastState.terminated.reason}{";"}{end}{"\n"}{end}' 2>/dev/null)
+pod_count=0
+while IFS='|' read -r name phase cs; do
+  [[ -z $name ]] && continue
+  pod_count=$((pod_count + 1))
+  NODE_NS["${name%%/*}"]=1
+  restarts=0; reasons=''
+  IFS=';' read -ra arr <<<"$cs"
+  for c in "${arr[@]}"; do
+    IFS=',' read -r rc wr lr <<<"$c"
+    num "$rc" && restarts=$((restarts + rc))
+    [[ -n $wr ]] && reasons+="$wr "
+    [[ $lr == OOMKilled ]] && OOMP+=("$name")
+  done
+  if [[ $phase != Running && $phase != Succeeded ]] || [[ -n $reasons ]]; then
+    BAD+=("$name [$phase${reasons:+ ${reasons% }}]")
+  fi
+  (( restarts >= RESTART_THRESHOLD )) && RESTARTP+=("$name (restarty: $restarts)")
+done <<<"$pods_raw"
+
+pp=$(pct "$pod_count" "${NA[cap_pods]:-0}")
+line "Liczba podów: $pod_count / ${NA[cap_pods]} (${pp}%)"
+(( pp >= 90 )) && warn "Liczba podów blisko maxPods (${pp}%)"
+if (( ${#BAD[@]} )); then
+  warn "Pody w złym stanie: ${#BAD[@]} (np. ${BAD[0]})"
+  for b in "${BAD[@]}"; do line "   $b"; done
+else ok "Brak podów w stanie błędu"; fi
+if (( ${#OOMP[@]} )); then
+  crit "Pody z ostatnim zakończeniem OOMKilled (limit pamięci kontenera): ${#OOMP[@]} (np. ${OOMP[0]})"
+  for b in "${OOMP[@]}"; do line "   $b"; done
+fi
+if (( ${#RESTARTP[@]} )); then
+  warn "Pody z ≥${RESTART_THRESHOLD} restartami: ${#RESTARTP[@]} (np. ${RESTARTP[0]})"
+  for b in "${RESTARTP[@]}"; do line "   $b"; done
+fi
+
+# ===================================================== 4. REALNE OBCIĄŻENIE
+hdr "4. Realne obciążenie hosta"
+if (( HOST_OK )); then
+  mt=${NH[MemTotal]:-0}; ma=${NH[MemAvailable]:-0}
+  ap=$(pct "$ma" "$mt")
+  line "Pamięć dostępna: $(kb_gib "$ma") z $(kb_gib "$mt") (${ap}%)"
+  if (( ap < 10 )); then crit "MemAvailable < 10% — realny brak pamięci na hoście"
+  elif (( ap < 20 )); then warn "MemAvailable < 20%"
+  else ok "Pamięci na hoście wystarcza"; fi
+
+  line "Load avg: ${NH[loadavg]}  (rdzenie: ${NH[nproc]})   uptime: ${NH[uptime_h]} h"
+  l1=${NH[loadavg]%% *}
+  fgt "$l1" "${NH[nproc]:-1}" && warn "Load avg (1 min) $l1 > liczba rdzeni ${NH[nproc]}"
+
+  line "PSI avg60 — memory some/full: ${NH[psi_memory_some]:-?}/${NH[psi_memory_full]:-?}  cpu some: ${NH[psi_cpu_some]:-?}  io some/full: ${NH[psi_io_some]:-?}/${NH[psi_io_full]:-?}"
+  if fgt "${NH[psi_memory_full]:-0}" 1; then crit "PSI memory full > 1% — procesy stoją, czekając na pamięć"
+  elif fgt "${NH[psi_memory_some]:-0}" 10; then warn "PSI memory some > 10% — presja pamięci (reclaim)"
+  else ok "Brak presji pamięci (PSI)"; fi
+  fgt "${NH[psi_cpu_some]:-0}" 25 && warn "PSI cpu some > 25% — procesy czekają na CPU"
+  fgt "${NH[psi_io_full]:-0}" 10  && warn "PSI io full > 10% — wąskie gardło I/O"
+
+  for m in _var _var_lib_containers; do
+    d=${NH[disk$m]:-}; i=${NH[inode$m]:-}
+    num "$d" || continue
+    line "Dysk ${m//_//}: ${d}% zajęte, inody ${i:-?}%"
+    if (( d >= 95 )); then crit "Dysk ${m//_//} zajęty w ${d}%"
+    elif (( d >= 85 )); then warn "Dysk ${m//_//} zajęty w ${d}% (próg image GC / eviction)"; fi
+    num "$i" && (( i >= 85 )) && warn "Inody na ${m//_//} zajęte w ${i}%"
+  done
+else
+  crit "Nie udało się zebrać danych z hosta (oc debug). Sprawdź uprawnienia lub ustaw DEBUG_IMAGE."
+fi
+
+# ======================================================= 5. LIMITY KERNELA
+hdr "5. Limity kernela (pamięć wirtualna, wątki, PID)"
+if (( HOST_OK )); then
+  om=${NH[vm.overcommit_memory]:-?}
+  cl=${NH[CommitLimit]:-0}; ca=${NH[Committed_AS]:-0}; cp=$(pct "$ca" "$cl")
+  line "vm.overcommit_memory=$om  overcommit_ratio=${NH[vm.overcommit_ratio]}  Committed_AS/CommitLimit=$(kb_gib "$ca")/$(kb_gib "$cl") (${cp}%)"
+  case $om in
+    1) ok "vm.overcommit_memory=1 (domyślne dla OCP)" ;;
+    0) warn "vm.overcommit_memory=0 (heurystyka) — różne od domyślnego OCP (1); duże rezerwacje pamięci wirtualnej mogą być odrzucane" ;;
+    2) crit "vm.overcommit_memory=2 (ścisły commit) — procesy rezerwujące dużo pamięci wirtualnej dostaną ENOMEM"
+       (( cp >= 90 )) && crit "Committed_AS = ${cp}% CommitLimit — nowe alokacje będą odrzucane przez kernel" ;;
+    *) warn "Nie udało się odczytać vm.overcommit_memory" ;;
+  esac
+
+  th=${NH[threads]:-0}; tm=${NH[kernel.threads-max]:-0}; pm=${NH[kernel.pid_max]:-0}
+  tp=$(pct "$th" "$tm"); pp2=$(pct "$th" "$pm")
+  line "Wątki: $th   threads-max: $tm (${tp}%)   pid_max: $pm (${pp2}%)"
+  if (( tp >= 80 || pp2 >= 80 )); then crit "Liczba wątków blisko limitu kernela — nowe wątki/procesy nie powstaną"
+  elif (( tp >= 60 || pp2 >= 60 )); then warn "Liczba wątków powyżej 60% limitu kernela"
+  else ok "Zapas wątków/PID-ów w kernelu"; fi
+
+  kp=${NH[kubepods_pids]:-}; kpm=${NH[kubepods_pids_max]:-}
+  if num "$kp" && num "$kpm"; then
+    kpp=$(pct "$kp" "$kpm")
+    line "PID-y w kubepods.slice: $kp / $kpm (${kpp}%)"
+    (( kpp >= 80 )) && crit "kubepods.slice blisko limitu PID-ów"
+  else
+    line "PID-y w kubepods.slice: ${kp:-?} (limit: ${kpm:-?})"
+  fi
+
+  line "vm.max_map_count=${NH[vm.max_map_count]}  swappiness=${NH[vm.swappiness]}  swap=$(kb_gib "${NH[SwapTotal]:-0}")  THP=${NH[thp]}  hugepages=${NH[HugePages_Total]}  tuned=${NH[tuned]:-?}  cgroup=${NH[cgroup]}"
+  num "${NH[SwapTotal]:-0}" && (( ${NH[SwapTotal]:-0} > 0 )) && info "Na nodzie jest włączony swap"
+  num "${NH[HugePages_Total]:-0}" && (( ${NH[HugePages_Total]:-0} > 0 )) && info "Zarezerwowane hugepages: ${NH[HugePages_Total]} (pomniejszają pamięć dostępną dla zwykłych procesów)"
+fi
+
+# =========================================================== 6. LOGI
+hdr "6. Logi kernela i kubeleta (ostatnie ${LOG_HOURS} h)"
+if (( HOST_OK )); then
+  line "kubelet: ${NH[kubelet_active]}   crio: ${NH[crio_active]}"
+  [[ ${NH[kubelet_active]} != active ]] && crit "kubelet nie jest active"
+  [[ ${NH[crio_active]} != active ]] && crit "crio nie jest active"
+
+  oc_=${NH[oom_count]:-0}
+  if num "$oc_" && (( oc_ > 0 )); then
+    oom_report
+  else ok "Brak zdarzeń OOM-killer w kernelu"; fi
+  num "${NH[segfault_count]:-0}" && (( ${NH[segfault_count]:-0} > 0 )) && warn "Segfaulty w logu kernela: ${NH[segfault_count]}"
+  num "${NH[hung_count]:-0}"     && (( ${NH[hung_count]:-0} > 0 ))     && warn "Zawieszone zadania (hung task): ${NH[hung_count]}"
+  num "${NH[evict_count]:-0}"    && (( ${NH[evict_count]:-0} > 0 ))    && warn "Kubelet eviction manager działał: ${NH[evict_count]} wpisów"
+  num "${NH[pleg_count]:-0}"     && (( ${NH[pleg_count]:-0} > 0 ))     && warn "PLEG is not healthy: ${NH[pleg_count]} wpisów (kubelet/crio nie nadąża)"
+fi
+
+ev=$(oc get events -A --field-selector "involvedObject.kind=Node,involvedObject.name=$NODE,type=Warning" --sort-by=.lastTimestamp --no-headers 2>/dev/null | tail -8)
+if [[ -n $ev ]]; then
+  warn "Eventy Warning dla noda: $(grep -c . <<<"$ev") ostatnich (lista w sekcji 6)"
+  while IFS= read -r l; do line "   ${l:0:160}"; done <<<"$ev"
+else ok "Brak eventów Warning dla noda"; fi
+
+# =========================================================== 7. PDB
+hdr "7. PodDisruptionBudget (wpływ na drain)"
+pdb_raw=$(oc get pdb -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.status.disruptionsAllowed}{"|"}{.status.currentHealthy}{"|"}{.status.desiredHealthy}{"|"}{.status.expectedPods}{"\n"}{end}' 2>/dev/null)
+pdb_zero=0
+while IFS='|' read -r ns nm da chh dh ep; do
+  [[ -z $ns ]] && continue
+  [[ $da == 0 ]] || continue
+  pdb_zero=$((pdb_zero + 1))
+  tag=''; [[ -n ${NODE_NS[$ns]:-} ]] && tag=' ← namespace ma pody na tym nodzie'
+  if (( ${chh:-0} < ${dh:-0} )); then
+    warn "PDB $ns/$nm: healthy ${chh}/${dh} (expected $ep) — aplikacja poniżej minimum$tag"
+  else
+    info "PDB $ns/$nm: disruptionsAllowed=0 (healthy ${chh}/${dh}) — zablokuje drain$tag"
+  fi
+done <<<"$pdb_raw"
+(( pdb_zero == 0 )) && ok "Wszystkie PDB pozwalają na disruption"
+
+# =========================================================== 8. ALERTY
+hdr "8. Aktywne alerty dotyczące noda"
+if [[ $SKIP_ALERTS == 1 ]]; then
+  line "pominięte (SKIP_ALERTS=1)"
+elif (( ! HAVE_JQ )); then
+  line "pominięte (brak jq)"
+else
+  json=$(oc -n openshift-monitoring exec -c prometheus prometheus-k8s-0 -- curl -s http://localhost:9090/api/v1/alerts 2>/dev/null)
+  short=${NODE%%.*}
+  alerts=$(jq -r --arg n "$NODE" --arg s "$short" '
+    .data.alerts[]? | select(.state=="firing")
+    | select(((.labels.node // "") == $n) or ((.labels.instance // "") | startswith($s)))
+    | "\(.labels.severity // "-")|\(.labels.alertname)|\(.labels.namespace // "")"' <<<"$json" 2>/dev/null | sort -u)
+  if [[ -z $json ]]; then
+    line "nie udało się odczytać alertów z Prometheusa"
+  elif [[ -z $alerts ]]; then
+    ok "Brak aktywnych alertów przypiętych do noda"
+  else
+    while IFS='|' read -r sev an ans; do
+      case $sev in
+        critical) crit "Alert $an${ans:+ ($ans)}" ;;
+        warning)  warn "Alert $an${ans:+ ($ans)}" ;;
+        *)        info "Alert $an${ans:+ ($ans)} [$sev]" ;;
+      esac
+    done <<<"$alerts"
+  fi
+fi
+
+# =========================================================== 9. PORÓWNANIE
+if [[ -n $REF ]]; then
+  hdr "9. Porównanie z nodem referencyjnym"
+  printf '  %s%-26s %-34s %-34s%s\n' "$BOLD" "parametr" "${NODE%%.*}" "${REF%%.*}" "$N"
+  declare -a DIFFS=()
+  cmp_row() {
+    local label=$1 a=$2 b=$3 important=${4:-0} mark=' '
+    if [[ "$a" != "$b" ]]; then
+      mark='≠'
+      (( important )) && DIFFS+=("$label: $a vs $b")
+    fi
+    printf '  %-26s %-34s %-34s %s\n' "$label" "${a:0:33}" "${b:0:33}" "$mark"
+  }
+  # wiersze z API
+  rows_api=(
+    "CPU (capacity)|${NA[cap_cpu]}|${RA[cap_cpu]}|1"
+    "RAM (capacity)|$(gib "$(to_mib "${NA[cap_mem]}")")|$(gib "$(to_mib "${RA[cap_mem]}")")|1"
+    "Rezerwacja RAM|$(gib "${NA[res_mem_mib]}")|$(gib "${RA[res_mem_mib]}")|1"
+    "Rezerwacja CPU|${NA[res_cpu_m]}m|${RA[res_cpu_m]}m|1"
+    "Kernel|${NA[kernel]}|${RA[kernel]}|1"
+    "Pula MCP|${NA[pool]}|${RA[pool]}|0"
+    "Rendered config|${NA[mc_cur]}|${RA[mc_cur]}|1"
+    "MCO state|${NA[mc_state]}|${RA[mc_state]}|1"
+  )
+  for r in "${rows_api[@]}"; do IFS='|' read -r a b c d <<<"$r"; cmp_row "$a" "$b" "$c" "$d"; done
+  if (( HOST_OK && REF_HOST_OK )); then
+    rows_host=(
+      "vm.overcommit_memory|${NH[vm.overcommit_memory]}|${RH[vm.overcommit_memory]}|1"
+      "vm.overcommit_ratio|${NH[vm.overcommit_ratio]}|${RH[vm.overcommit_ratio]}|1"
+      "vm.max_map_count|${NH[vm.max_map_count]}|${RH[vm.max_map_count]}|1"
+      "kernel.pid_max|${NH[kernel.pid_max]}|${RH[kernel.pid_max]}|1"
+      "kernel.threads-max|${NH[kernel.threads-max]}|${RH[kernel.threads-max]}|0"
+      "Watki (teraz)|${NH[threads]}|${RH[threads]}|0"
+      "Commit %|$(pct "${NH[Committed_AS]}" "${NH[CommitLimit]}")%|$(pct "${RH[Committed_AS]}" "${RH[CommitLimit]}")%|0"
+      "MemAvailable|$(kb_gib "${NH[MemAvailable]}")|$(kb_gib "${RH[MemAvailable]}")|0"
+      "Swap|$(kb_gib "${NH[SwapTotal]}")|$(kb_gib "${RH[SwapTotal]}")|1"
+      "THP|${NH[thp]}|${RH[thp]}|1"
+      "Hugepages|${NH[HugePages_Total]}|${RH[HugePages_Total]}|1"
+      "Tuned profile|${NH[tuned]}|${RH[tuned]}|1"
+      "cgroup|${NH[cgroup]}|${RH[cgroup]}|1"
+      "kubepods pids.max|${NH[kubepods_pids_max]}|${RH[kubepods_pids_max]}|1"
+      "node-sizing|$(tr '\n' ' ' <<<"${NH[sizing]}")|$(tr '\n' ' ' <<<"${RH[sizing]}")|1"
+      "PSI memory some|${NH[psi_memory_some]}|${RH[psi_memory_some]}|0"
+      "OOM (${LOG_HOURS}h)|${NH[oom_count]}|${RH[oom_count]}|0"
+    )
+    for r in "${rows_host[@]}"; do IFS='|' read -r a b c d <<<"$r"; cmp_row "$a" "$b" "$c" "$d"; done
+  else
+    line "(brak danych hosta dla jednego z nodów — porównanie tylko z API)"
+  fi
+  echo
+  if (( ${#DIFFS[@]} )); then
+    for d in "${DIFFS[@]}"; do warn "Różnica względem ${REF%%.*} — $d"; done
+  else
+    ok "Brak istotnych różnic konfiguracyjnych względem ${REF%%.*}"
+  fi
+fi
+
+# =========================================================== WNIOSKI
+hdr "WNIOSKI"
+if (( ${#F_CRIT[@]} )); then
+  printf '%s%sKRYTYCZNE (%d):%s\n' "$BOLD" "$R" "${#F_CRIT[@]}" "$N"
+  for f in "${F_CRIT[@]}"; do printf '  • %s\n' "$f"; done
+fi
+if (( ${#F_WARN[@]} )); then
+  printf '%s%sOSTRZEŻENIA (%d):%s\n' "$BOLD" "$Y" "${#F_WARN[@]}" "$N"
+  for f in "${F_WARN[@]}"; do printf '  • %s\n' "$f"; done
+fi
+if (( ${#F_INFO[@]} )); then
+  printf '%s%sINFORMACJE (%d):%s\n' "$BOLD" "$C" "${#F_INFO[@]}" "$N"
+  for f in "${F_INFO[@]}"; do printf '  • %s\n' "$f"; done
+fi
+
+printf '\n%sInterpretacja:%s\n' "$BOLD" "$N"
+real_pressure=0
+for f in "${F_CRIT[@]}"; do
+  case $f in *MemAvailable*|*PSI*|*"Globalny OOM"*|*"OOM na poziomie allocatable"*|*"OOM w system.slice"*|*Pressure=True*|*wątków*|*PID*|*overcommit*|*Committed_AS*) real_pressure=1 ;; esac
+done
+if (( real_pressure )); then
+  printf '  Node ma REALNY problem z zasobami na poziomie kernela/hosta — to dobry kandydat na przyczynę awarii\n'
+  printf '  aplikacji startujących tylko na tym nodzie. Zacznij od pozycji KRYTYCZNE powyżej.\n'
+elif (( ${#F_CRIT[@]} )); then
+  printf '  Są problemy KRYTYCZNE niezwiązane bezpośrednio z wyczerpaniem zasobów hosta\n'
+  printf '  (usługi, pody, alerty). Zacznij od nich; potem przejrzyj różnice ≠ w sekcji 9.\n'
+elif (( ${#F_WARN[@]} == 0 )); then
+  printf '  Node wygląda zdrowo. Jeśli aplikacja nie startuje tylko tutaj, szukaj różnic w sekcji porównania\n'
+  printf '  albo przyczyny po stronie samego workloadu (limity kontenera, wersja runtime).\n'
+else
+  printf '  Brak oznak realnego wyczerpania zasobów hosta. Ostrzeżenia dotyczą głównie konfiguracji\n'
+  printf '  (rezerwacje, limity, różnice względem noda referencyjnego) — różnice oznaczone ≠ w sekcji 9\n'
+  printf '  to najlepsze tropy, jeśli problem występuje wyłącznie na tym nodzie.\n'
+fi
+
+(( ${#F_CRIT[@]} )) && exit 2
+(( ${#F_WARN[@]} )) && exit 1
+exit 0
