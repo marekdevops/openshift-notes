@@ -1,5 +1,7 @@
 for n in $(oc get nodes -l node-role.kubernetes.io/master -o name | cut -d/ -f2); do
-  oc adm node-logs $n --path=kube-apiserver/audit.log
+  for f in $(oc adm node-logs $n --path=kube-apiserver/ | grep -E 'audit-2026-10-23T(12-[1-5]|13-0)'); do
+    oc adm node-logs $n --path=kube-apiserver/$f
+  done
 done | sed 's/^[^{]*//' | jq -R -r 'fromjson? |
   select(.requestReceivedTimestamp > "2026-10-23T12:15" and .requestReceivedTimestamp < "2026-10-23T12:35")
   | select(.verb|test("create|update|patch|delete"))
