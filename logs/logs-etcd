@@ -17,3 +17,5 @@ oc adm node-logs <master> --path=kube-apiserver/audit-2026-10-23T12-35-10.928.lo
 
 oc adm node-logs <master> --path=kube-apiserver/audit-2026-10-23T12-35-10.928.log \
   | sed 's/^[^{]*//' | jq -R -r 'fromjson? | .requestReceivedTimestamp' | head -3
+
+bash audit-window.sh 2026-10-23T12:15 2026-10-23T12:35
