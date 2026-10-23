@@ -1,2 +1,7 @@
-oc adm node-logs --role=master --path=kube-apiserver/audit.log | \
-  jq -r 'select(.requestReceivedTimestamp > "2026-10-23T12:20" and .requestReceivedTimestamp < "2026-10-23T12:35" and (.verb|test("create|update|patch|delete"))) | .user.username' | sort | uniq -c | sort -rn | head
+for n in $(oc get nodes -l node-role.kubernetes.io/master -o name | cut -d/ -f2); do
+  oc adm node-logs $n --path=kube-apiserver/audit.log
+done | sed 's/^[^{]*//' | jq -R -r 'fromjson? |
+  select(.requestReceivedTimestamp > "2026-10-23T12:15" and .requestReceivedTimestamp < "2026-10-23T12:35")
+  | select(.verb|test("create|update|patch|delete"))
+  | "\(.user.username) \(.verb) \(.objectRef.resource)"' \
+  | sort | uniq -c | sort -rn | head -20
