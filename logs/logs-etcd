@@ -7,3 +7,13 @@ done | sed 's/^[^{]*//' | jq -R -r 'fromjson? |
   | select(.verb|test("create|update|patch|delete"))
   | "\(.user.username) \(.verb) \(.objectRef.resource)"' \
   | sort | uniq -c | sort -rn | head -20
+
+
+oc get nodes -l node-role.kubernetes.io/master -o name
+
+oc adm node-logs <master> --path=kube-apiserver/ | grep -E 'audit-2026-10-23T(12-[1-5]|13-0)'
+
+oc adm node-logs <master> --path=kube-apiserver/audit-2026-10-23T12-35-10.928.log | head -c 600
+
+oc adm node-logs <master> --path=kube-apiserver/audit-2026-10-23T12-35-10.928.log \
+  | sed 's/^[^{]*//' | jq -R -r 'fromjson? | .requestReceivedTimestamp' | head -3
