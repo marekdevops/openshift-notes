@@ -13,3 +13,22 @@ grep -A5 '^### #[67]' report.md
 
 # 4. Dlaczego POD wraca na ten węzeł (zakładam, że to Deployment)
 oc get deploy $DEPLOY# -n $NS -o jsonpath='{.spec.template.spec.tolerations}{"\n"}{.spec.template.spec.nodeSelector}{"\n"}'
+
+
+##################################################################################################3
+
+# 1. Czy Prometheus jest na emptyDir i jaki ma priorytet
+oc get pod prometheus-k8s-1 -n openshift-monitoring -o json | jq '{node: .spec.nodeName, prio: .spec.priorityClassName,
+  vols: [.spec.volumes[] | select(.emptyDir or .persistentVolumeClaim)]}'
+
+# 2. Czy jest skonfigurowana retencja i wolumen (NotFound = domyślne ustawienia)
+oc get cm cluster-monitoring-config -n openshift-monitoring -o jsonpath='{.data.config\.yaml}'
+
+# 3. Czy kompakcje pokrywają się z godzinami incydentów
+oc logs prometheus-k8s-1 -n openshift-monitoring -c prometheus --since=24h | grep -iE 'compact|write block' | tail -30
+
+# 4. Gdzie jest druga replika (czy inny węzeł ma ten sam problem)
+oc get pods -n openshift-monitoring -o wide | grep prometheus-k8s
+
+# 5. Którego poda kubelet nie mógł usunąć
+grep -h 'critical pod' .txt | tail -5
