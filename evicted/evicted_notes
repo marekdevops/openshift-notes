@@ -1,0 +1,15 @@
+Co dalej
+
+
+# 1. Co zajmuje dysk worker teraz (obrazy i top 10 podów)
+oc get --raw /api/v1/nodes/worker/proxy/stats/summary | jq '{fs: .node.fs, image: .node.runtime.imageFs,
+  top: ([.pods[] | {p: (.podRef.namespace + "/" + .podRef.name), used: .["ephemeral-storage"].usedBytes}] | sort_by(.used // 0) | reverse | .[:10])}'
+
+# 2. Czy pod jest na worker i czy używa emptyDir
+oc get pod $POD -n $NS -o jsonpath='{.spec.nodeName}{"\n"}{.spec.volumes}{"\n"}'
+
+# 3. Ukryte incydenty z poprzedniego raportu
+grep -A5 '^### #[67]' report.md
+
+# 4. Dlaczego POD wraca na ten węzeł (zakładam, że to Deployment)
+oc get deploy $DEPLOY# -n $NS -o jsonpath='{.spec.template.spec.tolerations}{"\n"}{.spec.template.spec.nodeSelector}{"\n"}'
