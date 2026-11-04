@@ -1,0 +1,11 @@
+oc get events -n openshift-kube-apiserver-operator --sort-by=.lastTimestamp | egrep -i 'rotat|revision|cert' | tail -20
+
+oc get kubeapiserver cluster -o json | jq '.status.latestAvailableRevision, .status.nodeStatuses'
+
+
+oc get pods -n openshift-kube-apiserver -o wide | egrep 'installer|kube-apiserver-<node>'
+oc logs -n openshift-kube-apiserver installer-<rev>-<node>
+oc logs -n openshift-kube-apiserver kube-apiserver-<node> -c kube-apiserver --tail=50
+
+
+oc logs -n openshift-authentication -l app=oauth-openshift --tail=100 --prefix | egrep -i 'x509|ldap|error'
