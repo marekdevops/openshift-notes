@@ -374,10 +374,10 @@ echo "--- 📊 Podsumowanie symulacji ---"
 J '
   $evals[0] as $E
   | "Nodów łącznie: \($E | length)   Pasujących (symulacja): \([$E[] | select(.reasons | length == 0)] | length)",
-    ( ["SCHED:cordon/NotReady","AFFIN:selector/affinity","TAINT:taint","RES:zasoby cpu/mem/eph/pods","STOR:storage"][]
-      | split(":") as [$c, $label]
+    ( [{k:"SCHED",d:"cordon/NotReady"},{k:"AFFIN",d:"selector/affinity"},{k:"TAINT",d:"taint"},{k:"RES",d:"zasoby cpu/mem/eph/pods"},{k:"STOR",d:"storage"}][]
+      | .k as $c | .d as $desc
       | ([$E[] | select(any(.reasons[]; .c == $c))] | length) as $cnt
-      | select($cnt > 0) | "  \($cnt) node(s) odrzucone przez: \($label)" )'
+      | select($cnt > 0) | "  \($cnt) node(s) odrzucone przez: \($desc)" )'
 
 MATCHING=$(jq '[.[] | select(.reasons | length == 0)] | length' "$TMP/evals.json")
 STOR_FAIL=$(jq '[.[] | select(any(.reasons[]; .c == "STOR"))] | length' "$TMP/evals.json")
