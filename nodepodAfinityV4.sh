@@ -1,12 +1,25 @@
 #!/bin/bash
 # nodepodAfinityV4.sh - symulacja planowania poda na wezly (v4)
 #
-# Uzycie: nodepodAfinityV4.sh -pod <NAZWA_PODA> -n <NAMESPACE> [--top N] [--all-nodes] [--no-debug] [--debug-image IMG]
+# Uzycie: nodepodAfinityV4.sh -pod <NAZWA_PODA> -n <NAMESPACE> [--top N] [--all-nodes] [--no-debug]
+#                              [--debug-image IMG] [--device-class NAZWA]
 #
 #   --top N          ile nodow analizowac pod katem powiekszenia (domyslnie 3, najmniejszy deficyt)
 #   --all-nodes      analizuj takze nody, ktore odpadaja na innych filtrach (taint/zasoby/affinity)
 #   --no-debug       nie uruchamiaj 'oc debug node' - rekomendacja tylko z CR LVMS i CSIStorageCapacity
 #   --debug-image    obraz dla 'oc debug node' (np. registry.redhat.io/rhel9/support-tools)
+#   --device-class N policz powiekszenie dla wskazanego deviceClass/VG (gdy StorageClass nie wskazuje
+#                    istniejacego deviceClass albo chcesz sprawdzic inny)
+#
+# Nowosci w v4.1 (rekomendacja wprost z konfiguracji klastra, nadal TYLKO ODCZYT):
+#  - StorageClass -> deviceClass ustalane jak w driverze (parametr SC, inaczej default: true w LVMCluster);
+#    gdy SC nie wskazuje istniejacego deviceClass, skrypt mowi to wprost (blad konfiguracji, nie brak
+#    miejsca) i pokazuje, ktory deviceClass / StorageClass pomiesci PVC juz teraz
+#  - nody do analizy: najpierw te z istniejacym VG i objete nodeSelector deviceClass; nod spoza
+#    nodeSelector jest od razu oznaczany jako bezcelowy do powiekszania
+#  - wskazuje konkretny dysk (stabilna sciezka /dev/disk/by-id, serial), VG do ktorego go dodac,
+#    pole LVMCluster (paths / optionalPaths) i gotowa komende oc patch (tylko sugestia)
+#  - nieuzyte dyski: czy sa wystarczajace, zarezerwowane przez inny deviceClass, wykluczone przez LVMS
 #
 # Nowosci w v4 (TYLKO ODCZYT - skrypt niczego nie zmienia):
 #  - dla PVC, ktore nie mieszcza sie na nodach, liczy deficyt per node/StorageClass
@@ -38,6 +51,7 @@ TOP_N=3
 ALL_NODES=0
 USE_DEBUG=1
 DEBUG_IMAGE=""
+FORCE_DC=""
 
 while (( "$#" )); do
   case "$1" in
@@ -55,8 +69,10 @@ while (( "$#" )); do
       USE_DEBUG=0; shift ;;
     --debug-image)
       DEBUG_IMAGE="$2"; shift 2 ;;
+    --device-class)
+      FORCE_DC="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,25p' "$0"; exit 0 ;;
+      sed -n '2,/^$/p' "$0"; exit 0 ;;
     *)
       echo "🚨 Nieznany argument: $1" >&2; exit 1 ;;
   esac
@@ -420,7 +436,8 @@ fi
 read -r -d '' NODE_SCRIPT <<'EOF'
 lv() { c=$1; shift; "$c" --devicesfile "" "$@" 2>/dev/null || "$c" "$@" 2>/dev/null; }
 echo ===LSBLK
-lsblk -J -b -o NAME,KNAME,PKNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,RO 2>/dev/null || echo '{"blockdevices":[]}'
+lsblk -J -b -o NAME,KNAME,PKNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,RO,SERIAL,WWN,MODEL 2>/dev/null \
+  || lsblk -J -b -o NAME,KNAME,PKNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,RO 2>/dev/null || echo '{"blockdevices":[]}'
 echo ===VGS
 lv vgs --reportformat json --units b --nosuffix -o vg_name,vg_size,vg_free,pv_count,lv_count || echo '{"report":[{"vg":[]}]}'
 echo ===PVS
@@ -436,6 +453,10 @@ for b in /sys/class/block/*; do
   elif [ -e "$b/device" ]; then
     echo "DISK $n $(cat "$b/size")"
   fi
+done
+echo ===BYID
+for l in /dev/disk/by-id/*; do
+  [ -e "$l" ] && echo "$(basename "$(readlink -f "$l")") $l"
 done
 echo ===END
 EOF
@@ -454,6 +475,8 @@ collect_node() { # collect_node <node>  -> $TMP/node-<node>/*.json ; rc!=0 przy 
   awk '$1=="DISK"{printf "{\"t\":\"disk\",\"name\":\"%s\",\"sec\":%s}\n",$2,$3}
        $1=="PART"{printf "{\"t\":\"part\",\"name\":\"%s\",\"disk\":\"%s\",\"start\":%s,\"sec\":%s}\n",$2,$3,$4,$5}' \
       "$d/SYS.out" 2>/dev/null | jq -s . > "$d/sys.json"
+  # mapa: nazwa jadra -> stabilna sciezka /dev/disk/by-id
+  { [ -s "$d/BYID.out" ] && jq -R 'split(" ") | {k: .[0], p: .[1]}' "$d/BYID.out"; } 2>/dev/null | jq -s . > "$d/byid.json"
   return 0
 }
 
@@ -465,6 +488,49 @@ def thinparams: { thin: ($dccfg.thinPoolConfig != null),
                   R:  ($dccfg.thinPoolConfig.overprovisionRatio // 10),
                   SP: ($dccfg.thinPoolConfig.sizePercent // 90),
                   pool: ($dccfg.thinPoolConfig.name // "thin-pool-1") };
+def selpaths: (($dccfg.deviceSelector.paths // []) + ($dccfg.deviceSelector.optionalPaths // []));
+def nstext:
+  if ($dccfg.nodeSelector // null) == null then "brak (wszystkie nody z vg-manager)"
+  else ($dccfg.nodeSelector.nodeSelectorTerms // []
+        | map((.matchExpressions // []) + (.matchFields // []) | map("\(.key) \(.operator) \(.values // [] | join(","))") | join(" AND "))
+        | join("  OR  "))
+  end;
+EOF
+
+# Funkcje wymagajace danych z noda ($byid, $lsblk) i zasiegu deviceClass ($cover)
+read -r -d '' NODELIB <<'EOF'
+# sciezka z deviceSelector -> nazwa jadra dysku na tym nodzie
+def pathk($p): ([ $byid[0][]? | select(.p == $p) | .k ] | first)
+               // (if ($p | test("^/dev/[^/]+$")) then ($p | split("/") | last) else null end);
+# stabilna sciezka by-id dysku; preferuj typ identyfikatora juz uzywany w deviceSelector
+def stablepath($k):
+  [ $byid[0][]? | select(.k == $k) | .p ] as $c
+  | ([ selpaths[] | capture("^/dev/disk/by-id/(?<p>[A-Za-z0-9]+)-").p ] | unique) as $pref
+  | ( [ $c[] | select((split("/") | last) as $b | any($pref[]; . as $p | $b | startswith($p + "-"))) ] | sort | first )
+    // ( [ ("wwn-", "nvme-eui.", "scsi-3", "virtio-", "scsi-", "nvme-", "ata-") as $o
+           | $c[] | select((split("/") | last) | startswith($o)) ] | first )
+    // ($c | sort | first);
+def devref($k): stablepath($k) // "/dev/\($k)";
+def serial($k): [ $lsblk[0].blockdevices[]? | select(.name == $k) | .serial // empty | select(. != "") ] | first;
+def ident($k):
+  ([ (stablepath($k) // empty), (serial($k) // empty | "serial=\(.)") ] | join(", ")) as $x
+  | if $x == "" then "" else " [\($x)]" end;
+# inny deviceClass, ktory ma ten dysk w swoim deviceSelector
+def reservedby($k):
+  [ $lvmc[0].items[]?.spec.storage.deviceClasses[]? | select(.name != $dcname) | .name as $o
+    | ((.deviceSelector.paths // []) + (.deviceSelector.optionalPaths // []))[] | select(pathk(.) == $k) | $o ] | first;
+# sciezka by-id istnieje tylko na jednym nodzie: przy deviceClass na wielu nodach musi trafic do optionalPaths
+def selfield:
+  ($dccfg.deviceSelector // {}) as $ds
+  | if $cover > 1 or ($ds.optionalPaths != null and $ds.paths == null) then "optionalPaths" else "paths" end;
+def statuscmd:
+  "oc get lvmvolumegroupnodestatus" + (if $dccfg._ns != null then " -n \($dccfg._ns) \($node)" else " -A" end) + " -o yaml";
+def patchcmd($path):
+  ($dccfg.deviceSelector // null) as $ds | selfield as $f
+  | if $ds == null then null
+    elif $dccfg._cr == null then "oc edit lvmcluster  # deviceClass \($dcname): deviceSelector.\($f) += \($path)"
+    else "oc -n \($dccfg._ns) patch lvmcluster \($dccfg._cr) --type=json -p '[{\"op\":\"add\",\"path\":\"/spec/storage/deviceClasses/\($dccfg._idx)/deviceSelector/\($f)\(if $ds[$f] != null then "/-" else "" end)\",\"value\":\(if $ds[$f] != null then ($path | tojson) else ([$path] | tojson) end)}]'"
+    end;
 EOF
 
 # Wariant bez dostepu do noda: tylko wzor + CR LVMS
@@ -481,15 +547,15 @@ recommend_formula() { # <node> <deficitBytes> <dccfgJSON> <dcname>
           else "     Urządzenia VG \($dcname) (LVMS): \(.devices // [] | join(", "))",
                ( .excluded[]? | "     Wykluczone przez LVMS: \(.name) → \(.reasons // [] | join("; "))" )
           end ),
-      "     👉 Powiększ dysk(i) z listy urządzeń VG o ~\(($vgGrow | gup) + 1)Gi (lub dodaj nowy dysk tej wielkości), potem pvresize.",
+      "     👉 Powiększ dysk(i) z listy urządzeń VG \($dcname) o ~\(($vgGrow | gup) + 1)Gi (lub dodaj nowy dysk tej wielkości do deviceSelector), potem pvresize.",
       "        Z działającym oc debug (bez --no-debug, uprawnienia cluster-admin) skrypt wskaże konkretny dysk/partycję."' \
     --arg node "$1" --argjson deficit "$2" --argjson dccfg "$3" --arg dcname "$4"
 }
 
 # Wariant pelny: dane LVM z noda
-recommend_node() { # <node> <deficitBytes> <dccfgJSON> <dcname>
+recommend_node() { # <node> <deficitBytes> <dccfgJSON> <dcname> <coverCount> <inSel true|false>
   local d="$TMP/node-$1"
-  J "$RECLIB"'
+  J "$RECLIB $NODELIB"'
     ($lsblk[0].blockdevices // []) as $BD
     | ($vgs[0].report[0].vg // []) as $VGS
     | ($pvsn[0].report[0].pv // []) as $PVS
@@ -515,13 +581,14 @@ recommend_node() { # <node> <deficitBytes> <dccfgJSON> <dcname>
     | [ $PVS[] | select(.vg_name == $dcname)
         | (.pv_name | split("/") | last) as $bn
         | ($SYS | map(select(.name == $bn)) | first) as $s
+        | (if $s.t == "part" then $s.disk else $bn end) as $dk
         | (.pv_size | num) as $ps | (.dev_size | num) as $ds
         | { dev: .pv_name, bn: $bn, pvSize: $ps, devSize: $ds,
             pending: ([$ds - $ps, 0] | max | if . < 1073741824 then 0 else . end),
             kind: (if $s == null then "inne" elif $s.t == "part" then "partycja" else "dysk" end),
-            disk: (if $s.t == "part" then $s.disk else $bn end),
+            disk: $dk, id: ident($dk),
             partnum: (if $s.t == "part" then ($bn | capture("(?<n>[0-9]+)$").n // "?") else null end),
-            diskSize: (($SYS | map(select(.t == "disk" and .name == (if $s.t == "part" then $s.disk else $bn end))) | first | .sec // 0) * 512),
+            diskSize: (($SYS | map(select(.t == "disk" and .name == $dk)) | first | .sec // 0) * 512),
             last: (if $s.t == "part" then ([ $SYS[] | select(.t == "part" and .disk == $s.disk and .start > $s.start) ] | length == 0) else true end),
             tail: (if $s.t == "part" then
                      (($SYS | map(select(.t == "disk" and .name == $s.disk)) | first | .sec // 0) * 512) as $dsz
@@ -529,72 +596,128 @@ recommend_node() { # <node> <deficitBytes> <dccfgJSON> <dcname>
                      | ((($next // ($dsz - 34 * 512)) - ($s.start + $s.sec) * 512) | if . < 1073741824 then 0 else . end)
                    else 0 end) } ] as $P
 
-    # --- nieuzyte dyski ---
+    # --- nieuzyte dyski (z identyfikatorem by-id i informacja, czy cos je blokuje) ---
     | [ $BD[] | select(.type == "disk" and ((.children // []) | length) == 0 and .fstype == null and .mountpoint == null
                        and ((.ro | tostring) as $r | $r != "true" and $r != "1"))
         | select(.name as $nm | ($PVS | any(.[]; .pv_name | endswith("/" + $nm))) | not)
-        | { dev: "/dev/\(.name)", size: (.size | num),
-            excl: (.name as $nm | [ $ns.excluded[]? | select(.name | endswith("/" + $nm)) | .reasons[]? ] | join("; ")) } ] as $FREE
+        | .name as $nm
+        | { dev: "/dev/\($nm)", size: (.size | num), ref: devref($nm), stable: (stablepath($nm) != null), id: ident($nm),
+            resv: reservedby($nm), inThis: any(selpaths[]; pathk(.) == $nm),
+            excl: ([ $ns.excluded[]? | select(.name | endswith("/" + $nm)) | .reasons[]? ] | join("; ")) } ] as $FREE
+    | ([ $FREE[] | select(.resv == null and .size >= $vgGrow) ] | sort_by(.size)) as $USE
 
     # --- opcje (od najtanszej) ---
     | ($P | map(.pending) | add // 0) as $pendSum
+    | (" (\(selfield)" + (if selfield == "optionalPaths" and $cover > 1 then " - deviceClass obejmuje \($cover) nody, a ta ścieżka istnieje tylko na tym" else "" end) + ")") as $fnote
     | [
         ( if $t.thin and $pool != null and $poolSlack >= $poolGrow then
             { k: "lvextend", t: "Thin pool \($dcname)/\($pool.lv_name) ma zapas w VG (\($poolSlack | gi)) - wystarczy rozszerzyć pool o +\(($poolGrow | gup) + 1)Gi (LVMS/vgmanager zwykle robi to sam - sprawdź logi vgmanager)",
               cmd: "lvextend -L +\(($poolGrow | gup) + 1)G \($dcname)/\($pool.lv_name)" } else empty end ),
         ( if $pendSum >= $vgGrow then
-            { k: "pvresize", t: "Dysk już jest większy niż PV (\($P | map(select(.pending > 0) | "\(.dev) +\(.pending | gi)") | join(", "))) - wystarczy pvresize, bez zmian w infrastrukturze",
+            { k: "pvresize", t: "Dysk już jest większy niż PV w VG \($dcname) (\($P | map(select(.pending > 0) | "\(.dev) +\(.pending | gi)") | join(", "))) - wystarczy pvresize, bez zmian w infrastrukturze",
               cmd: ($P | map(select(.pending > 0) | "pvresize \(.dev)") | join(" && ")) } else empty end ),
         ( $P[] | select(.kind == "partycja" and (.tail + .pending) >= $vgGrow)
-          | { k: "growpart", t: "Za partycją \(.dev) na /dev/\(.disk) jest \(.tail | gi) wolnego (niepartycjonowanego) miejsca - rozciągnij partycję i PV",
+          | { k: "growpart", t: "Za partycją \(.dev) na /dev/\(.disk)\(.id) jest \(.tail | gi) wolnego (niepartycjonowanego) miejsca - rozciągnij partycję i PV w VG \($dcname)",
               cmd: "growpart /dev/\(.disk) \(.partnum) && pvresize \(.dev)" } ),
-        ( $FREE[] | select(.size >= $vgGrow)
-          | { k: "newdisk", t: "Nieużyty dysk \(.dev) (\(.size | gi)) - dodaj do deviceClass \($dcname) (spec.storage.deviceClasses[].deviceSelector.paths w LVMCluster)\(if .excl != "" then "; LVMS go wyklucza: " + .excl else "" end)",
-              cmd: "oc edit lvmcluster  # deviceSelector.paths += \(.dev)" } ),
+        ( $USE[]
+          | { k: "newdisk",
+              t: ( "Użyj nieużytego dysku \(.dev) (\(.size | gi))\(.id) → dodaj do VG \($dcname)"
+                   + (if .inThis then ": ścieżka już jest w deviceSelector, ale dysk nie trafił do VG - sprawdź status LVMS"
+                      elif ($dccfg.deviceSelector // null) == null then ": deviceClass bez deviceSelector powinien dobrać go sam - sprawdź status LVMS"
+                      else ": dopisz \(.ref) do LVMCluster deviceClass \($dcname) deviceSelector" + $fnote end)
+                   + (if .excl != "" then "; LVMS go wyklucza: " + .excl else "" end)
+                   + (if .stable then "" else "  ⚠️ brak linku by-id - nazwa /dev może się zmienić po restarcie" end) ),
+              cmd: (if .inThis then statuscmd else (patchcmd(.ref) // statuscmd) end) } ),
         ( ($P | map(select(.kind == "dysk")) | sort_by(-.pvSize) | first) as $wd
           | if $wd != null then
               ([$vgGrow - $wd.pending, 0] | max) as $g
-              | { k: "grow-disk", t: "Powiększ dysk \($wd.dev) (PV całego dysku, teraz \($wd.diskSize | gi)) o +\($g | gup)Gi → \((($wd.diskSize + $g) | gup))Gi w hypervisorze/SAN, potem pvresize",
+              | { k: "grow-disk", t: "Powiększ dysk \($wd.dev)\($wd.id) (PV całego dysku w VG \($dcname), teraz \($wd.diskSize | gi)) o +\($g | gup)Gi → \((($wd.diskSize + $g) | gup))Gi w hypervisorze/SAN, potem pvresize",
                 cmd: "pvresize \($wd.dev)" }
             else empty end ),
         ( ($P | map(select(.kind == "partycja" and .last)) | sort_by(-.pvSize) | first) as $lp
           | if $lp != null then
               ([$vgGrow - $lp.tail - $lp.pending, 0] | max) as $g
               | select($g > 0)
-              | { k: "grow-disk-part", t: "Powiększ dysk /dev/\($lp.disk) (teraz \($lp.diskSize | gi)) o +\($g | gup)Gi → \((($lp.diskSize + $g) | gup))Gi; PV jest na ostatniej partycji \($lp.dev), więc potem growpart + pvresize",
+              | { k: "grow-disk-part", t: "Powiększ dysk /dev/\($lp.disk)\($lp.id) (teraz \($lp.diskSize | gi)) o +\($g | gup)Gi → \((($lp.diskSize + $g) | gup))Gi; PV VG \($dcname) jest na ostatniej partycji \($lp.dev), więc potem growpart + pvresize",
                   cmd: "growpart /dev/\($lp.disk) \($lp.partnum) && pvresize \($lp.dev)" }
             else empty end ),
-        { k: "add-disk", t: "Dołóż nowy dysk ≥ \($vgGrow | gup)Gi do noda i dodaj go do deviceClass \($dcname) (deviceSelector.paths)",
-          cmd: "oc edit lvmcluster  # deviceSelector.paths += /dev/<nowy-dysk>" }
+        { k: "add-disk",
+          t: ( "Dołóż do noda nowy dysk ≥ \($vgGrow | gup)Gi i dodaj go do VG \($dcname)"
+               + (if ($dccfg.deviceSelector // null) == null then " (deviceClass bez deviceSelector - LVMS dobierze wolny dysk sam)"
+                  else ": dopisz jego ścieżkę /dev/disk/by-id do LVMCluster deviceClass \($dcname) deviceSelector" + $fnote end) ),
+          cmd: (patchcmd("/dev/disk/by-id/<NOWY-DYSK>") // statuscmd) }
       ] as $OPTS
 
     # --- wydruk ---
-    | if $vg == null then
-        "     ❌ VG \($dcname) nie istnieje na nodzie \($node).",
-        ( if $ns != null then "     LVMS nodeStatus: status=\($ns.status // "?") \($ns.reason // "")",
-              ( $ns.excluded[]? | "     Wykluczone: \(.name) → \(.reasons // [] | join("; "))" ) else empty end ),
-        ( if ($FREE | length) > 0 then "     Nieużyte dyski na nodzie: \($FREE | map("\(.dev)(\(.size | gi))") | join(", "))" else "     Brak nieużytych dysków na nodzie." end ),
-        "     👉 Sprawdź nodeSelector/deviceSelector deviceClass \($dcname) w LVMCluster albo dołóż dysk ≥ \($vgGrow | gup)Gi."
-      else
-        "     VG \($dcname): rozmiar \($vgSize | gi), wolne \($vgFree | gi), PV: \($vg.pv_count), LV: \($vg.lv_count)",
-        ( if $pool != null then "     Thin pool \($pool.lv_name): \($poolSize | gi), data \($pool.data_percent // "?")%, metadata \($pool.metadata_percent // "?")%"
-              + (if ($pool.data_percent | num) >= 80 then "  ⚠️ pool fizycznie zapełniony ≥80%!" else "" end)
-              + (if ($pool.metadata_percent | num) >= 80 then "  ⚠️ metadata ≥80%!" else "" end)
-          else empty end ),
-        ( $P[] | "       PV \(.dev | pad(18)) \(.kind | pad(9)) dysk=/dev/\(.disk) (\(.diskSize | gi))  PV=\(.pvSize | gi)"
-                 + (if .pending > 0 then "  ⚡ dysk większy o \(.pending | gi) (brak pvresize)" else "" end)
-                 + (if .kind == "partycja" then "  za partycją wolne: \(.tail | gi)\(if .last then "" else " (nie ostatnia partycja)" end)" else "" end) ),
-        ( if ($FREE | length) > 0 then "       Nieużyte dyski: \($FREE | map("\(.dev)(\(.size | gi))") | join(", "))" else empty end ),
-        "     Obliczenie: deficyt \($deficit | gi)"
-          + (if $t.thin then " ÷ overprovisionRatio \($t.R) = pool +\($poolGrow | gi); pool może zająć \($t.SP)% VG → VG +\($vgGrowRaw | gi)" else " (thick) → VG +\($vgGrowRaw | gi)" end)
-          + " → zaokrąglone z zapasem: +\($vgGrow | gup)Gi",
-        "     ✅ REKOMENDACJA: \($OPTS[0].t)",
-        "        sugestia (NIE wykonano): \($OPTS[0].cmd)",
-        ( $OPTS[1:][] | "     ➖ alternatywa: \(.t)" )
-      end' \
-    --arg node "$1" --argjson deficit "$2" --argjson dccfg "$3" --arg dcname "$4" \
+    | ( if $vg == null then
+          "     ❌ VG \($dcname) nie istnieje na nodzie \($node)" + (if $insel then " (nodeSelector deviceClass obejmuje ten nod - LVMS powinien go tu utworzyć)." else "." end),
+          ( if $ns != null then "     LVMS nodeStatus: status=\($ns.status // "?") \($ns.reason // "")"
+            else "     LVMVolumeGroupNodeStatus: brak wpisu \($dcname) dla tego noda." end )
+        else
+          "     VG \($dcname): rozmiar \($vgSize | gi), wolne \($vgFree | gi), PV: \($vg.pv_count), LV: \($vg.lv_count)",
+          ( if $pool != null then "     Thin pool \($pool.lv_name): \($poolSize | gi), data \($pool.data_percent // "?")%, metadata \($pool.metadata_percent // "?")%"
+                + (if ($pool.data_percent | num) >= 80 then "  ⚠️ pool fizycznie zapełniony ≥80%!" else "" end)
+                + (if ($pool.metadata_percent | num) >= 80 then "  ⚠️ metadata ≥80%!" else "" end)
+            else empty end ),
+          ( $P[] | "       PV \(.dev | pad(18)) \(.kind | pad(9)) dysk=/dev/\(.disk) (\(.diskSize | gi))  PV=\(.pvSize | gi)\(.id)"
+                   + (if .pending > 0 then "  ⚡ dysk większy o \(.pending | gi) (brak pvresize)" else "" end)
+                   + (if .kind == "partycja" then "  za partycją wolne: \(.tail | gi)\(if .last then "" else " (nie ostatnia partycja)" end)" else "" end) )
+        end ),
+      ( $FREE[] | "       nieużyty dysk \(.dev) (\(.size | gi))\(.id)  "
+                  + (if .resv != null then "⛔ zarezerwowany w deviceSelector deviceClass \(.resv)"
+                     elif .size < $vgGrow then "⛔ za mały (potrzeba ≥ \($vgGrow | gup)Gi)"
+                     else "✅ nadaje się" end)
+                  + (if .excl != "" then "  (LVMS wyklucza: \(.excl))" else "" end) ),
+      ( if ($FREE | length) == 0 then "       Brak nieużytych dysków na nodzie." else empty end ),
+      "     Obliczenie: deficyt \($deficit | gi)"
+        + (if $t.thin then " ÷ overprovisionRatio \($t.R) = pool +\($poolGrow | gi); pool może zająć \($t.SP)% VG → VG +\($vgGrowRaw | gi)" else " (thick) → VG +\($vgGrowRaw | gi)" end)
+        + " → zaokrąglone z zapasem: +\($vgGrow | gup)Gi",
+      "     ✅ REKOMENDACJA: \($OPTS[0].t)",
+      "        sugestia (NIE wykonano): \($OPTS[0].cmd)",
+      ( $OPTS[1:][] | "     ➖ alternatywa: \(.t)" )' \
+    --arg node "$1" --argjson deficit "$2" --argjson dccfg "$3" --arg dcname "$4" --argjson cover "$5" --argjson insel "$6" \
     --slurpfile lsblk "$d/LSBLK.out" --slurpfile vgs "$d/VGS.out" --slurpfile pvsn "$d/PVS.out" \
-    --slurpfile lvs "$d/LVS.out" --slurpfile sys "$d/sys.json"
+    --slurpfile lvs "$d/LVS.out" --slurpfile sys "$d/sys.json" --slurpfile byid "$d/byid.json"
+}
+
+# StorageClass nie wskazuje istniejacego deviceClass: blad konfiguracji, nie brak miejsca.
+# Pokaz, ktory deviceClass / StorageClass pomiesci PVC juz teraz (wg adnotacji pojemnosci na nodach).
+dc_alternatives() { # <groupJSON> <infoJSON>
+  J '
+    $g.need as $need
+    | [ $g.rows[] | select($alln == 1 or .cand) | .node ] as $cn
+    | [ $lvmc[0].items[]?.spec.storage.deviceClasses[]? as $d
+        | [ $scs[0].items[] | select(.provisioner == $g.provisioner
+              and ((.parameters // {}) | (.["topolvm.io/device-class"] // .["topolvm.cybozu.com/device-class"] // "")) == $d.name) | .metadata.name ] as $dsc
+        | [ $nodes[0].items[] | . as $n | select(any($cn[]; . == $n.metadata.name))
+            | (($n.metadata.annotations // {})["capacity.topolvm.io/" + $d.name]) as $a
+            | select($a != null) | {node: $n.metadata.name, free: ($a | qty)} ] as $caps
+        | { name: $d.name, thin: ($d.thinPoolConfig != null), scs: $dsc, caps: $caps,
+            fit: ($caps | map(select(.free >= $need)) | sort_by(-.free)) } ] as $D
+    | ( if $info.how == "force" then "   ❌ --device-class \($info.want): takiego deviceClass nie ma w LVMCluster."
+        elif $info.how == "param" then "   ❌ StorageClass \($g.sc) wskazuje deviceClass \($info.want), którego nie ma w LVMCluster."
+        else "   ❌ StorageClass \($g.sc) nie ma parametru device-class, a żaden deviceClass w LVMCluster nie ma default: true." end ),
+      "      Driver raportuje wtedy 0 lub brak pojemności na każdym nodzie - to błąd konfiguracji, powiększanie dysków NIE pomoże.",
+      "      deviceClass dostępne w LVMCluster (wolne miejsce wg adnotacji capacity na nodach-kandydatach):",
+      ( $D[]
+        | "        • \(.name) [\(if .thin then "thin" else "thick" end)]  StorageClass: \(if (.scs | length) == 0 then "brak" else (.scs | join(", ")) end)",
+          "            " + ( if (.fit | length) > 0 then
+                               "✅ zmieści \($need | gi) na \(.fit | length) nodach: \(.fit[0:3] | map("\(.node) (wolne \(.free | gi))") | join(", "))\(if (.fit | length) > 3 then ", ..." else "" end)"
+                             elif (.caps | length) > 0 then "❌ za mało miejsca (max \(.caps | map(.free) | max | gi) na \(.caps | sort_by(-.free) | .[0].node))"
+                             else "❌ tego VG nie ma na żadnym nodzie-kandydacie" end ) ),
+      ( ($D | map(select(.fit | length > 0)) | sort_by((if (.scs | length) > 0 then 0 else 1 end), -(.fit | length)) | first) as $b
+        | if $b != null then
+            ( if ($b.scs | length) > 0
+              then "   ✅ REKOMENDACJA: użyj StorageClass \($b.scs[0]) (deviceClass \($b.name)) - PVC zmieści się od razu, bez powiększania dysków."
+              else "   ✅ REKOMENDACJA: utwórz StorageClass z parametrem topolvm.io/device-class=\($b.name) i użyj jej - PVC zmieści się od razu, bez powiększania dysków." end ),
+            "      storageClassName w PVC jest niezmienne: usuń PVC i utwórz ponownie z nową SC (StatefulSet: zmiana volumeClaimTemplates = odtworzenie StatefulSet).",
+            ( if $info.how == "none" then "   ➖ alternatywa: oznacz docelowy deviceClass jako default: true w LVMCluster (o ile wersja LVMS pozwala to zmienić) - SC bez parametru zacznie go używać." else empty end ),
+            "   ➖ inny deviceClass: uruchom ponownie z --device-class <nazwa> - skrypt wskaże dysk do dodania/powiększenia i VG."
+          else
+            "   ⚠️  Żaden deviceClass nie pomieści teraz \($need | gi) na nodach-kandydatach.",
+            "   👉 Wybierz docelowy deviceClass i uruchom ponownie z --device-class <nazwa> - skrypt wskaże dysk do dodania/powiększenia i VG."
+          end )' \
+    --argjson g "$1" --argjson info "$2" --argjson alln "$ALL_NODES"
 }
 
 # Grupy: StorageClass -> suma niezbindowanych PVC vs pojemnosc per node
@@ -604,7 +727,7 @@ J 'pvcinfo as $PI
       | $grp[0] as $v0
       | ($grp | map(.size) | add) as $need
       | { sc: $v0.scName, provisioner: $v0.provisioner, need: $need,
-          dc: ($v0.sc.parameters["topolvm.io/device-class"] // ""),
+          dc: ($v0.sc.parameters["topolvm.io/device-class"] // $v0.sc.parameters["topolvm.cybozu.com/device-class"] // ""),
           claims: ($grp | map("\(.claim)(\(.size | gi))")),
           rows: [ $nodes[0].items[] as $n
                   | ([ $evals[0][] | select(.name == $n.metadata.name) | .reasons[] | select(.c != "STOR") ] | length == 0) as $cand
@@ -628,42 +751,97 @@ if [ "$(jq length "$TMP/grow.json")" -gt 0 ]; then
       continue
     fi
 
-    # Nody do analizy: najpierw selected-node, potem najmniejszy deficyt
-    if [ "$ALL_NODES" -eq 1 ]; then SEL='.rows'; else SEL='[.rows[] | select(.cand)]'; fi
-    TARGETS=$(jq -r "$SEL | sort_by((if .sel then 0 else 1 end), .deficit) | .[0:$TOP_N][] | [.node, (.deficit|tostring), (.have|tostring), (.cand|tostring), (.sel|tostring)] | @tsv" <<<"$G")
-    if [ -z "$TARGETS" ]; then
+    if [ "$ALL_NODES" -ne 1 ] && [ "$(jq '[.rows[] | select(.cand)] | length' <<<"$G")" -eq 0 ]; then
       echo "   ⚠️  Żaden node nie przechodzi pozostałych filtrów (taint/zasoby/affinity/cordon) - samo powiększenie dysku nie pomoże."
       echo "      Użyj --all-nodes, aby mimo to policzyć powiększenie dla nodów."
       continue
     fi
 
-    # Konfiguracja deviceClass z LVMCluster
-    DCCFG=$(J '([ $lvmc[0].items[]?.spec.storage.deviceClasses[]? ]) as $all
-               | (if $dc != "" then ($all | map(select(.name == $dc)) | first) else null end)
-                 // ($all | map(select(.default == true)) | first) // $all[0] // {}' --arg dc "$DC" | jq -c .)
-    DCNAME=$(jq -r --arg dc "$DC" '.name // (if $dc != "" then $dc else "vg1" end)' <<<"$DCCFG")
-    IS_LVMS=0; [[ "$PROV" == *topolvm* ]] && IS_LVMS=1
-    if [ "$IS_LVMS" -eq 1 ]; then
-      echo "   LVMS deviceClass: $DCNAME  $(jq -r '"thinPool=" + (if .thinPoolConfig then "\(.thinPoolConfig.name // "-") sizePercent=\(.thinPoolConfig.sizePercent // 90) overprovisionRatio=\(.thinPoolConfig.overprovisionRatio // 10)" else "brak (thick)" end) + "  deviceSelector=" + ((.deviceSelector.paths // []) + (.deviceSelector.optionalPaths // []) | if length == 0 then "auto (wszystkie wolne dyski)" else join(",") end)' <<<"$DCCFG")"
+    if [[ "$PROV" != *topolvm* ]]; then
+      echo "   Provisioner $PROV nie jest LVMS/TopoLVM - nie umiem zmapować pojemności na dyski."
+      echo "   Parametry SC: $(J '[$scs[0].items[] | select(.metadata.name == $sc) | .parameters // {} | to_entries[] | "\(.key)=\(.value)"] | join(" ")' --arg sc "$SC")"
+      J '[ $g.rows[] | select($alln == 1 or .cand) ] | sort_by(.deficit, .node) | .[0:$top][]
+         | "   🖥️  \(.node): dostępne \(.have | gi), brakuje \(.deficit | gi)"' --argjson g "$G" --argjson alln "$ALL_NODES" --argjson top "$TOP_N"
+      echo "   👉 Zwiększ pulę backendu tej SC o co najmniej $(J '[ $g.rows[] | select($alln == 1 or .cand) | .deficit ] | min | gi' --argjson g "$G" --argjson alln "$ALL_NODES")."
+      continue
     fi
 
-    while IFS=$'\t' read -r NODE DEF HAVE CAND ISSEL; do
+    # StorageClass -> deviceClass tak, jak liczy to driver: parametr SC, a gdy go brak - deviceClass z default: true
+    INFO=$(J '[ $lvmc[0].items[]? as $c | ($c.spec.storage.deviceClasses // []) | to_entries[]
+                | .value + {_idx: .key, _cr: $c.metadata.name, _ns: $c.metadata.namespace} ] as $all
+              | ($all | map(select(.default == true)) | first) as $dflt
+              | (if $force != "" then $force elif $dc != "" then $dc else ($dflt.name // "") end) as $want
+              | { want: $want, known: (($all | length) > 0),
+                  how: (if $force != "" then "force" elif $dc != "" then "param" elif $dflt != null then "default" else "none" end),
+                  cfg: ($all | map(select(.name == $want)) | first) }' --arg dc "$DC" --arg force "$FORCE_DC" | jq -c .)
+    DCNAME=$(jq -r .want <<<"$INFO"); DCCFG=$(jq -c '.cfg // {}' <<<"$INFO")
+    if [ "$(jq -r '.known and .cfg == null' <<<"$INFO")" = true ]; then
+      dc_alternatives "$G" "$INFO"
+      continue
+    fi
+    if [ -z "$DCNAME" ]; then
+      echo "   ⚠️  Nie mogę ustalić deviceClass/VG: brak danych LVMCluster, a SC nie ma parametru device-class."
+      echo "      Uruchom ponownie z --device-class <nazwa VG>."
+      continue
+    fi
+
+    # Nody: zasieg nodeSelector deviceClass, istnienie VG, pojemnosc (przy --device-class z adnotacji noda)
+    PLAN=$(J '[ $nodes[0].items[] as $n
+                | (if ($dccfg.nodeSelector // null) != null then ($dccfg.nodeSelector | termsmatch($n)) else true end) as $cov
+                | (($n.metadata.annotations // {})["capacity.topolvm.io/" + $dcname]) as $a
+                | ($g.rows[] | select(.node == $n.metadata.name)) as $r
+                | (if $force != "" then ($a | qty) else $r.have end) as $have
+                | $r + { inSel: $cov, have: $have, deficit: ([$g.need - $have, 0] | max),
+                         hasVg: ($a != null or any($lvmns[0].items[]?; .metadata.name == $r.node and any(.spec.nodeStatus[]?; .name == $dcname))) } ] as $R
+              | { cover: ([ $R[] | select(.inSel) ] | length),
+                  rows: [ $R[] | select($alln == 1 or .cand) ] }' \
+            --argjson g "$G" --argjson dccfg "$DCCFG" --arg dcname "$DCNAME" --arg force "$FORCE_DC" --argjson alln "$ALL_NODES" | jq -c .)
+    COVER=$(jq .cover <<<"$PLAN")
+
+    J "$RECLIB"'
+      "   deviceClass (= nazwa VG): \($dcname)  ← " + (if $info.how == "force" then "wymuszony opcją --device-class"
+            elif $info.how == "param" then "parametr device-class w StorageClass \($g.sc)"
+            else "default: true w LVMCluster (StorageClass \($g.sc) nie ma parametru device-class)" end),
+      ( if $dccfg._cr != null then
+          "   LVMCluster \($dccfg._ns)/\($dccfg._cr): " + (if $dccfg.thinPoolConfig != null
+              then "thin pool \(thinparams.pool), sizePercent=\(thinparams.SP), overprovisionRatio=\(thinparams.R)" else "thick (bez thin pool)" end),
+          "   nodeSelector: \(nstext)",
+          "   deviceSelector: " + (if ($dccfg.deviceSelector // null) == null then "brak (LVMS sam bierze wszystkie wolne dyski)"
+              else "paths=\($dccfg.deviceSelector.paths // [] | length), optionalPaths=\($dccfg.deviceSelector.optionalPaths // [] | length)" end)
+        else "   ⚠️  Brak danych LVMCluster - parametry thin pool przyjęte domyślnie." end ),
+      "   Zasięg: deviceClass obejmuje \($plan.cover) nodów; analizowane nody: \($plan.rows | length), z nich objęte deviceClass: \([$plan.rows[] | select(.inSel)] | length), z istniejącym VG: \([$plan.rows[] | select(.hasVg)] | length)"' \
+      --argjson g "$G" --argjson info "$INFO" --argjson dccfg "$DCCFG" --arg dcname "$DCNAME" --argjson plan "$PLAN"
+
+    if [ -n "$FORCE_DC" ]; then
+      FITS=$(jq -r '[.rows[] | select(.deficit == 0) | .node] | join(", ")' <<<"$PLAN")
+      if [ -n "$FITS" ]; then
+        echo "   ✅ deviceClass $DCNAME pomieści PVC już teraz na: $FITS - wystarczy StorageClass wskazująca ten deviceClass, bez powiększania dysków."
+        continue
+      fi
+    fi
+
+    # Kolejnosc: selected-node, potem nody z istniejacym VG, potem objete deviceClass, potem najmniejszy deficyt
+    TARGETS=$(jq -r --argjson top "$TOP_N" '.rows
+      | sort_by((if .sel then 0 else 1 end), (if .hasVg then 0 else 1 end), (if .inSel then 0 else 1 end), .deficit, .node)
+      | .[0:$top][] | [.node, (.deficit|tostring), (.have|tostring), (.cand|tostring), (.sel|tostring), (.inSel|tostring), (.hasVg|tostring)] | @tsv' <<<"$PLAN")
+
+    while IFS=$'\t' read -r NODE DEF HAVE CAND ISSEL INSEL HASVG; do
       echo ""
       echo "   🖥️  $NODE  (dostępne $(J '$x|tonumber|gi' --arg x "$HAVE"), brakuje $(J '$x|tonumber|gi' --arg x "$DEF")$( [ "$ISSEL" = true ] && echo ', 🎯 selected-node')$( [ "$CAND" = true ] || echo ', ⚠️ odpada też na innych filtrach'))"
       if [ "$DEF" = "0" ]; then
         echo "     ✅ Miejsca wystarcza - powiększanie nic nie da; node blokuje inny filtr (patrz tabela)."
         continue
       fi
-      if [ "$IS_LVMS" -ne 1 ]; then
-        echo "     Provisioner $PROV nie jest LVMS/TopoLVM - nie umiem zmapować pojemności na dyski."
-        echo "     Parametry SC: $(J '[$scs[0].items[] | select(.metadata.name == $sc) | .parameters // {} | to_entries[] | "\(.key)=\(.value)"] | join(" ")' --arg sc "$SC")"
-        echo "     👉 Zwiększ pulę backendu tej SC o co najmniej $(J '$x|tonumber|gi' --arg x "$DEF")."
+      if [ "$INSEL" != true ] && [ "$HASVG" != true ]; then
+        echo "     ⛔ deviceClass $DCNAME nie obejmuje tego noda (nodeSelector: $(J "$RECLIB"'nstext' --argjson dccfg "$DCCFG"))."
+        echo "        LVMS nie utworzy tu VG $DCNAME - dokładanie ani powiększanie dysku na tym nodzie nic nie da."
+        echo "     👉 Wybierz nod objęty deviceClass albo nadaj temu nodowi etykietę zgodną z nodeSelector."
         continue
       fi
       if [ "$USE_DEBUG" -eq 1 ]; then
         echo "     ⏳ oc debug node/$NODE (lsblk/vgs/pvs/lvs - tylko odczyt)..."
         if collect_node "$NODE"; then
-          recommend_node "$NODE" "$DEF" "$DCCFG" "$DCNAME"
+          recommend_node "$NODE" "$DEF" "$DCCFG" "$DCNAME" "$COVER" "$INSEL"
           continue
         else
           echo "     ⚠️  oc debug nie powiódł się: $(grep -v '^$' "$TMP/node-$NODE/err.txt" | tail -1). Rekomendacja przybliżona:"
@@ -674,7 +852,7 @@ if [ "$(jq length "$TMP/grow.json")" -gt 0 ]; then
   done
   echo ""
   echo "   ℹ️  Skrypt niczego nie zmienił. Komendy są sugestią - wykonuj je świadomie (oc debug node/<node> → chroot /host)."
-  echo "      Po powiększeniu dysku: LVMS (vgmanager) powinien wykryć zmianę; CSIStorageCapacity odświeży się po chwili."
+  echo "      Po zmianie: LVMS (vg-manager) powinien wykryć dysk/rozmiar; CSIStorageCapacity odświeży się po chwili."
 fi
 
 echo ""
