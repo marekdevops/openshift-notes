@@ -369,8 +369,10 @@ def kvmap: split(",") | map(select(. != "") | capture("^\\s*(?<k>[^=]+?)\\s*=\\s
         else FAIL("\($what): brak selektora \(IK) (nodeSelector: \($spec.nodeSelector // {} | tojson)); \($where)") end ]
     + (if $ti and ($spec | targetsworker) and $a.rmworker then [WARN("\($what): selektor zawiera też \(WK) - po usunięciu etykiety worker pody się nie uruchomią")] else [] end);
 
+  # tylko komponenty, dla ktorych cluster-monitoring-config przyjmuje nodeSelector/tolerations
+  # (prometheusOperatorAdmissionWebhook ich NIE przyjmuje - webhook odrzuca cala ConfigMape)
   ({"prometheus-k8s":"prometheusK8s","alertmanager-main":"alertmanagerMain","prometheus-operator":"prometheusOperator",
-    "prometheus-operator-admission-webhook":"prometheusOperatorAdmissionWebhook","kube-state-metrics":"kubeStateMetrics",
+    "kube-state-metrics":"kubeStateMetrics",
     "openshift-state-metrics":"openshiftStateMetrics","telemeter-client":"telemeterClient","thanos-querier":"thanosQuerier",
     "metrics-server":"metricsServer","prometheus-adapter":"k8sPrometheusAdapter","monitoring-plugin":"monitoringPlugin"}) as $monmap
 | [$wl[] | select(.metadata.namespace == "openshift-monitoring" and $monmap[.metadata.name] != null)
