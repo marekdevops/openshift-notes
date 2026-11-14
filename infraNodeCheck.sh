@@ -3,6 +3,7 @@
 #
 # Uzycie: infraNodeCheck.sh [--nodes a,b,c] [--name-pattern REGEX] [--taint-value WART]
 #                           [--noexecute] [--remove-worker] [--allow-ns REGEX] [--max N] [--emit PLIK]
+#                           [--emit-rollback PLIK]
 #
 #   --nodes a,b,c       nody, ktore MAJA byc infra (domyslnie: nody z etykieta node-role.kubernetes.io/infra,
 #                       a gdy takich brak - nody, ktorych nazwa pasuje do --name-pattern)
@@ -14,6 +15,7 @@
 #   --allow-ns RE       dodatkowe namespace'y dozwolone na infra (np. Quay, instancje GitOps)
 #   --max N             ile pozycji pokazywac na listach (domyslnie 30)
 #   --emit PLIK         zapisz proponowane komendy do pliku (skrypt NIE jest uruchamiany)
+#   --emit-rollback PLIK zapisz komendy wycofania do pliku (skrypt NIE jest uruchamiany)
 #
 # Co sprawdza (wg dokumentacji OpenShift: "Creating infrastructure machine sets",
 # "Binding infrastructure node workloads using taints and tolerations", "Moving resources to
@@ -30,7 +32,15 @@
 #  6. pody, ktore JUZ dzialaja na infra, a nie sa komponentami infrastruktury
 #  7. pody/workloady, ktore MOGA trafic na infra - teraz oraz po wprowadzeniu proponowanych zmian
 #     (tolerancje, nodeSelector, wymagane nodeAffinity)
-#  Na koncu: komendy wprowadzajace brakujace zmiany, w bezpiecznej kolejnosci (tylko wypisywane).
+#  Na koncu: komendy wprowadzajace brakujace zmiany, w bezpiecznej kolejnosci (tylko wypisywane):
+#   KROK 0 - kopia wszystkich zmienianych obiektow (nodes, mcp, machinesets, ingresscontroller,
+#            image registry, cluster-monitoring-config)
+#  oraz ROLLBACK - komendy wycofania, wygenerowane ze stanu klastra SPRZED zmian, w odwrotnej
+#  kolejnosci (tainty, etykiety, patche komponentow przywracaja dokladnie poprzednie wartosci;
+#  pula MCP infra usuwana bezpiecznie: nody najpierw wracaja do puli worker). Nie da sie cofnac:
+#  usunietych podow, podow wyrzuconych przez NoExecute, restartow nodow, zmian poza klastrem (LB/DNS).
+#  Ostrzega tez, gdy PVC monitoringu sa przypiete do nodow spoza infra (lokalny storage, np. LVMS) -
+#  po przeniesieniu pod zostalby w Pending.
 #
 # Kod wyjscia: 0 - OK, 1 - tylko ostrzezenia, 2 - bledy, 3 - blad uruchomienia
 
@@ -44,6 +54,7 @@ RMWORKER=false
 ALLOW_NS=""
 MAXLIST=30
 EMIT=""
+EMIT_RB=""
 
 need() { if [ -z "$2" ]; then echo "🚨 Błąd: brak wartości po $1." >&2; exit 3; fi; }
 
@@ -57,6 +68,7 @@ while (( "$#" )); do
     --allow-ns)      need "$1" "$2"; ALLOW_NS="$2"; shift 2 ;;
     --max)           need "$1" "$2"; MAXLIST="$2"; shift 2 ;;
     --emit)          need "$1" "$2"; EMIT="$2"; shift 2 ;;
+    --emit-rollback) need "$1" "$2"; EMIT_RB="$2"; shift 2 ;;
     -h|--help)       sed -n '2,/^$/p' "$0"; exit 0 ;;
     *)               echo "🚨 Nieznany argument: $1" >&2; exit 3 ;;
   esac
@@ -88,6 +100,11 @@ get "$TMP/reg.json"    '{}'           configs.imageregistry.operator.openshift.i
 get "$TMP/cm.json"     '{}'           configmap cluster-monitoring-config -n openshift-monitoring
 get "$TMP/ma.json"     '{"items":[]}' machines.machine.openshift.io -n openshift-machine-api
 get "$TMP/ms.json"     '{"items":[]}' machinesets.machine.openshift.io -n openshift-machine-api
+get "$TMP/pvc.json"    '{"items":[]}' pvc -n openshift-monitoring
+if ! oc get pv -o json 2>/dev/null | jq -c '{items: [.items[] | select(.spec.claimRef.namespace == "openshift-monitoring")
+      | {metadata: {name: .metadata.name}, spec: {nodeAffinity: .spec.nodeAffinity}}]}' >"$TMP/pv.json"; then
+  echo '{"items":[]}' >"$TMP/pv.json"
+fi
 
 : >"$TMP/wl.list"
 for ns in openshift-ingress openshift-image-registry openshift-monitoring openshift-logging; do
@@ -115,9 +132,9 @@ fi
 jq -n \
   --arg nodes "$NODES" --arg pat "$NAME_PATTERN" --arg tval "$TAINT_VALUE" \
   --argjson noexec "$NOEXEC" --argjson rmworker "$RMWORKER" --arg allowns "$ALLOW_NS" \
-  --argjson max "$MAXLIST" \
+  --argjson max "$MAXLIST" --arg now "$(date '+%F %T')" \
   '{nodes: ($nodes | split(",") | map(select(. != ""))), pat: $pat, tval: $tval,
-    noexec: $noexec, rmworker: $rmworker, allowns: $allowns, max: $max}' >"$TMP/args.json" || exit 3
+    noexec: $noexec, rmworker: $rmworker, allowns: $allowns, max: $max, now: $now}' >"$TMP/args.json" || exit 3
 
 read -r -d '' JQPROG <<'EOF'
 def IK: "node-role.kubernetes.io/infra";
@@ -360,7 +377,7 @@ def kvmap: split(",") | map(select(. != "") | capture("^\\s*(?<k>[^=]+?)\\s*=\\s
          | {key: $monmap[.metadata.name], wl: ., ok: ((.spec.template.spec | targetsinfra) and (.spec.template.spec | tolok($TT)))}] as $mon
 | ($IC[0].items // []) as $ics
 | [$ics[] | . as $ic | (.spec.nodePlacement // {}) as $np
-    | {name: .metadata.name, np: $np,
+    | {name: .metadata.name, np: $np, rawnp: .spec.nodePlacement,
        ti: (((($np.nodeSelector.matchLabels // {}) | has(IK))) or any($np.nodeSelector.matchExpressions[]?; .key == IK)),
        tw: (($np.nodeSelector.matchLabels // {}) | has(WK)),
        to: ($np | tolok($TT)),
@@ -370,6 +387,13 @@ def kvmap: split(",") | map(select(. != "") | capture("^\\s*(?<k>[^=]+?)\\s*=\\s
 | (($reg.spec.managementState // "") | . == "Managed" or . == "") as $regman
 | (($reg.spec // {}) | targetsinfra and tolok($TT)) as $regok
 | ($CM[0].data["config.yaml"] // null) as $cmy
+| ($PV[0].items // []) as $pvs
+| [ ($PVC[0].items // [])[] | select(.status.phase == "Bound") | . as $c
+    | ([$pvs[] | select(.metadata.name == $c.spec.volumeName)] | .[0]) as $pv
+    | select($pv != null and $pv.spec.nodeAffinity.required != null)
+    | select(any($TSIM[]; . as $n | $pv.spec.nodeAffinity.required | termsmatch($n)) | not)
+    | {pvc: .metadata.name, pv: $pv.metadata.name,
+       hosts: ([$pv.spec.nodeAffinity.required.nodeSelectorTerms[]?.matchExpressions[]?.values[]?] | unique)} ] as $pinned
 
 | ( H("4. KOMPONENTY INFRASTRUKTURY (selektory i tolerancje)")
   + [INFO("Wymagane tolerancje (tainty infra po zmianach): \($TT | map(tstr) | join(" "))")]
@@ -392,6 +416,7 @@ def kvmap: split(",") | map(select(. != "") | capture("^\\s*(?<k>[^=]+?)\\s*=\\s
   + (if $cmy == null then [INFO("ConfigMap cluster-monitoring-config nie istnieje")] else [OK("ConfigMap cluster-monitoring-config istnieje")] end)
   + (if ($mon | length) == 0 then [WARN("Nie odczytano workloadów openshift-monitoring")]
      else [ $mon[] | compcheck("\(.key) (\(.wl.kind)/\(.wl.metadata.name))"; .wl.spec.template.spec; "openshift-monitoring"; .wl.metadata.name) ] | add end)
+  + [ $pinned[] | WARN("PVC \(.pvc): wolumen \(.pv) przypięty do \(.hosts | join(",")) (lokalny storage) - na infra pod zostanie w Pending (volume node affinity conflict); potrzebny storage dostępny na infra albo usunięcie PVC (UTRATA DANYCH)") ]
   + ([$wl[] | select(.metadata.namespace == "openshift-logging")] as $lg
      | if ($lg | length) == 0 then []
        else ["", "  ▶ Logging (openshift-logging) - tylko raport; konfiguracja w LokiStack spec.template.<komponent>.nodeSelector/tolerations"]
@@ -488,31 +513,45 @@ def kvmap: split(",") | map(select(. != "") | capture("^\\s*(?<k>[^=]+?)\\s*=\\s
   def monblock($ind; $k): [$ind + $k + ":", $ind + "  nodeSelector:", $ind + "    " + IK + ": \"\"", $ind + "  tolerations:"] + yamltols($ind + "  ");
   def step($t; $c): if ($c | length) == 0 then [] else ["", "# ---- " + $t + " ----"] + $c end;
   ([$mon[] | select(.ok | not) | .key] | unique) as $monmiss
+| [ $msl[] | . as $ms
+    | ((.spec.template.spec.taints // []) + [$TT[] | . as $t | select(any($ms.spec.template.spec.taints[]?; .key == $t.key and .effect == $t.effect) | not)]) as $nt
+    | select((((.spec.template.spec.metadata.labels // {}) | has(IK)) | not) or ($nt | length) > ((.spec.template.spec.taints // []) | length))
+    | {ms: ., nt: $nt} ] as $mspatch
+| [ $icx[] | select((.ti and .to and ((.tw and $a.rmworker) | not)) | not) ] as $icpatch
+| ($regman and ($reg != {}) and ($regok | not)) as $regpatch
+| (($ipools | length) == 0 and ($T | length) > 0) as $mcpcreate
+| (if $a.rmworker then [ $T[] | select(hasrole("worker")) ] else [] end) as $rmw
 
 | ( [ "#!/bin/bash",
       "# Komendy wygenerowane przez infraNodeCheck.sh - przejrzyj przed wykonaniem, wykonuj krok po kroku.",
       "# Nody infra: \($T | map(.metadata.name) | join(" "))",
-      "# Kopia stanu: oc get nodes,mcp -o yaml > infra-backup-$(date +%F).yaml" ]
+      "",
+      "# ---- KROK 0: kopia zmienianych obiektów (podstawa rollbacku) ----",
+      "B=infra-backup-$(date +%F-%H%M); mkdir -p \"$B\"",
+      "oc get nodes -o yaml > \"$B/nodes.yaml\"",
+      "oc get mcp -o yaml > \"$B/mcp.yaml\"",
+      "oc get machinesets.machine.openshift.io -n openshift-machine-api -o yaml > \"$B/machinesets.yaml\" 2>/dev/null",
+      "oc get ingresscontroller -n openshift-ingress-operator -o yaml > \"$B/ingresscontrollers.yaml\"",
+      "oc get configs.imageregistry.operator.openshift.io cluster -o yaml > \"$B/imageregistry.yaml\"",
+      "oc get configmap cluster-monitoring-config -n openshift-monitoring -o yaml > \"$B/cluster-monitoring-config.yaml\" 2>/dev/null",
+      "echo \"Kopia: $B\"" ]
   + step("KROK 1: etykieta roli infra"; [ $nolabel[] | "oc label node \(.metadata.name) \(IK)=\"\"" ])
   + step("KROK 2: pula MachineConfigPool infra (UWAGA: nody puli mogą zostać zrestartowane)";
-      if ($ipools | length) > 0 then [] else
+      if ($mcpcreate | not) then [] else
       [ "cat <<'YAML' | oc create -f -", "apiVersion: machineconfiguration.openshift.io/v1", "kind: MachineConfigPool",
         "metadata:", "  name: infra", "spec:", "  machineConfigSelector:", "    matchExpressions:",
         "      - key: machineconfiguration.openshift.io/role", "        operator: In", "        values: [worker, infra]",
         "  nodeSelector:", "    matchLabels:", "      \(IK): \"\"", "YAML",
         "oc get machineconfig | grep rendered-infra", "oc get mcp infra -w   # czekaj na UPDATED=True" ] end)
   + step("KROK 3: MachineSety - etykieta/taint w szablonie (dotyczy tylko NOWYCH maszyn)";
-      [ $msl[] | . as $ms
-        | ((.spec.template.spec.taints // []) + [$TT[] | . as $t | select(any($ms.spec.template.spec.taints[]?; .key == $t.key and .effect == $t.effect) | not)]) as $nt
-        | select((((.spec.template.spec.metadata.labels // {}) | has(IK)) | not) or ($nt | length) > ((.spec.template.spec.taints // []) | length))
-        | "oc patch machineset \(.metadata.name) -n openshift-machine-api --type=merge -p " + ({spec: {template: {spec: {metadata: {labels: {(IK): ""}}, taints: $nt}}}} | tojson | @sh) ])
+      [ $mspatch[] | "oc patch machineset \(.ms.metadata.name) -n openshift-machine-api --type=merge -p " + ({spec: {template: {spec: {metadata: {labels: {(IK): ""}}, taints: .nt}}}} | tojson | @sh) ])
   + step("KROK 4a: Ingress - routery na infra";
-      [ $icx[] | select((.ti and .to and ((.tw and $a.rmworker) | not)) | not)
+      [ $icpatch[]
         | "oc patch ingresscontroller/\(.name) -n openshift-ingress-operator --type=merge -p "
           + ({spec: {nodePlacement: {nodeSelector: {matchLabels: ({(IK): ""} + (if .tw then {(WK): null} else {} end))}, tolerations: $SUGT}}} | tojson | @sh) ]
       + (if any($icx[]; .replicas > ($T | length)) then ["# replicas > liczba infra nodów - rozważ: oc patch ingresscontroller/default -n openshift-ingress-operator --type=merge -p '{\"spec\":{\"replicas\":\($T | length)}}'"] else [] end))
   + step("KROK 4b: image registry na infra";
-      if $regman and ($reg != {}) and ($regok | not)
+      if $regpatch
       then [ "oc patch configs.imageregistry.operator.openshift.io/cluster --type=merge -p " + ({spec: {nodeSelector: {(IK): ""}, tolerations: $SUGT}} | tojson | @sh) ]
       else [] end)
   + step("KROK 4c: monitoring na infra (\($monmiss | join(", ")))";
@@ -528,20 +567,24 @@ def kvmap: split(",") | map(select(. != "") | capture("^\\s*(?<k>[^=]+?)\\s*=\\s
         [ "oc -n openshift-monitoring patch configmap cluster-monitoring-config --type=merge -p "
           + ({data: {"config.yaml": (($cmy | if . == "" or endswith("\n") then . else . + "\n" end) + ([$monmiss[] | monblock(""; .)] | add | join("\n")) + "\n")}} | tojson | @sh) ]
       end
-      + (if ($monmiss | length) > 0 then ["oc get pods -n openshift-monitoring -o wide   # sprawdź, czy pody przeszły na infra"] else [] end))
+      + (if ($monmiss | length) > 0 then ["oc get pods -n openshift-monitoring -o wide   # sprawdź, czy pody przeszły na infra"]
+           + [ $pinned[] | "# UWAGA: PVC \(.pvc) przypięty do \(.hosts | join(",")) - pod nie wystartuje na infra (patrz sekcja 4)" ] else [] end))
   + step("KROK 4d: komponenty już skonfigurowane, ale ich pody działają poza infra - przeplanowanie";
       ( [ $mon[] | select(.ok) | {ns: "openshift-monitoring", name: .wl.metadata.name} ]
       + (if $regman and $regok then [{ns: "openshift-image-registry", name: "image-registry"}] else [] end)
       + [ $icx[] | select(.ti and .to) | {ns: "openshift-ingress", name: ("router-" + .name)} ] )
-      | map(. as $c | [podsof($c.ns; $c.name)[] | select($TS[.spec.nodeName // ""] != true) | .metadata.name] as $pn
-            | select(($pn | length) > 0) | "oc delete pod -n \($c.ns) \($pn | join(" "))"))
+      | map(. as $c | [podsof($c.ns; $c.name)[] | select($TS[.spec.nodeName // ""] != true) | .metadata.name] as $all
+            | [$all[] | . as $pn | select($c.ns == "openshift-monitoring" and any($pinned[]; .pvc | endswith("-" + $pn)))] as $blk
+            | ($all - $blk) as $pn
+            | (if ($pn | length) > 0 then "oc delete pod -n \($c.ns) \($pn | join(" "))" else empty end),
+              ($blk[] | "# NIE usuwaj \($c.ns)/\(.) - jego PVC jest przypięty do noda spoza infra (Pending); najpierw rozwiąż storage (sekcja 4)")))
   + step("KROK 5: weryfikacja przed taintem (komponenty muszą już działać na infra)";
       if ($taintplan | length) > 0 then
         [ "oc get pods -n openshift-ingress -o wide", "oc get pods -n openshift-image-registry -o wide", "oc get mcp" ] else [] end)
   + step("KROK 6: tainty infra (NoSchedule nie usuwa działających podów" + (if $a.noexec then "; NoExecute USUWA pody bez tolerancji" else "" end) + ")";
       [ $taintplan[] | "oc adm taint nodes \(.n) " + (.pl | map("\(.key)=\(.value):\(.effect)") | join(" ")) + " --overwrite" ])
   + step("KROK 7: usunięcie roli worker (dopiero gdy pula infra jest Updated, a routery mają selektor infra)";
-      if $a.rmworker then [ $T[] | select(hasrole("worker")) | "oc label node \(.metadata.name) \(WK)-" ] else [] end)
+      [ $rmw[] | "oc label node \(.metadata.name) \(WK)-" ])
   + step("KROK 8: aplikacje spoza infrastruktury działające na infra (po taincie przeniosą się po restarcie poda)";
       [ $violg[] | select(.kind != "DaemonSet")
         | (if .tolall then "# \(.ns)/\(.kind)/\(.name) toleruje wszystkie tainty - usuń 'operator: Exists' bez klucza z tolerancji, inaczej wróci na infra" else empty end),
@@ -550,8 +593,82 @@ def kvmap: split(",") | map(select(. != "") | capture("^\\s*(?<k>[^=]+?)\\s*=\\s
       + [ $after[] | "# \(.ns)/\(.kind)/\(.name): po zmianach nadal toleruje taint infra - popraw tolerancje (lub dodaj nodeAffinity \(IK) DoesNotExist)" ])
   ) as $CMDS
 
+# ---------------- ROLLBACK (odwrotna kolejnosc, wartosci sprzed zmian) ----------------
+| (($infra + $nolabel) | map(.metadata.name) | unique) as $allinfra
+| ( [ "#!/bin/bash",
+      "# ROLLBACK wygenerowany przez infraNodeCheck.sh \($a.now) ze stanu klastra SPRZED zmian.",
+      "# Wykonuj od góry, krok po kroku; cofaj tylko kroki, które faktycznie wykonano.",
+      "# Jeśli konfiguracja zmieniła się po wygenerowaniu - przywracaj z kopii z KROKU 0 (katalog infra-backup-*)." ]
+  + step("R7: przywrócenie roli worker (przed zmianami w puli MCP!)";
+      [ $rmw[] | "oc label node \(.metadata.name) \(WK)=\"\"" ])
+  + step("R6: zdjęcie dodanych taintów (natychmiastowe, bez restartu; najszybszy 'hamulec')";
+      [ $taintplan[] | "oc adm taint nodes \(.n) " + (.pl | map("\(.key):\(.effect)-") | join(" ")) ]
+      + (if any($taintplan[].pl[]; .effect == "NoExecute") then ["# pody wyrzucone przez NoExecute nie wrócą same na te nody"] else [] end))
+  + step("R8/R4d: usunięte pody - nie do wycofania";
+      if ($violg | length) > 0 or ([$CMDS[] | select(startswith("oc delete pod"))] | length) > 0
+      then ["# pody z kontrolerem (Deployment/StatefulSet/...) zostały odtworzone automatycznie; pody bez kontrolera przepadły"] else [] end)
+  + step("R4c: monitoring - przywrócenie cluster-monitoring-config";
+      if ($monmiss | length) == 0 then []
+      elif $cmy == null then
+        [ "oc delete configmap cluster-monitoring-config -n openshift-monitoring   # nie istniała przed zmianą - CMO wraca do ustawień domyślnych" ]
+      else
+        [ "oc -n openshift-monitoring patch configmap cluster-monitoring-config --type=merge -p " + ({data: {"config.yaml": $cmy}} | tojson | @sh) ]
+      end
+      + (if ($monmiss | length) > 0 then ["oc get pods -n openshift-monitoring -o wide   # pody wracają na poprzednie nody (PVC lokalne - na nod z wolumenem)"] else [] end))
+  + step("R4b: image registry - poprzedni nodeSelector/tolerations";
+      if $regpatch then
+        ($reg.spec.nodeSelector) as $o
+        | [ "oc patch configs.imageregistry.operator.openshift.io/cluster --type=merge -p "
+            + ({spec: {nodeSelector: (if $o == null then null elif ($o | has(IK)) then $o else $o + {(IK): null} end),
+                       tolerations: ($reg.spec.tolerations // null)}} | tojson | @sh) ]
+      else [] end)
+  + step("R4a: Ingress - poprzedni nodePlacement (routery wracają na workery)";
+      [ $icpatch[]
+        | if .rawnp == null then
+            "oc patch ingresscontroller/\(.name) -n openshift-ingress-operator --type=merge -p " + ({spec: {nodePlacement: null}} | tojson | @sh)
+          else
+            (.np.nodeSelector.matchLabels) as $ml
+            | "oc patch ingresscontroller/\(.name) -n openshift-ingress-operator --type=merge -p "
+              + ({spec: {nodePlacement: {nodeSelector: {matchLabels: (if $ml == null then null elif ($ml | has(IK)) then $ml else $ml + {(IK): null} end)},
+                                         tolerations: (.np.tolerations // null)}}} | tojson | @sh)
+          end ]
+      + (if ($icpatch | length) > 0 then ["# jeśli LB / VIP *.apps przestawiono na infra nody - przywróć go na workery RAZEM z tym krokiem",
+                                          "oc get pods -n openshift-ingress -o wide"] else [] end)
+      + [ $icx[] | select(.replicas > ($T | length)) | "# jeśli zmieniono replicas: oc patch ingresscontroller/\(.name) -n openshift-ingress-operator --type=merge -p '{\"spec\":{\"replicas\":\(.replicas)}}'" ])
+  + step("R3: MachineSety - poprzednie etykiety/tainty szablonu (istniejące maszyny bez zmian)";
+      [ $mspatch[] | .ms as $ms
+        | "oc patch machineset \($ms.metadata.name) -n openshift-machine-api --type=merge -p "
+          + ({spec: {template: {spec: {metadata: {labels: (if (($ms.spec.template.spec.metadata.labels // {}) | has(IK)) then {} else {(IK): null} end)},
+                                       taints: ($ms.spec.template.spec.taints // null)}}}} | tojson | @sh) ])
+  + step("R2: usunięcie puli MCP infra (UWAGA: restart nodów przy powrocie do puli worker)";
+      if ($mcpcreate | not) then [] else
+        [ "# 1) zdejmij etykietę infra, by nody wróciły do puli worker (usunięcie puli z nodami w środku zostawia je z nieistniejącym rendered-infra)" ]
+        + [ $allinfra[] | "oc label node \(.) \(IK)-" ]
+        + [ $T[] | . as $n | select((hasrole("worker") | not) and (any($rmw[]; .metadata.name == $n.metadata.name) | not))
+            | "# UWAGA: \(.metadata.name) nie miał roli worker - po zdjęciu etykiety infra nie będzie w żadnej puli (jak przed zmianą); rozważ: oc label node \(.metadata.name) \(WK)=\"\"" ]
+        + [ "# 2) czekaj, aż pula worker obejmie te nody i będzie UPDATED=True, a pula infra MACHINECOUNT=0",
+            "oc get mcp -w",
+            "# 3) usuń pulę",
+            "oc delete mcp infra" ]
+        + (if ($infra | length) > 0 then
+             ["# 4) przywróć etykietę infra nodom, które miały ją przed zmianą (bez puli infra zostają w puli worker)"]
+             + [ $infra[] | "oc label node \(.metadata.name) \(IK)=\"\"" ]
+           else [] end)
+      end)
+  + step("R1: zdjęcie etykiety infra dodanej w KROKU 1";
+      if $mcpcreate then
+        (if ($nolabel | length) > 0 then ["# wykonane już w R2 (nody bez etykiety infra przed zmianą jej nie odzyskują)"] else [] end)
+      else
+        [ $nolabel[] | "oc label node \(.metadata.name) \(IK)-" ]
+        + (if ($nolabel | length) > 0 and ($ipools | length) > 0 then ["# nody opuszczą pulę \($ipools | map(.metadata.name) | join(",")) i wrócą do worker - możliwy restart"] else [] end)
+      end)
+  ) as $RB
+
 | ($S1 + $S2 + $S3 + $S4 + $S5 + $S6 + $S7) as $R
-| {r: $R, c: $CMDS,
+| ([$CMDS[] | select(startswith("# ---- KROK") and (startswith("# ---- KROK 0") | not))] | length) as $nsteps
+| {r: $R, n: $nsteps,
+   c: (if $nsteps > 0 then $CMDS else [] end),
+   rb: (if $nsteps > 0 then $RB else [] end),
    f: ([$R[] | select(test("^ *❌"))] | length),
    w: ([$R[] | select(test("^ *⚠️"))] | length)}
 EOF
@@ -561,25 +678,32 @@ jq -n \
   --slurpfile P "$TMP/pods.json" --slurpfile SCH "$TMP/sched.json" --slurpfile NS "$TMP/ns.json" \
   --slurpfile IC "$TMP/ic.json" --slurpfile REG "$TMP/reg.json" --slurpfile CM "$TMP/cm.json" \
   --slurpfile WL "$TMP/wl.json" --slurpfile MA "$TMP/ma.json" --slurpfile MS "$TMP/ms.json" \
+  --slurpfile PVC "$TMP/pvc.json" --slurpfile PV "$TMP/pv.json" \
   "$JQPROG" >"$TMP/out.json" || { echo "🚨 Błąd przetwarzania danych (jq)." >&2; exit 3; }
 
 jq -r '.r[]' "$TMP/out.json"
 
 FAILS=$(jq '.f' "$TMP/out.json")
 WARNS=$(jq '.w' "$TMP/out.json")
-NCMD=$(jq '[.c[] | select(. != "" and (startswith("#") | not))] | length' "$TMP/out.json")
+NSTEPS=$(jq '.n' "$TMP/out.json")
 
 echo
 echo "════════ PODSUMOWANIE ════════"
-echo "  Błędy: $FAILS   Ostrzeżenia: $WARNS   Proponowanych komend: $NCMD"
+echo "  Błędy: $FAILS   Ostrzeżenia: $WARNS   Proponowanych kroków zmian: $NSTEPS"
 echo
 echo "════════ PROPONOWANE KOMENDY (skrypt niczego nie zmienia) ════════"
-if [ "$NCMD" -eq 0 ] && [ "$(jq '[.c[] | select(startswith("# ----"))] | length' "$TMP/out.json")" -eq 0 ]; then
+if [ "$NSTEPS" -eq 0 ]; then
   echo "  Brak - konfiguracja zgodna."
 else
   jq -r '.c[]' "$TMP/out.json"
   if [ -n "$EMIT" ]; then
     jq -r '.c[]' "$TMP/out.json" >"$EMIT" && echo && echo "💾 Komendy zapisane do: $EMIT (nie zostały wykonane)"
+  fi
+  echo
+  echo "════════ ROLLBACK - KOMENDY WYCOFANIA (skrypt niczego nie zmienia) ════════"
+  jq -r '.rb[]' "$TMP/out.json"
+  if [ -n "$EMIT_RB" ]; then
+    jq -r '.rb[]' "$TMP/out.json" >"$EMIT_RB" && echo && echo "💾 Rollback zapisany do: $EMIT_RB (nie został wykonany)"
   fi
 fi
 
