@@ -29,7 +29,7 @@
 set -uo pipefail
 export LC_ALL=C
 
-WATCH=60; TOPN=20; BASE="7d"; HDAYS=14
+WATCH=60; TOPN=20; BASE="7d"; HDAYS=14; AUDIT=0; AUDIT_H=1
 CURL_K=""; OC_K=()
 
 usage() { cat <<EOF
@@ -38,9 +38,13 @@ Uzycie: $0 [opcje]
   -t N         liczba wierszy w zestawieniach            (domyslnie: $TOPN)
   -B OKRES     z kiedy porownac zapisy do API            (domyslnie: $BASE temu)
   -D DNI       ile dni historii reloadow analizowac      (domyslnie: $HDAYS)
+  -a           przeczytaj logi audytu openshift-apiservera z masterow (oc adm node-logs,
+               tylko odczyt) i pokaz KTO (uzytkownik/konto serwisowe, program) zapisuje
+               route w ostatnich $AUDIT_H h. Wymaga uprawnien do node-logs (cluster-admin).
   -k, --insecure
                nie weryfikuj certyfikatow TLS (oc + thanos-querier)
-Przyklad:  $0 -k -s 120 | tee reload-source-\$(date +%F_%H%M).txt
+Przyklady: $0 -k -s 120 | tee reload-source-\$(date +%F_%H%M).txt
+           $0 -k -s 120 -a
 EOF
 exit "${1:-0}"; }
 
@@ -51,9 +55,9 @@ for a in "$@"; do case $a in
   *) args+=("$a");;
 esac; done
 set -- "${args[@]+"${args[@]}"}"
-while getopts "s:t:B:D:kh" o; do case $o in
+while getopts "s:t:B:D:akh" o; do case $o in
   s) WATCH=$OPTARG;; t) TOPN=$OPTARG;; B) BASE=$OPTARG;; D) HDAYS=$OPTARG;;
-  k) CURL_K="-k"; OC_K=(--insecure-skip-tls-verify=true);; h) usage 0;; *) usage 1;;
+  a) AUDIT=1;; k) CURL_K="-k"; OC_K=(--insecure-skip-tls-verify=true);; h) usage 0;; *) usage 1;;
 esac; done
 
 die()  { echo "BLAD: $*" >&2; exit 1; }
@@ -65,8 +69,11 @@ say()  { fold -s -w 96 <<<"$*" | sed 's/^/  | /'; }
 table() { local rows; rows=$(cat)
   if [[ $(wc -l <<<"$rows") -le 1 ]]; then echo "  (brak danych)"; else column -t -s $'\t' <<<"$rows" | sed 's/^/  /'; fi; }
 
-# Jedyna droga do klastra: tylko get/whoami. OC_TIMEOUT=N ogranicza czas (obserwacja --watch).
+# Jedyna droga do klastra: tylko get/whoami (+ 'adm node-logs' z opcja -a).
+# OC_TIMEOUT=N ogranicza czas (obserwacja --watch).
 oc_ro() { case "${1:-}" in
+  adm) [[ ${2:-} == node-logs ]] && (( AUDIT )) || die "oc_ro: 'oc adm $*' niedozwolone"
+    command oc "${OC_K[@]+"${OC_K[@]}"}" "$@";;
   get|whoami)
     if [[ -n ${OC_TIMEOUT:-} ]]; then timeout "$OC_TIMEOUT" oc "${OC_K[@]+"${OC_K[@]}"}" "$@"
     else command oc "${OC_K[@]+"${OC_K[@]}"}" "$@"; fi;;
@@ -257,8 +264,11 @@ SIG='
 def mgr: ((.metadata.managedFields // []) | max_by(.time // "") // {}) as $f
   | if $f=={} then "-" else "\($f.manager // "?") (\($f.operation // "?")\(if $f.subresource then "/"+$f.subresource else "" end))" end;
 def meta: {l:(.metadata.labels // {}), a:((.metadata.annotations // {}) | del(.["kubectl.kubernetes.io/last-applied-configuration"]))};
+def owner: ((.metadata.ownerReferences // [])[0] // null) | if .==null then "-" else "\(.kind)/\(.name)" end;
 def sig($kind):
-  if   $kind=="routes" then {spec:(.spec|tojson), status:(.status|tojson), meta:(meta|tojson)}
+  if   $kind=="routes" then {spec:(.spec|tojson), status:(.status|tojson),
+       adnotacje:((.metadata.annotations // {}) | del(.["kubectl.kubernetes.io/last-applied-configuration"])),
+       etykiety:(.metadata.labels // {})}
   elif $kind=="endpointslices.discovery.k8s.io" then
        {pody:([.endpoints[]? | {a:.addresses, r:.conditions.ready, s:.conditions.serving, t:.conditions.terminating}] | sort | tojson),
         porty:(.ports|tojson), meta:(meta|tojson)}
@@ -274,7 +284,7 @@ for k in "${KINDS[@]}"; do
     "$TMP/w0_$k.json" 2>/dev/null >"$TMP/s0_$k.jsonl"
   # strumien zdarzen -> dla kazdego obiektu: liczba zmian, co sie zmienialo, kto zmienial
   jq -c --arg kind "$k" "$SIG"'select(.object.metadata!=null) | {t:.type, key:"\(.object.metadata.namespace)/\(.object.metadata.name)",
-       ns:.object.metadata.namespace, svc:(.object|svc($kind)), s:(.object|sig($kind)), mgr:(.object|mgr)}' \
+       ns:.object.metadata.namespace, svc:(.object|svc($kind)), own:(.object|owner), s:(.object|sig($kind)), mgr:(.object|mgr)}' \
     "$TMP/w_$k.json" 2>/dev/null >"$TMP/ev_$k.jsonl"
   jq -n --slurpfile init "$TMP/s0_$k.jsonl" --slurpfile ev "$TMP/ev_$k.jsonl" --slurpfile routed "$TMP/routed.json" \
         --argjson names "$NAMES" --arg kind "$k" '
@@ -283,9 +293,13 @@ for k in "${KINDS[@]}"; do
       | (if $e.t=="ADDED" then ["NOWY"] elif $e.t=="DELETED" then ["USUNIETY"]
          elif $p==null then ["?"]
          else ([$e.s | keys[] | select($e.s[.] != $p[.]) | $names[.] // .] | if length==0 then ["nic istotnego (resourceVersion/managedFields)"] else . end) end) as $what
+      # ktore klucze adnotacji/etykiet sie zmienily
+      | ([ ("adnotacje","etykiety") as $f | select($p != null and ($e.s[$f]|type)=="object" and $e.s[$f] != $p[$f])
+           | (($e.s[$f] // {}) as $x | ($p[$f] // {}) as $y | ([$x, $y] | map(keys) | add | unique)[] | select($x[.] != $y[.])) ]) as $ck
       | .prev[$e.key] = $e.s
-      | .out[$e.key] |= ((. // {ns:$e.ns, svc:$e.svc, n:0, what:{}, mgr:{}})
-           | .n += 1 | reduce $what[] as $w (.; .what[$w] += 1) | .mgr[$e.mgr] += 1))
+      | .out[$e.key] |= ((. // {ns:$e.ns, svc:$e.svc, own:$e.own, n:0, what:{}, mgr:{}, ck:{}})
+           | .n += 1 | reduce $what[] as $w (.; .what[$w] += 1) | .mgr[$e.mgr] += 1
+           | reduce $ck[] as $c (.; .ck[$c] += 1)))
     | .out | to_entries | map(.value + {key:.key,
         routed: ($routed[0]["\(.value.ns)/\(.value.svc)"] // false)})' >"$TMP/sum_$k.json"
 done
@@ -293,16 +307,17 @@ done
 show_kind() { # $1=kind $2=tytul $3=czy kolumna ZA_ROUTE
   local k=$1
   sub "$2  (zdarzen: $(jq 'map(.n)|add // 0' "$TMP/sum_$k.json"), obiektow: $(jq length "$TMP/sum_$k.json"))"
-  { printf 'NAMESPACE/NAZWA\tZMIAN\tCO_SIE_ZMIENIA\tKTO_ZMIENIA\t%s\n' "$([[ -n $3 ]] && echo ZA_ROUTE)"
+  { printf 'NAMESPACE/NAZWA\tZMIAN\tCO_SIE_ZMIENIA\tZMIENIANE_KLUCZE\tKTO_ZMIENIA\t%s\n' "$([[ -n $3 ]] && echo ZA_ROUTE || echo WLASCICIEL)"
     jq -r --argjson n "$TOPN" --arg rc "$3" 'sort_by(-.n) | .[:$n][]
       | [.key, (.n|tostring),
          (.what | to_entries | sort_by(-.value) | map("\(.key) x\(.value)") | join(", ")),
+         ((.ck // {}) | to_entries | sort_by(-.value) | .[:3] | map(.key) | join(",") | if .=="" then "-" else . end),
          (.mgr | to_entries | sort_by(-.value) | .[:2] | map(.key) | join("; ")),
-         (if $rc=="" then "" elif .routed then "TAK" else "nie" end)] | @tsv' "$TMP/sum_$k.json"
+         (if $rc=="" then (.own // "-") elif .routed then "TAK" else "nie" end)] | @tsv' "$TMP/sum_$k.json"
   } | table
 }
 show_kind routes "Route" ""
-say "Zmiana spec route = reload. Czesta zmiana samego statusu tej samej route = spor o status (np. dwa IngressControllery/shardy albo stary wpis po usunietym routerze). KTO_ZMIENIA = ostatni wpis managedFields: nazwa kontrolera/narzedzia (np. kontroler GitOps, kubectl, operator)."
+say "Router przetwarza KAZDA zmiane route - takze samych adnotacji i etykiet (adnotacje steruja konfiguracja HAProxy) - wiec spec, adnotacje i etykiety = reload. ZMIENIANE_KLUCZE = ktore adnotacje/etykiety sie zmieniaja. WLASCICIEL Ingress/... = route wygenerowana z obiektu Ingress (zarzadza nia route-controller-manager - zmiany robione recznie na takiej route moga byc przez niego cofane). Czesta zmiana samego statusu tej samej route = spor o status (np. dwa IngressControllery/shardy albo stary wpis po usunietym routerze). KTO_ZMIENIA = ostatni wpis managedFields: nazwa kontrolera/narzedzia (np. kontroler GitOps, kubectl, operator)."
 show_kind endpointslices.discovery.k8s.io "EndpointSlice (pody za serwisami)" yes
 say "PODY = zmienil sie adres lub gotowosc poda za serwisem. Jesli ZA_ROUTE = TAK, to na pewno wymusza reload routera. Zmiany 'etykiety/adnotacje' lub 'nic istotnego' zwykle reloadu nie robia."
 show_kind endpoints "Endpoints (stary API, rownolegle do EndpointSlice)" yes
@@ -311,10 +326,10 @@ show_kind services "Service" yes
 
 # Podsumowanie na namespace: tylko zmiany, ktore realnie dotycza routera
 sub "Namespace'y generujace zmiany istotne dla routera (w ${WATCH}s)"
-{ printf 'NAMESPACE\tROUTE_SPEC\tROUTE_STATUS\tPODY_ZA_ROUTE\tPODY_BEZ_ROUTE\tSERVICE_SPEC\n'
+{ printf 'NAMESPACE\tROUTE_ZMIANY\tROUTE_STATUS\tPODY_ZA_ROUTE\tPODY_BEZ_ROUTE\tSERVICE_SPEC\n'
   jq -rn --slurpfile r "$TMP/sum_routes.json" --slurpfile e "$TMP/sum_endpointslices.discovery.k8s.io.json" \
          --slurpfile s "$TMP/sum_services.json" --argjson n "$TOPN" '
-    ([ $r[0][] | {ns, rs:((.what.spec // 0) + (.what.NOWY // 0) + (.what.USUNIETY // 0)), st:(.what.status // 0)} ]
+    ([ $r[0][] | {ns, rs:((.what.spec // 0) + (.what.adnotacje // 0) + (.what.etykiety // 0) + (.what.NOWY // 0) + (.what.USUNIETY // 0)), st:(.what.status // 0)} ]
      + [ $e[0][] | ((.what["PODY (adresy/gotowosc)"] // 0) + (.what.NOWY // 0) + (.what.USUNIETY // 0)) as $p
          | {ns, pr:(if .routed then $p else 0 end), pn:(if .routed then 0 else $p end)} ]
      + [ $s[0][] | {ns, ss:((.what.spec // 0) + (.what.NOWY // 0) + (.what.USUNIETY // 0))} ])
@@ -323,24 +338,66 @@ sub "Namespace'y generujace zmiany istotne dla routera (w ${WATCH}s)"
     | map(select(.rs+.st+.pr+.ss > 0)) | sort_by(-(.rs*3 + .pr*3 + .ss*3 + .st)) | .[:$n][]
     | [.ns, (.rs|tostring), (.st|tostring), (.pr|tostring), (.pn|tostring), (.ss|tostring)] | @tsv'
 } | table
-say "Kolumny ROUTE_SPEC, PODY_ZA_ROUTE i SERVICE_SPEC to zmiany, ktore wymuszaja reload. Namespace na gorze tej tabeli to najpewniejsze zrodlo reloadow. Zmiany, ktore przychodza czesciej niz reloadInterval, router laczy w jeden reload."
+say "ROUTE_ZMIANY = zmiany spec, adnotacji lub etykiet route (oraz nowe/usuniete). Kolumny ROUTE_ZMIANY, PODY_ZA_ROUTE i SERVICE_SPEC to zmiany, ktore wymuszaja reload. Namespace na gorze tej tabeli to najpewniejsze zrodlo reloadow. Zmiany, ktore przychodza czesciej niz reloadInterval, router laczy w jeden reload."
 
 # Wnioski z obserwacji
-RSPEC=$(jq '[.[] | (.what.spec // 0) + (.what.NOWY // 0) + (.what.USUNIETY // 0)] | add // 0' "$TMP/sum_routes.json")
+RSPEC=$(jq '[.[] | (.what.spec // 0) + (.what.adnotacje // 0) + (.what.etykiety // 0) + (.what.NOWY // 0) + (.what.USUNIETY // 0)] | add // 0' "$TMP/sum_routes.json")
+RNOBJ=$(jq '[.[] | select((.what.spec // 0) + (.what.adnotacje // 0) + (.what.etykiety // 0) > 0)] | length' "$TMP/sum_routes.json")
+RKEYS=$(jq -r '[.[] | (.ck // {}) | to_entries[]] | group_by(.key) | map({k:.[0].key, n:(map(.value)|add)}) | sort_by(-.n) | .[:5] | map("\(.k) (x\(.n))") | join(", ")' "$TMP/sum_routes.json")
+RMGRS=$(jq -r '[.[] | select((.what.spec // 0) + (.what.adnotacje // 0) + (.what.etykiety // 0) > 0) | .mgr | to_entries[]] | group_by(.key) | map({k:.[0].key, n:(map(.value)|add)}) | sort_by(-.n) | .[:4] | map(.k) | join("; ")' "$TMP/sum_routes.json")
+RNS=$(jq -r '[.[] | select((.what.spec // 0) + (.what.adnotacje // 0) + (.what.etykiety // 0) > 0) | .ns] | group_by(.) | map("\(.[0]) (\(length) route)") | join(", ")' "$TMP/sum_routes.json")
+RING=$(jq '[.[] | select(((.what.adnotacje // 0) + (.what.etykiety // 0) > 0) and ((.own // "-")|startswith("Ingress/")))] | length' "$TMP/sum_routes.json")
 RSTAT=$(jq '[.[] | .what.status // 0] | add // 0' "$TMP/sum_routes.json")
 EPR=$(jq '[.[] | select(.routed) | (.what["PODY (adresy/gotowosc)"] // 0) + (.what.NOWY // 0) + (.what.USUNIETY // 0)] | add // 0' "$TMP/sum_endpointslices.discovery.k8s.io.json")
 SSP=$(jq '[.[] | (.what.spec // 0) + (.what.NOWY // 0) + (.what.USUNIETY // 0)] | add // 0' "$TMP/sum_services.json")
 top_of() { jq -r --arg f "$2" 'map(select(.what[$f] != null)) | sort_by(-.what[$f]) | .[:3] | map("\(.key) (x\(.what[$f]), \(.mgr|to_entries|max_by(.value)|.key))") | join("; ")' "$1"; }
-ge "$RSPEC" 2 && finding 1 "W ${WATCH}s zmieniono spec route $RSPEC razy - kazda taka zmiana to reload. Najczesciej: $(top_of "$TMP/sum_routes.json" spec). Sprawdz, kto je zmienia (KTO_ZMIENIA, sekcja 3) - np. narzedzie GitOps walczace z wartosciami domyslnymi route (host, tls, wildcardPolicy) albo dwa narzedzia nadpisujace sie nawzajem."
+ge "$RSPEC" 2 && finding 1 "W ${WATCH}s zmieniono route $RSPEC razy ($RNOBJ roznych route; namespace: $RNS) - kazda zmiana route, takze samej adnotacji/etykiety, to reload. Zmieniane klucze: ${RKEYS:--} (tylko spec, jesli '-'). Kto zmienia (managedFields): ${RMGRS:--}. 'kubectl-annotate' / 'kubectl-label' = ktos wykonuje 'oc/kubectl annotate|label' (skrypt, CronJob, pipeline CI/CD) - znajdz go opcja -a (logi audytu) i zatrzymaj albo spraw, by nie zapisywal w kolko zmieniajacej sie wartosci (np. znacznika czasu)."
+ge "$RING" 1 && finding 2 "$RING ze zmienianych route ma wlasciciela Ingress (route wygenerowane z Ingress). Adnotacje/etykiety trzeba ustawiac na Ingress - route-controller-manager przepisuje route z Ingress, wiec reczne zmiany na route moga byc cofane i ponawiane w petli."
 ge "$RSTAT" 10 && finding 2 "W ${WATCH}s status route zmienil sie $RSTAT razy. Najczesciej: $(top_of "$TMP/sum_routes.json" status). Czeste zmiany statusu tych samych route = spor o status miedzy routerami (shardy z nakladajacymi sie selektorami, stary wpis status.ingress)."
 ge "$EPR" 2 && finding 1 "W ${WATCH}s pody za route zmienily sie $EPR razy (EndpointSlice) - to wymusza reloady. Najczesciej: $(jq -r 'map(select(.routed and (.what["PODY (adresy/gotowosc)"] != null))) | sort_by(-.what["PODY (adresy/gotowosc)"]) | .[:3] | map("\(.key) (x\(.what["PODY (adresy/gotowosc)"]))") | join("; ")' "$TMP/sum_endpointslices.discovery.k8s.io.json"). Sprawdz te aplikacje: restarty, flapujace readinessProbe, autoskalowanie w gore/dol."
 ge "$SSP" 2 && finding 2 "W ${WATCH}s zmieniono spec Service $SSP razy. Najczesciej: $(top_of "$TMP/sum_services.json" spec)."
-if ! ge "$RSPEC" 2 && ! ge "$EPR" 2 && ! ge "$SSP" 2; then
+if ! ge "$RSPEC" 2 && ! ge "$EPR" 2 && ! ge "$SSP" 2 && ! ge "$RSTAT" 10; then
   finding 2 "W ${WATCH}s nie zaobserwowano zmian route/podow/serwisow, ktore tlumacza reloady. Uruchom ponownie z dluzsza obserwacja (-s 300) albo sprawdz sekcje 2 (rodzaje zapisow) i 1b (co sie zmienilo, gdy zaczal sie skok)."
 fi
 for k in "${KINDS[@]}"; do
   [[ -s $TMP/w_$k.err ]] && grep -qiE 'forbidden|error' "$TMP/w_$k.err" && warn "obserwacja $k: $(head -c 200 "$TMP/w_$k.err")"
 done
+
+# =============================================================================
+# 3b. KTO ZAPISUJE ROUTE - LOGI AUDYTU (opcja -a)
+# =============================================================================
+if (( AUDIT )); then
+  hdr "3b. KTO ZAPISUJE ROUTE - LOGI AUDYTU openshift-apiserver (ostatnie ${AUDIT_H}h)"
+  echo "  Czytam logi audytu z masterow (oc adm node-logs) - przy duzych plikach moze to potrwac..." >&2
+  ACUT=$(( $(date +%s) - AUDIT_H * 3600 ))
+  # tylko zapisy do route; prefiks z nazwa wezla (jesli jest) odcinamy do pierwszego '{'
+  oc_ro adm node-logs --role=master --path=openshift-apiserver/audit.log 2>"$TMP/audit.err" \
+    | grep -E '"resource": ?"routes"' | grep -E '"verb": ?"(patch|update|create|delete)"' | sed 's/^[^{]*//' \
+    | jq -Rc --argjson cut "$ACUT" 'fromjson? | select(.stage=="ResponseComplete")
+        | select((.requestReceivedTimestamp // "" | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // 0) >= $cut)
+        | {u:(.user.username // "?"), ua:((.userAgent // "?") | split(" ")[0]), v:.verb,
+           ns:(.objectRef.namespace // "-"), n:(.objectRef.name // "-"), sr:(.objectRef.subresource // ""),
+           c:(.responseStatus.code // 0), t:.requestReceivedTimestamp}' >"$TMP/audit.jsonl"
+  if [[ ! -s $TMP/audit.jsonl ]]; then
+    echo "  (brak wpisow - brak uprawnien do node-logs, inna sciezka logu albo brak zapisow w oknie)"
+    [[ -s $TMP/audit.err ]] && echo "  blad: $(head -c 300 "$TMP/audit.err")"
+  else
+    sub "Kto zapisuje route (uzytkownik / konto serwisowe, program, operacja)"
+    { printf 'KTO\tPROGRAM\tOPERACJA\tNAMESPACE\tZAPISOW\tROZNYCH_ROUTE\tOSTATNIO\n'
+      jq -rs --argjson n "$TOPN" 'map(select(.sr != "status"))
+        | group_by([.u, .ua, .v, .ns]) | map({k:.[0], cnt:length, r:(map(.n)|unique|length), last:(map(.t)|max)})
+        | sort_by(-.cnt) | .[:$n][] | [.k.u, .k.ua, .k.v, .k.ns, (.cnt|tostring), (.r|tostring), .last] | @tsv' "$TMP/audit.jsonl"
+    } | table
+    say "KTO = uzytkownik albo konto serwisowe (system:serviceaccount:NAMESPACE:NAZWA - wtedy szukaj poda/CronJoba/pipeline'u z tym kontem w tym namespace). PROGRAM = User-Agent (np. kubectl/oc z wersja, nazwa kontrolera). Zapisy statusu (route/status) pominieto."
+    sub "Zapisy statusu route (route/status)"
+    { printf 'KTO\tPROGRAM\tZAPISOW\tROZNYCH_ROUTE\n'
+      jq -rs --argjson n "$TOPN" 'map(select(.sr == "status")) | group_by([.u, .ua]) | map({k:.[0], cnt:length, r:(map("\(.ns)/\(.n)")|unique|length)})
+        | sort_by(-.cnt) | .[:$n][] | [.k.u, .k.ua, (.cnt|tostring), (.r|tostring)] | @tsv' "$TMP/audit.jsonl"
+    } | table
+    TOPW=$(jq -rs 'map(select(.sr != "status")) | group_by([.u, .ua]) | map({k:.[0], cnt:length}) | sort_by(-.cnt) | .[0] | select(.!=null) | "\(.k.u) (program: \(.k.ua), \(.cnt) zapisow)"' "$TMP/audit.jsonl")
+    [[ -n $TOPW ]] && finding 1 "Najwiecej zapisow route w ostatnich ${AUDIT_H}h wykonuje: $TOPW - to najpewniej zrodlo reloadow (sekcja 3b)."
+  fi
+fi
 
 # =============================================================================
 # 4. KONFIGURACJA ROUTEROW ZWIAZANA Z RELOADAMI
