@@ -33,7 +33,7 @@
 set -uo pipefail
 export LC_ALL=C
 
-HOURS=24; RDAYS=7; LOGL=100; NODELOGS=1; MAXNODES=6; TLMAX=120
+HOURS=24; RDAYS=7; LOGL=100; NODELOGS=1; MAXNODES=6; TLMAX=120; HTML=""
 CURL_K=""; OC_K=()
 
 usage() { cat <<EOF
@@ -48,12 +48,15 @@ Uzycie: $0 [opcje] <namespace> <workload>
   -l LINIE     ile ostatnich linii logow pokazywac        (domyslnie: $LOGL, 0 = bez logow aplikacji)
   -m N         maks. liczba workerow, z ktorych czytac journal (domyslnie: $MAXNODES)
   -N           nie czytaj logow workerow (oc adm node-logs)
+  -o PLIK.html dodatkowo zapisz raport HTML (wykresy pamieci/CPU/restartow z OOM
+               i wdrozeniami na osi czasu, wnioski, rekomendacje, pelny raport)
   -k, --insecure
                nie weryfikuj certyfikatow TLS (oc + thanos-querier)
 
 Przyklady:
   $0 moja-aplikacja deploy/backend
   $0 -k -H 48 moja-aplikacja sts/baza | tee audyt-\$(date +%F_%H%M).txt
+  $0 -H 72 -o audyt-\$(date +%F_%H%M).html moja-aplikacja deploy/backend
 EOF
 exit "${1:-0}"; }
 
@@ -64,6 +67,8 @@ while (( $# )); do case $1 in
   -D) RDAYS=${2:-}; shift 2 || usage 1;;
   -m) MAXNODES=${2:-}; shift 2 || usage 1;;
   -N) NODELOGS=0; shift;;
+  -o|--html) HTML=${2:-}; shift 2 || usage 1;;
+  --html=*) HTML=${1#--html=}; shift;;
   -k|--insecure|--insecure-skip-tls-verify|--insecure-skip-tls-verify=true)
       CURL_K="-k"; OC_K=(--insecure-skip-tls-verify=true); shift;;
   -h|--help) usage 0;;
@@ -97,6 +102,11 @@ for c in oc jq curl column awk timeout; do command -v "$c" >/dev/null || die "br
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 : >"$TMP/findings"; : >"$TMP/tl.tsv"
+if [[ -n $HTML ]]; then
+  : >"$HTML" 2>/dev/null || die "nie moge zapisac pliku $HTML"
+  # kopia calego raportu tekstowego do osadzenia w HTML
+  exec 3>&1 > >(tee "$TMP/report.txt" >&3); TEE_PID=$!
+fi
 # finding POZIOM STRONA TEKST   (POZIOM: KRYT|OSTR|INFO|OK, STRONA: APLIKACJA|PLATFORMA|KONFIG|-)
 finding() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$TMP/findings"; }
 # tl EPOCH ZRODLO OPIS - wpis na osi czasu
@@ -1007,6 +1017,7 @@ done
 
 sub "NAJBARDZIEJ PRAWDOPODOBNA PRZYCZYNA RESTARTOW"
 if (( RST == 0 && $(fn RST_API) == 0 )); then
+  CAUSE_T="Restartow nie bylo"; CAUSE_W="Jesli aplikacja zle dziala, sprawdz zuzycie (sekcja 4) i eventy (sekcja 6)."
   say "Restartow nie bylo. Jesli aplikacja zle dziala, sprawdz sekcje 4 (zuzycie) i 6 (eventy)."
 else
   best="nieustalona"; why=""
@@ -1017,8 +1028,10 @@ else
   (( sc_err  > max )) && { max=$sc_err;  best="PROCES APLIKACJI KONCZY SIE BLEDEM - strona APLIKACJI"; why="Kontener sam sie zamyka z kodem bledu. Dzialanie: logi poprzedniej instancji (sekcja 8) - wyjatek, brak zaleznosci, konfiguracja."; }
   (( sc_node > max )) && { max=$sc_node; best="PROBLEM WORKERA (brak pamieci wezla / reboot / NotReady / ewikcja) - strona PLATFORMY"; why="Pody gina z powodu stanu workera, nie aplikacji. Dzialanie: sekcja 5 i 7 - pamiec i rezerwacje workera, requesty podow na nim, przyczyna rebootu/NotReady."; }
   if (( max == 0 )); then
+    CAUSE_T="Przyczyna nieustalona"; CAUSE_W="Za malo sladow w metrykach i eventach - uruchom z dostepem do logow workerow (bez -N) albo zaraz po kolejnym restarcie."
     say "Nie udalo sie jednoznacznie ustalic przyczyny na podstawie metryk i eventow (eventy znikaja po ok. 3h, API pamieta tylko ostatnie zakonczenie). Uruchom skrypt z uprawnieniami do logow workerow (bez -N) i/lub zaraz po kolejnym restarcie."
   else
+    CAUSE_T=$best; CAUSE_W=$why
     say "$best"; say "$why"
     echo
     say "Wagi dowodow: OOM=$sc_oom, probe=$sc_liv, blad aplikacji=$sc_err, worker=$sc_node (im wiecej, tym wiecej niezaleznych sladow)."
@@ -1026,3 +1039,380 @@ else
 fi
 echo
 echo "Koniec audytu. Nic nie zostalo zmienione w klastrze."
+
+# =============================================================================
+# RAPORT HTML (opcja -o)
+# =============================================================================
+[[ -n $HTML ]] || exit 0
+exec 1>&3 3>&-; wait "$TEE_PID" 2>/dev/null     # domkniecie kopii raportu tekstowego
+echo "Raport HTML: pobieram przebiegi z ${HOURS}h..." >&2
+
+# krok wykresow: ok. 720 punktow w oknie, kazdy punkt = MAKSIMUM z kroku
+CST=$(( HOURS * 3600 / 720 / 60 * 60 )); (( CST < 60 )) && CST=60
+: >"$TMP/charts.jsonl"
+# hchart ID JEDNOSTKA KROK_S TYTUL OPIS ZAPYTANIE
+hchart() {
+  local id=$1 unit=$2 st=$3 title=$4 desc=$5 q=$6
+  prom query_range "$TMP/h_$id.json" "query=$q" "start=$(( T0 / st * st ))" "end=$NOW" "step=$st" || true
+  jq -c --arg id "$id" --arg unit "$unit" --argjson st "$st" --arg title "$title" --arg desc "$desc" "$JQDEF"'
+    { id: $id, unit: $unit, stepS: $st, title: $title, desc: $desc,
+      series: ([.data.result[]
+                | {name: (.metric.pod // .metric.instance // .metric.node // $title),
+                   pts: [.values[] | [(.[0] | floor), (.[1] | num)] | select(.[1] | type == "number")]}
+                | select(.pts | length > 0) | . + {peak: ([.pts[][1]] | max)}]
+               | (map(select(.name | startswith("LIMIT")))) as $lim
+               | (map(select(.name | startswith("LIMIT") | not)) | sort_by(-.peak)) as $s
+               | (if ($s | length) > 7 then $s[:6] + [{name: "pozostale \(($s | length) - 6) (max z nich)",
+                     pts: ([$s[6:][].pts[]] | group_by(.[0]) | map([.[0][0], ([.[][1]] | max)]))} | . + {peak: ([.pts[][1]] | max)}]
+                  else $s end) + $lim) }' "$TMP/h_$id.json" >>"$TMP/charts.jsonl" 2>/dev/null || true
+}
+LIMQ() { printf 'label_replace(max(sum by (namespace, pod) (kube_pod_container_resource_limits{namespace="%s",resource="%s"}) %s), "pod", "LIMIT (na pod)", "", "")' "$NS" "$1" "$(J "$OWNI")"; }
+hchart mem bytes "$CST" "Pamiec podow (working set)" \
+  "Suma pamieci kontenerow poda; kazdy punkt to maksimum z kroku. Przerywana linia = limit pamieci poda. Gdy linia poda dochodzi do limitu i znika/spada - OOMKilled." \
+  "sum by (pod) (max_over_time(container_memory_working_set_bytes{$CSEL}[${CST}s]) $(J "$OWNI")) or $(LIMQ memory)"
+hchart cpu cores "$CST" "CPU podow (rdzenie)" \
+  "Zuzycie CPU poda (rate 5m, maksimum z kroku). Przerywana linia = limit CPU poda - przy niej kontener jest dlawiony (throttling)." \
+  "max_over_time((sum by (pod) (rate(container_cpu_usage_seconds_total{$CSEL}[5m]) $(J "$OWNI")))[${CST}s:1m]) or $(LIMQ cpu)"
+hchart thr pct "$CST" "Throttling CPU (% okresow zdlawionych)" \
+  "Jaka czesc okresow CPU kontener czekal, bo wyczerpal limit. Powyzej ~25% aplikacja zwalnia, probe moga nie dostac odpowiedzi." \
+  "max_over_time((max by (pod) (rate(container_cpu_cfs_throttled_periods_total{$CSEL}[5m]) / rate(container_cpu_cfs_periods_total{$CSEL}[5m]) $(J "$OWNI")))[${CST}s:1m]) * 100"
+hchart rst int "$HS" "Restarty kontenerow (na ${HSH}h)" \
+  "Ile razy kontenery poda zostaly uruchomione ponownie w kazdym kroku." \
+  "sum by (pod) (increase(kube_pod_container_status_restarts_total{namespace=\"$NS\"}[${HS}s]) $(J "$OWNI"))"
+if (( NNODES > 0 )); then
+  hchart node pct "$CST" "Pamiec workerow, na ktorych dzialala aplikacja (%)" \
+    "100% minus najnizsza MemAvailable w kroku. Gdy worker dochodzi do ~100%, kernel zabija procesy (OOM wezla) a kubelet ewakuuje pody." \
+    "100 * (1 - min_over_time(node_memory_MemAvailable_bytes{$NI}[${CST}s]) / max_over_time(node_memory_MemTotal_bytes{$NI}[${CST}s]))"
+fi
+
+# zakonczenia kontenerow, OOM, wdrozenia, skalowania, problemy workerow -> znaczniki na wykresach
+awk -F'\t' '$2 ~ /^(KONTENER|KERNEL|WDROZENIE|SKALOWANIE|WORKER|CORDON)$/' "$TMP/tls.tsv" >"$TMP/marks.tsv"
+jq -nc \
+  --arg server "$(oc_ro whoami --show-server 2>/dev/null)" --arg gen "$(date '+%F %T %Z')" \
+  --arg ns "$NS" --arg wl "$KIND/$NAME" --argjson hours "$HOURS" --argjson t0 "$T0" --argjson t1 "$NOW" --argjson rdays "$RDAYS" \
+  --arg rst "$RST" --arg oom "$OOMN" --arg liv "$LIVK" --arg mempct "$(fv MEM_PCT)" --arg memk "$(fv MEM_PCT_K)" \
+  --arg thr "$(fv THR_MAX)" --arg npods "$NPODS" --arg nnodes "$NNODES" \
+  --arg ct "${CAUSE_T:-}" --arg cw "${CAUSE_W:-}" \
+  --rawfile fnd "$TMP/findings" --rawfile tl "$TMP/tls.tsv" --rawfile mk "$TMP/marks.tsv" --rawfile report "$TMP/report.txt" \
+  --slurpfile charts "$TMP/charts.jsonl" --slurpfile rec "$TMP/rec.json" "$JQDEF"'
+  def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
+  { meta: {server: $server, generated: $gen, ns: $ns, wl: $wl, hours: $hours, start: $t0, end: $t1, rdays: $rdays},
+    tiles: {rst: $rst, oom: $oom, liv: $liv, mempct: $mempct, memk: $memk, thr: $thr, npods: $npods, nnodes: $nnodes},
+    cause: {t: $ct, w: $cw},
+    findings: [rows($fnd)[] | {l: .[0], s: .[1], t: .[2]}],
+    marks: [rows($mk)[] | {t: (.[0] | tonumber), s: .[1], m: .[2]}],
+    timeline: [rows($tl)[] | {t: (.[0] | tonumber), s: .[1], m: .[2]}] | .[-300:],
+    rec: (($rec[0] // {c: []}) | .days as $d | {days: ($d * 10 | round / 10), rows: [.c[] |
+           [.n, (.p95 | fb), (.max | fb), (.oom | tostring), (.rq | fb), (.rreq | fb), (.lm | fb), (.rlim | fb),
+            (.cp95 | fc), (.crq | fc), (.rcreq | fc), (.clm | fc), .rclim, .conf]]}),
+    charts: $charts, report: $report }' | sed 's#</#<\\/#g' >"$TMP/data.json"
+[[ -s $TMP/data.json ]] || die "nie udalo sie zlozyc danych do raportu HTML"
+
+html_template() { cat <<'HTMLEOF'
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audyt workloadu</title>
+<style>
+:root {
+  color-scheme: light;
+  --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,0.10);
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#008300; --s7:#6250d6;
+  --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#0ca30c; --s7:#9085e9;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+  --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#0ca30c; --s7:#9085e9;
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--page); color:var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 1240px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 22px; margin: 0 0 4px; overflow-wrap:anywhere; }
+h2 { font-size: 16px; margin: 0 0 2px; }
+.meta { color: var(--ink2); font-size: 13px; }
+.meta code { font-size: 12px; overflow-wrap:anywhere; }
+.tiles { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:12px; margin:20px 0; }
+.tile, .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; }
+.tile { padding:14px 16px; }
+.tile .lbl { color:var(--ink2); font-size:12px; }
+.tile .val { font-size:26px; font-weight:650; font-variant-numeric: tabular-nums; margin:2px 0; }
+.tile .sub { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+.card { padding:16px; margin:0 0 16px; min-width:0; }
+.card .desc { color:var(--ink2); font-size:13px; margin:0 0 10px; max-width:90ch; }
+.cause { border-left:4px solid var(--critical); }
+.cause.ok { border-left-color: var(--good); }
+.cause .t { font-size:17px; font-weight:650; margin:4px 0; }
+.cause .w { color:var(--ink2); max-width:110ch; }
+.findings { list-style:none; padding:0; margin:0; }
+.findings li { display:flex; gap:10px; padding:8px 0; border-top:1px solid var(--grid); }
+.findings li:first-child { border-top:0; }
+.badge { flex:none; display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:650;
+  padding:2px 8px; border-radius:999px; height:20px; margin-top:1px; color:#0b0b0b; white-space:nowrap; }
+.badge.KRYT { background:var(--critical); color:#fff; } .badge.OSTR { background:var(--warning); }
+.badge.INFO { background:var(--grid); color:var(--ink); } .badge.OK { background:var(--good); color:#fff; }
+.side { color:var(--muted); font-size:12px; margin-right:4px; }
+.legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin:0 0 6px; }
+.legend button { all:unset; cursor:pointer; display:inline-flex; align-items:center; gap:6px; font-size:12px;
+  color:var(--ink2); padding:2px 0; overflow-wrap:anywhere; }
+.legend button[aria-pressed="false"] { opacity:.4; text-decoration: line-through; }
+.legend button:focus-visible { outline:2px solid var(--s1); outline-offset:2px; border-radius:3px; }
+.legend .mk { color:var(--muted); font-size:12px; display:inline-flex; align-items:center; gap:6px; }
+.key { width:14px; height:0; border-top:2px solid; border-radius:2px; flex:none; }
+.key.dash { border-top-style:dashed; }
+.plot { position:relative; }
+.plot svg { display:block; width:100%; overflow:visible; }
+.plot svg text { fill: var(--muted); font-size:11px; font-variant-numeric: tabular-nums; }
+.plot svg .peak-label { fill: var(--ink); font-weight:600; }
+.tip { position:absolute; pointer-events:none; background:var(--surface); border:1px solid var(--border);
+  border-radius:8px; padding:8px 10px; font-size:12px; box-shadow:0 4px 16px rgba(0,0,0,.12);
+  min-width:180px; max-width:380px; display:none; z-index:2; }
+.tip .t { color:var(--ink2); margin-bottom:4px; }
+.tip .row { display:flex; align-items:center; gap:8px; }
+.tip .row b { font-variant-numeric: tabular-nums; min-width:72px; }
+.tip .row span:last-child { color:var(--ink2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tip .ev { color:var(--ink); border-top:1px solid var(--grid); margin-top:4px; padding-top:4px; white-space:normal; }
+.empty { color:var(--muted); padding:24px 0; }
+details { margin-top:10px; }
+summary { cursor:pointer; color:var(--ink2); font-size:13px; }
+.tbl { overflow-x:auto; }
+table { border-collapse:collapse; font-size:12px; margin-top:8px; width:100%; }
+th, td { text-align:left; padding:4px 10px 4px 0; border-bottom:1px solid var(--grid); white-space:nowrap; }
+td.wrap { white-space:normal; min-width:300px; }
+td.n, th.n { text-align:right; font-variant-numeric: tabular-nums; }
+tr.oom td:first-child { box-shadow: inset 3px 0 0 var(--critical); padding-left:8px; }
+#charts { display:grid; grid-template-columns: 1fr 1fr; gap:0 16px; }
+#charts > .card { grid-column: 1 / -1; }
+#charts > .card.half { grid-column: auto; }
+@media (max-width: 760px) { #charts { grid-template-columns: 1fr; } #charts > .card.half { grid-column: 1 / -1; } }
+pre.report { background:var(--page); border:1px solid var(--border); border-radius:8px; padding:12px;
+  overflow:auto; font-size:12px; line-height:1.35; max-height:80vh; margin:8px 0 0; }
+.sec summary { font-size:14px; color:var(--ink); font-weight:600; }
+.note { color:var(--ink2); font-size:12px; margin:8px 0 0; max-width:110ch; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="h1">Audyt workloadu</h1>
+  <div class="meta" id="meta"></div>
+  <section class="tiles" id="tiles"></section>
+  <section class="card cause" id="cause"></section>
+  <section class="card"><h2>Przyczyny, problemy i wnioski</h2><ul class="findings" id="findings"></ul></section>
+  <div id="charts"></div>
+  <section class="card" id="rec"></section>
+  <section class="card"><h2>Os czasu</h2><p class="desc">Wszystkie zrodla chronologicznie (pody, zakonczenia kontenerow, kubelet, kernel, eventy, wdrozenia).</p>
+    <details><summary>Pokaz wpisy</summary><div class="tbl"><table id="tl"></table></div></details></section>
+  <section class="card"><h2>Pelny raport tekstowy</h2><p class="desc">To samo, co skrypt wypisal w terminalu, podzielone na sekcje.</p><div id="report"></div></section>
+</main>
+<script id="data" type="application/json">
+__DATA__
+</script>
+<script>
+(function () {
+  const D = JSON.parse(document.getElementById('data').textContent);
+  const M = D.meta;
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const svgEl = (tag, attrs) => { const e = document.createElementNS('http://www.w3.org/2000/svg', tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+  const pad = n => String(n).padStart(2, '0');
+  const fday = t => { const d = new Date(t * 1000); return pad(d.getDate()) + '.' + pad(d.getMonth() + 1); };
+  const fhm = t => { const d = new Date(t * 1000); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+  const fdt = t => fday(t) + ' ' + fhm(t);
+  function fmt(v, u) {
+    if (v == null || isNaN(v)) return '-';
+    if (v === 0) return '0';
+    if (u === 'pct') return v.toFixed(v >= 10 ? 0 : 1) + '%';
+    if (u === 'cores') return v >= 1 ? v.toFixed(2) : Math.round(v * 1000) + 'm';
+    if (u === 'bytes') { const a = Math.abs(v);
+      if (a >= 1073741824) return (v / 1073741824).toFixed(2) + ' GiB';
+      if (a >= 1048576) return (v / 1048576).toFixed(0) + ' MiB';
+      return (v / 1024).toFixed(0) + ' KiB'; }
+    return String(Math.round(v * 10) / 10);
+  }
+  function niceMax(v, u) {
+    if (u === 'pct' && v <= 100) return 100;
+    if (!(v > 0)) return u === 'int' ? 4 : 1;
+    if (u === 'int' && v <= 4) return 4;
+    if (u === 'bytes') { const g = 1073741824, mi = 1048576; const base = v >= g ? g : mi;
+      const s = [1, 2, 4, 5, 8, 10, 16, 20, 25, 32, 40, 50, 64, 80, 100, 128, 160, 200, 256, 320, 400, 512, 640, 768, 1024];
+      for (const x of s) if (x * base >= v * 1.05) return x * base; }
+    const e = Math.pow(10, Math.floor(Math.log10(v * 1.05))); const f = v * 1.05 / e;
+    return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * e;
+  }
+
+  // --- naglowek ---
+  document.getElementById('h1').textContent = 'Audyt workloadu ' + M.wl;
+  document.title = 'Audyt ' + M.wl;
+  const meta = document.getElementById('meta');
+  meta.append('Namespace ', el('code', null, M.ns), ' \u00b7 klaster ', el('code', null, M.server),
+    ' \u00b7 okno ' + M.hours + 'h (' + fdt(M.start) + ' \u2013 ' + fdt(M.end) + ') \u00b7 wygenerowano ' + M.generated + ' \u00b7 tylko odczyt, nic nie zmieniono w klastrze.');
+
+  // --- kafelki ---
+  const T = D.tiles, tiles = document.getElementById('tiles');
+  [['Restarty w oknie', T.rst || '0', 'kontenerow, ' + M.hours + 'h'],
+   ['OOMKilled', T.oom || '0', 'przekroczony limit pamieci'],
+   ['Zabicia po probe', T.liv || '0', 'liveness / startup'],
+   ['Maks. pamieci', T.mempct ? T.mempct + '%' : '-', T.mempct ? 'limitu \u00b7 ' + T.memk : 'brak limitu lub danych'],
+   ['Maks. throttling CPU', T.thr ? T.thr + '%' : '-', 'okresow zdlawionych przez limit'],
+   ['Pody / workery', (T.npods || '0') + ' / ' + (T.nnodes || '0'), 'w oknie (takze usuniete)']]
+  .forEach(([l, v, s]) => { const t = el('div', 'tile'); t.append(el('div', 'lbl', l), el('div', 'val', v), el('div', 'sub', s)); tiles.append(t); });
+
+  // --- najbardziej prawdopodobna przyczyna ---
+  const cs = document.getElementById('cause');
+  if ((T.rst || '0') === '0') cs.classList.add('ok');
+  cs.append(el('h2', null, 'Najbardziej prawdopodobna przyczyna restartow'), el('div', 't', D.cause.t || '-'), el('div', 'w', D.cause.w || ''));
+
+  // --- wnioski ---
+  const fl = document.getElementById('findings');
+  const lvn = { KRYT: 'KRYTYCZNE', OSTR: 'UWAGA', INFO: 'INFO', OK: 'OK' }, ord = { KRYT: 0, OSTR: 1, INFO: 2, OK: 3 };
+  if (!D.findings.length) fl.append(el('li', null, 'Nie wykryto niczego niepokojacego.'));
+  D.findings.slice().sort((a, b) => (ord[a.l] ?? 9) - (ord[b.l] ?? 9)).forEach(f => {
+    const li = el('li'), tx = el('span');
+    if (f.s && f.s !== '-') tx.append(el('span', 'side', f.s));
+    tx.append(f.t); li.append(el('span', 'badge ' + f.l, lvn[f.l] || f.l), tx); fl.append(li); });
+
+  // --- znaczniki zdarzen ---
+  const mkKind = m => /OOM|oom/.test(m.m) ? 'oom' : m.s === 'KONTENER' ? 'kill' : m.s === 'KERNEL' ? 'oom' : 'chg';
+  const mkStyle = { oom: ['var(--critical)', 'OOM'], kill: ['var(--serious)', 'zakonczenie kontenera'], chg: ['var(--ink2)', 'wdrozenie / skalowanie / worker'] };
+  const marks = D.marks.filter(m => m.t >= M.start && m.t <= M.end).map(m => Object.assign(m, { k: mkKind(m) }));
+
+  // --- wykresy ---
+  const host = document.getElementById('charts');
+  const charts = [];
+  for (const c of D.charts) {
+    const card = el('section', 'card' + (c.id === 'thr' || c.id === 'rst' ? ' half' : ''));
+    card.append(el('h2', null, c.title), el('p', 'desc', c.desc)); host.append(card);
+    if (!c.series.length) { card.append(el('div', 'empty', 'Brak danych w Prometheusie dla tego zapytania.')); continue; }
+    let ci = 0;
+    c.series.forEach(s => { s.lim = s.name.startsWith('LIMIT'); s.color = s.lim ? 'var(--ink2)' : 'var(--s' + (++ci) + ')'; s.on = true;
+      s.map = new Map(s.pts.map(p => [p[0], p[1]])); });
+    const lg = el('div', 'legend');
+    if (c.series.length > 1) c.series.forEach(s => { const b = el('button'); b.type = 'button'; b.setAttribute('aria-pressed', 'true');
+      const k = el('span', 'key' + (s.lim ? ' dash' : '')); k.style.borderTopColor = s.color;
+      b.append(k, el('span', null, s.name + ' \u00b7 max ' + fmt(s.peak, c.unit))); b.title = 'Pokaz/ukryj serie';
+      b.onclick = () => { s.on = !s.on; b.setAttribute('aria-pressed', String(s.on)); draw(c); }; lg.append(b); });
+    const kinds = [...new Set(marks.map(m => m.k))];
+    kinds.forEach(k => { const x = el('span', 'mk'); const kk = el('span', 'key dash'); kk.style.borderTopColor = mkStyle[k][0]; x.append(kk, mkStyle[k][1]); lg.append(x); });
+    if (lg.childNodes.length) card.append(lg);
+    const plot = el('div', 'plot'); card.append(plot); c.plot = plot;
+    const det = el('details'); det.append(el('summary', null, 'Tabela: maksimum, kiedy, ostatnia wartosc'));
+    const wrap = el('div', 'tbl'), tb = el('table'), hr = el('tr');
+    [['Seria', ''], ['Maksimum', 'n'], ['Kiedy', ''], ['Srednia', 'n'], ['Ostatnia', 'n']].forEach(([h, k]) => hr.append(el('th', k, h)));
+    tb.append(hr);
+    for (const s of c.series) { const tr = el('tr'); let pk = s.pts[0], sum = 0;
+      for (const p of s.pts) { if (p[1] > pk[1]) pk = p; sum += p[1]; }
+      tr.append(el('td', null, s.name), el('td', 'n', fmt(pk[1], c.unit)), el('td', null, fdt(pk[0])),
+        el('td', 'n', fmt(sum / s.pts.length, c.unit)), el('td', 'n', fmt(s.pts[s.pts.length - 1][1], c.unit)));
+      tb.append(tr); }
+    wrap.append(tb); det.append(wrap); card.append(det);
+    charts.push(c);
+  }
+
+  function draw(c) {
+    const plot = c.plot; plot.textContent = '';
+    const half = plot.parentNode.classList.contains('half');
+    const W = Math.max(300, plot.clientWidth), H = W < 600 || half ? 220 : 280;
+    const m = { l: 62, r: 14, t: 22, b: 26 }, iw = W - m.l - m.r, ih = H - m.t - m.b;
+    const vis = c.series.filter(s => s.on);
+    const vmax = niceMax(Math.max(0, ...vis.map(s => s.peak)), c.unit);
+    const X = t => m.l + (t - M.start) / (M.end - M.start) * iw;
+    const Y = v => m.t + ih - Math.min(Math.max(v, 0), vmax) / vmax * ih;
+    const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, height: H, role: 'img', 'aria-label': c.title });
+    for (let i = 0; i <= 4; i++) { const v = vmax * i / 4, y = Y(v);
+      svg.append(svgEl('line', { x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: i ? 'var(--grid)' : 'var(--axis)', 'stroke-width': 1 }));
+      const tx = svgEl('text', { x: m.l - 8, y: y + 4, 'text-anchor': 'end' }); tx.textContent = fmt(v, c.unit); svg.append(tx); }
+    // os X: pelne godziny co 1/2/3/6/12/24h zaleznie od szerokosci
+    const span = (M.end - M.start) / 3600, maxTicks = Math.max(3, Math.floor(iw / 80));
+    const hstep = [1, 2, 3, 6, 12, 24, 48].find(h => span / h <= maxTicks) || 72;
+    const d0 = new Date(M.start * 1000); d0.setMinutes(0, 0, 0);
+    for (let t = d0.getTime() / 1000 + 3600; t < M.end; t += 3600) {
+      const hr = new Date(t * 1000).getHours(); if (hr % hstep) continue;
+      const x = X(t); svg.append(svgEl('line', { x1: x, x2: x, y1: m.t, y2: m.t + ih, stroke: 'var(--grid)', 'stroke-width': 1, 'stroke-dasharray': '2 3' }));
+      const tx = svgEl('text', { x: x, y: H - 6, 'text-anchor': 'middle' }); tx.textContent = hr === 0 || hstep >= 24 ? fday(t) : fhm(t); svg.append(tx); }
+    // znaczniki zdarzen
+    for (const mk of marks) { const x = X(mk.t);
+      svg.append(svgEl('line', { x1: x, x2: x, y1: m.t, y2: m.t + ih, stroke: mkStyle[mk.k][0], 'stroke-width': mk.k === 'chg' ? 1 : 1.5, 'stroke-dasharray': '4 3', opacity: mk.k === 'chg' ? .6 : .9 })); }
+    // linie
+    const gap = c.stepS * 1.5;
+    for (const s of vis) { let d = '', prev = null;
+      for (const p of s.pts) { d += (prev === null || p[0] - prev > gap ? 'M' : 'L') + X(p[0]).toFixed(1) + ' ' + Y(p[1]).toFixed(1); prev = p[0]; }
+      svg.append(svgEl('path', { d: d, fill: 'none', stroke: s.color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round', 'stroke-dasharray': s.lim ? '6 4' : 'none' })); }
+    let pk = null; for (const s of vis) if (!s.lim) for (const p of s.pts) if (!pk || p[1] > pk.v) pk = { t: p[0], v: p[1], s: s };
+    if (pk) { const x = X(pk.t), y = Y(pk.v);
+      svg.append(svgEl('circle', { cx: x, cy: y, r: 4.5, fill: pk.s.color, stroke: 'var(--surface)', 'stroke-width': 2 }));
+      const tx = svgEl('text', { x: Math.min(Math.max(x, m.l + 60), W - m.r - 60), y: Math.max(y - 9, 12), 'text-anchor': 'middle', class: 'peak-label' });
+      tx.textContent = 'max ' + fmt(pk.v, c.unit) + ' \u00b7 ' + fdt(pk.t); svg.append(tx); }
+    const cross = svgEl('line', { y1: m.t, y2: m.t + ih, stroke: 'var(--muted)', 'stroke-width': 1, visibility: 'hidden' });
+    const dots = svgEl('g', {}); svg.append(cross, dots);
+    const hit = svgEl('rect', { x: m.l, y: 0, width: iw, height: H, fill: 'transparent' }); svg.append(hit);
+    const tip = el('div', 'tip'); plot.append(svg, tip);
+    const hide = () => { cross.setAttribute('visibility', 'hidden'); dots.textContent = ''; tip.style.display = 'none'; };
+    hit.addEventListener('pointerleave', hide);
+    hit.addEventListener('pointermove', ev => {
+      const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * W / r.width;
+      const traw = M.start + (px - m.l) / iw * (M.end - M.start);
+      const t0 = Math.floor(M.start / c.stepS) * c.stepS, t = t0 + Math.round((traw - t0) / c.stepS) * c.stepS;
+      if (traw < M.start || traw > M.end) return hide();
+      const x = X(t); cross.setAttribute('x1', x); cross.setAttribute('x2', x); cross.setAttribute('visibility', 'visible');
+      dots.textContent = '';
+      const rows = vis.map(s => ({ s: s, v: s.map.get(t) })).filter(o => o.v != null).sort((a, b) => b.v - a.v);
+      for (const o of rows) dots.append(svgEl('circle', { cx: x, cy: Y(o.v), r: 4, fill: o.s.color, stroke: 'var(--surface)', 'stroke-width': 2 }));
+      tip.textContent = ''; tip.append(el('div', 't', fdt(t)));
+      if (!rows.length) tip.append(el('div', null, 'brak danych'));
+      for (const o of rows) { const row = el('div', 'row'); const k = el('span', 'key' + (o.s.lim ? ' dash' : '')); k.style.borderTopColor = o.s.color;
+        row.append(k, el('b', null, fmt(o.v, c.unit)), el('span', null, o.s.name)); tip.append(row); }
+      const tol = Math.max(c.stepS, (M.end - M.start) / iw * 6);
+      marks.filter(mk => Math.abs(mk.t - traw) <= tol).slice(0, 4).forEach(mk => tip.append(el('div', 'ev', fhm(mk.t) + ' ' + mk.s + ': ' + mk.m.slice(0, 160))));
+      tip.style.display = 'block';
+      const pw = plot.clientWidth, tw = tip.offsetWidth, sx = x * r.width / W;
+      tip.style.left = (sx + 14 + tw > pw ? Math.max(0, sx - 14 - tw) : sx + 14) + 'px'; tip.style.top = '8px';
+    });
+  }
+  const redraw = () => charts.forEach(draw);
+  redraw();
+  let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(redraw, 150); });
+
+  // --- rekomendacja zasobow ---
+  const rc = document.getElementById('rec');
+  rc.append(el('h2', null, 'Ile pamieci i CPU aplikacja potrzebuje (na pod)'),
+    el('p', 'desc', 'Z ostatnich ' + D.rec.days + ' dni (zadano ' + M.rdays + '). Request pamieci = p95 x 1.2; limit = maks. x 1.2, po OOM co najmniej obecny limit +50% (szczyt byl uciety), dla JVM co najmniej -Xmx/0.7. CPU request = p95. To propozycja - nic nie zostalo wdrozone.'));
+  if (!D.rec.rows.length) rc.append(el('div', 'empty', 'brak danych'));
+  else { const w = el('div', 'tbl'), t = el('table'), h = el('tr');
+    const H = [['Kontener', ''], ['Pam. p95', 'n'], ['Pam. maks.', 'n'], ['OOM', 'n'], ['Request', 'n'], ['\u2192 zalecany', 'n'], ['Limit', 'n'], ['\u2192 zalecany', 'n'],
+               ['CPU p95', 'n'], ['CPU request', 'n'], ['\u2192 zalecany', 'n'], ['CPU limit', 'n'], ['\u2192 zalecany', 'n'], ['Pewnosc', '']];
+    H.forEach(([x, k]) => h.append(el('th', k, x))); t.append(h);
+    for (const r of D.rec.rows) { const tr = el('tr'); if (r[3] !== '0') tr.className = 'oom';
+      r.forEach((v, i) => { const td = el('td', H[i][1], v); if ([5, 7, 10, 12].includes(i)) td.style.fontWeight = '650'; tr.append(td); }); t.append(tr); }
+    w.append(t); rc.append(w); }
+
+  // --- os czasu ---
+  const tl = document.getElementById('tl'), th = el('tr');
+  ['Kiedy', 'Zrodlo', 'Co'].forEach(x => th.append(el('th', null, x))); tl.append(th);
+  for (const e of D.timeline) { const tr = el('tr'); tr.append(el('td', null, fdt(e.t)), el('td', null, e.s), el('td', 'wrap', e.m)); tl.append(tr); }
+
+  // --- raport tekstowy w sekcjach ---
+  const rp = document.getElementById('report');
+  const parts = (D.report || '').split(/\n=+\n(?=== )/);
+  parts.forEach((p, i) => { const lines = p.replace(/^=+\n/, '').split('\n');
+    let title = i === 0 ? 'Naglowek' : lines[0].replace(/^== /, ''); let body = i === 0 ? lines.join('\n') : lines.slice(2).join('\n');
+    const d = el('details', 'sec'); d.append(el('summary', null, title), el('pre', 'report', body.replace(/\n=+\s*$/, ''))); rp.append(d); });
+})();
+</script>
+</body>
+</html>
+HTMLEOF
+}
+html_template | awk -v f="$TMP/data.json" '$0=="__DATA__"{ while ((getline l < f) > 0) print l; next } { print }' >"$HTML"
+echo "Raport HTML zapisany: $HTML ($(du -h "$HTML" | cut -f1)). Zawiera nazwy z klastra - nie wrzucaj go do repozytorium." >&2
