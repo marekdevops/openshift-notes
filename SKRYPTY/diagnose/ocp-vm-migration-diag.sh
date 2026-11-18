@@ -174,6 +174,15 @@ jq -s '{items: (map(.items) | add | unique_by(.metadata.uid // (.metadata.namesp
 
 NVMIM=$(jq '.items | length' "$TMP/vmim.json"); NVMI=$(jq '.items | length' "$TMP/vmi.json")
 
+# PVC i DataVolume w namespace z niezakonczonymi migracjami (gotowosc wolumenow)
+: >"$TMP/pvcu.jsonl"; : >"$TMP/dvu.jsonl"; VOLOK=true
+for ns in $(jq -r '[.items[] | select((.status.phase // "") | test("^(Succeeded|Failed)$") | not) | .metadata.namespace] | unique[]' "$TMP/vmim.json"); do
+  oc_ro get pvc -n "$ns" -o json 2>/dev/null | jq -c '.items[]' >>"$TMP/pvcu.jsonl" || VOLOK=false
+  oc_ro get datavolumes.cdi.kubevirt.io -n "$ns" -o json 2>/dev/null | jq -c '.items[]' >>"$TMP/dvu.jsonl" || VOLOK=false
+done
+jq -s 'map({key: "\(.metadata.namespace)/\(.metadata.name)", value: .}) | from_entries' "$TMP/pvcu.jsonl" >"$TMP/pvcu.json"
+jq -s 'map({key: "\(.metadata.namespace)/\(.metadata.name)", value: .}) | from_entries' "$TMP/dvu.jsonl" >"$TMP/dvu.json"
+
 # requesty na nodach (Prometheus) - do liczenia wolnego miejsca
 REQ_ACT='(max by (namespace, pod) (kube_pod_status_phase{phase=~"Pending|Running"}) == 1)'
 prom query "$TMP/rqm.json" "query=sum by (node) (kube_pod_container_resource_requests{resource=\"memory\",node!=\"\"} * on (namespace, pod) group_left() $REQ_ACT)" || true
@@ -322,9 +331,9 @@ NEVAC_NOMIG=$(jq --slurpfile m "$TMP/vmim.json" '[.items[] | select(.status.evac
 hdr "3. DLACZEGO CZEKAJA - KLASYFIKACJA KAZDEJ NIEZAKONCZONEJ MIGRACJI"
 { printf '{"vmim":'; cat "$TMP/vmim.json"; printf ',"vmimall":'; cat "$TMP/vmimall.json"; printf ',"vmi":'; cat "$TMP/vmi.json"; printf ',"pods":'; cat "$TMP/launch.json"
   printf ',"ev":'; cat "$TMP/ev.json"; printf ',"nodes":'; cat "$TMP/nodes.json"; printf ',"free":'; cat "$TMP/free.json"
-  printf ',"quota":'; cat "$TMP/quota.json"; printf '}'; } >"$TMP/all.json"
+  printf ',"quota":'; cat "$TMP/quota.json"; printf ',"pvc":'; cat "$TMP/pvcu.json"; printf ',"dv":'; cat "$TMP/dvu.json"; printf '}'; } >"$TMP/all.json"
 
-jq -c --argjson now "$NOW" --argjson lcl "$LIM_CL" --argjson lpn "$LIM_PN" --argjson freeok "$FREE_OK" "$JQDEF"'
+jq -c --argjson now "$NOW" --argjson lcl "$LIM_CL" --argjson lpn "$LIM_PN" --argjson freeok "$FREE_OK" --argjson volok "$VOLOK" "$JQDEF"'
   def tol($t): (.effect == null or .effect == "" or .effect == $t.effect) and
      (((.operator // "Equal") == "Exists" and (.key == null or .key == "" or .key == $t.key))
       or ((.operator // "Equal") == "Equal" and .key == $t.key and (.value // "") == ($t.value // "")));
@@ -365,16 +374,30 @@ jq -c --argjson now "$NOW" --argjson lcl "$LIM_CL" --argjson lpn "$LIM_PN" --arg
         and (if $tmpl then (selok($tmpl) and taintok($tmpl.spec.tolerations // [])) else ((.metadata.labels // {})["kubevirt.io/schedulable"] == "true") end))
       | .metadata.name]) as $cand
   | ([$cand[] | select($free[.].fm != null and $free[.].fm >= $rqm and ($rqc == 0 or $free[.].fc >= $rqc))]) as $fit
+  | ([$vmi.spec.volumes[]? | (.dataVolume.name // .persistentVolumeClaim.claimName // empty) as $c
+       | $a.pvc["\($ns)/\($c)"] as $p | $a.dv["\($ns)/\($c)"] as $d
+       | ([$p.metadata.ownerReferences[]? | select(.kind == "DataVolume")][0]) as $own
+       | ($p.metadata.deletionTimestamp != null) as $term
+       | if $p == null and $d == null then {t: false, x: "brak PVC i DataVolume \($c)"}
+         elif $own != null and $a.dv["\($ns)/\($own.name)"] == null then
+           {t: $term, x: "PVC \($c) ma wlasciciela DataVolume \($own.name), ktorego NIE MA\(if $term then "; PVC JEST USUWANY (Terminating)" else "" end)"}
+         elif $own != null and ($a.dv["\($ns)/\($own.name)"].status.phase // "") != "Succeeded" then
+           {t: $term, x: "DataVolume \($own.name) w fazie \($a.dv["\($ns)/\($own.name)"].status.phase // "-") (wymagana Succeeded)"}
+         elif $term then {t: true, x: "PVC \($c) jest usuwany (Terminating)"}
+         else empty end]) as $volp
   | ([$vmi.status.conditions[]? | select(.type == "LiveMigratable")][0]) as $lm
   | ([$tp.status.conditions[]? | select(.type == "PodScheduled" and .status == "False")][0].message // "") as $sched
   | (evmsg($ev; $ns; [$m.metadata.name, $vn] + (if $tp then [$tp.metadata.name] else [] end))) as $evs
   | ([$evs[] | select(.type == "Warning")] | last // null) as $lastw
   | ([$evs[] | select(.msg | test("quota|LimitRange|forbidden|denied the request|admission webhook"; "i"))] | last // null) as $adm
+  | ([$evs[] | select(.msg | test("unable to find datavolume|determining if volume is ready|volume.*not ready"; "i"))] | last // null) as $vev
   | ([$evs[] | select(.reason == "FailedMount" or .reason == "FailedAttachVolume" or .reason == "FailedCreatePodSandBox")] | last // null) as $mnt
   | ($now - ($m.metadata.creationTimestamp | ts)) as $age
   | (if $vmi == null then {c: "VMI_BRAK", d: "VMI nie istnieje (VM wylaczona/usunieta) - migracja jest osierocona"}
      elif $vmi.status.phase != "Running" then {c: "VMI_NIE_DZIALA", d: "VMI w fazie \($vmi.status.phase // "-")"}
      elif $lm != null and $lm.status == "False" then {c: "NIEMIGROWALNA", d: "\($lm.reason // "-"): \($lm.message // "" | .[0:150])"}
+     elif $tp == null and (($volok and ($volp | length) > 0) or $vev != null) then
+       {c: "WOLUMEN_NIEGOTOWY", d: (if ($volp | length) > 0 then ($volp | map(.x) | join("; ")) else "\($vev.reason): \($vev.msg[0:150])" end)}
      elif ($perVmi["\($ns)/\($vn)"] // 0) > 1 and $tp == null then {c: "DUPLIKAT", d: "dla tej VMI istnieje \($perVmi["\($ns)/\($vn)"]) niezakonczonych migracji - aktywna moze byc tylko jedna"}
      elif $tp != null and $tp.status.phase == "Pending" and $tp.spec.nodeName == null then
        (if ($sched | test("Insufficient (memory|cpu|devices\\.kubevirt\\.io)")) then {c: "BRAK_MIEJSCA", d: $sched[0:170]}
@@ -397,7 +420,7 @@ jq -c --argjson now "$NOW" --argjson lcl "$LIM_CL" --argjson lpn "$LIM_PN" --arg
   | {ns: $ns, mig: $m.metadata.name, vmi: $vn, ph: $ph, age: $age, ages: ($age | age), src: ($src | split(".")[0]), srcfull: $src,
      origin: ($m.metadata.name | origin), c: $cause.c, d: $cause.d, rqm: $rqm, rqc: $rqc,
      cand: ($cand | length), fit: ($fit | length), tp: ($tp.metadata.name // "-"), tpnode: ($tp.spec.nodeName // "-"),
-     lmr: ($lm.reason // ""), evict: ($vmi.spec.evictionStrategy // "-")}' "$TMP/all.json" >"$TMP/cls.jsonl" 2>"$TMP/cls.err"
+     lmr: ($lm.reason // ""), evict: ($vmi.spec.evictionStrategy // "-"), term: any($volp[]; .t)}' "$TMP/all.json" >"$TMP/cls.jsonl" 2>"$TMP/cls.err"
 [[ -s $TMP/cls.err ]] && warn "klasyfikacja: $(head -c 300 "$TMP/cls.err")"
 jq -s '.' "$TMP/cls.jsonl" >"$TMP/cls.json"
 NCLS=$(jq 'length' "$TMP/cls.json")
@@ -408,6 +431,7 @@ desc_cause() { case $1 in
   BRAK_MIEJSCA) echo "brak wolnej pamieci/CPU na pasujacych nodach (requesty)";;
   BRAK_PASUJACEGO_NODA) echo "zaden node nie pasuje (nodeSelector/affinity/model CPU/tainty)";;
   NIEMIGROWALNA) echo "VM nie da sie migrowac (LiveMigratable=False)";;
+  WOLUMEN_NIEGOTOWY) echo "wolumen VM niegotowy (brak/niegotowy DataVolume, PVC usuwany)";;
   ODRZUCONE_PRZY_TWORZENIU) echo "utworzenie poda docelowego odrzucone (quota/LimitRange/webhook)";;
   DUPLIKAT) echo "kilka migracji tej samej VM";;
   VMI_BRAK|VMI_NIE_DZIALA) echo "VM nie dziala - migracja osierocona";;
@@ -581,6 +605,7 @@ hdr "8. PODSUMOWANIE - DLACZEGO MIGRACJE STOJA I CO ZROBIC"
 C_QCL=$(cnt KOLEJKA_KLASTER); C_QN=$(cnt KOLEJKA_NODE); C_MEM=$(cnt BRAK_MIEJSCA); C_NODE=$(cnt BRAK_PASUJACEGO_NODA)
 C_NM=$(cnt NIEMIGROWALNA); C_ADM=$(cnt ODRZUCONE_PRZY_TWORZENIU); C_DUP=$(cnt DUPLIKAT); C_ORF=$(( $(cnt VMI_BRAK) + $(cnt VMI_NIE_DZIALA) ))
 C_TS=$(( $(cnt POD_DOCELOWY_STARTUJE) + $(cnt POD_DOCELOWY_PADL) + $(cnt STORAGE) )); C_HS=$(cnt HANDSHAKE); C_UNK=$(cnt CZEKA_NA_KONTROLER)
+C_VOL=$(cnt WOLUMEN_NIEGOTOWY); C_TERM=$(jq '[.[] | select(.term)] | length' "$TMP/cls.json")
 C_RUN=$(cnt W_TOKU); C_RUNOLD=$(jq '[.[] | select(.c == "W_TOKU" and .age > 3600)] | length' "$TMP/cls.json")
 
 if (( C_QCL + C_QN > 0 )); then
@@ -592,6 +617,8 @@ fi
 (( C_MEM > 0 )) && finding 1 "$C_MEM migracji nie ma DOKAD pojsc - pasujace nody nie maja wolnych requestow pamieci/CPU dla VM (sekcja 4). Pod docelowy wymaga tyle samo co zrodlowy (pamiec VM + narzut virt-launchera); przy drainie ubywa calego noda pojemnosci. Dzialania: dodaj/odblokuj nody (uncordon zakonczonych), zatrzymaj zbedne VM, migruj mniejszymi partiami, rozwaz overcommit pamieci VM (memoryOvercommitPercentage w HCO) zgodnie z dokumentacja."
 (( C_NODE > 0 )) && finding 1 "$C_NODE migracji nie ma PASUJACEGO noda (nodeSelector/affinity/tainty z poda VM; najczesciej model CPU - etykiety cpu-model-migration.node.kubevirt.io/* lub host-model). VM z cpu.model: host-passthrough albo konkretnym modelem moga migrowac tylko na identyczny sprzet. Porownaj nodeSelector poda virt-launcher z etykietami nodow; dla heterogenicznych nodow ustaw wspolny model CPU (HCO spec.defaultCPUModel lub w VM)."
 (( C_NM > 0 )) && finding 1 "$C_NM migracji dotyczy VM, ktorych NIE DA SIE MIGROWAC (LiveMigratable=False; powody w sekcji 2 i 3). Typowo: dysk PVC RWO (potrzebny RWX/ block z RWX), interfejs bridge w sieci podow (uzyj masquerade), urzadzenia PCI/GPU/vGPU, SR-IOV bez obslugi migracji. Te migracje nie przejda nigdy - VM trzeba zatrzymac na czas drainu albo zmienic jej konfiguracje."
+(( C_TERM > 0 )) && finding 1 "UWAGA - RYZYKO UTRATY DYSKU: $C_TERM VM ma dysk PVC w stanie Terminating (usuniety np. kaskadowo razem z DataVolume; trzyma go tylko finalizer pvc-protection, bo VM dziala). NIE zatrzymuj, nie restartuj i nie migruj tych VM - po zniknieciu poda virt-launcher dysk zostanie skasowany. Najpierw zabezpiecz dane (snapshot/klon PVC, backup z wnetrza VM) i zaplanuj odtworzenie dysku; szczegoly w sekcji 3."
+(( C_VOL > 0 )) && finding 1 "$C_VOL migracji stoi, bo wolumen VM nie jest gotowy (sekcja 3). virt-controller przed utworzeniem poda docelowego sprawdza kazdy dysk: PVC z wlascicielem DataVolume wymaga istniejacego DataVolume w fazie Succeeded; komunikat 'unable to find datavolume' = PVC wskazuje na DataVolume, ktorego nie ma (usuniety albo PVC odtworzony z backupu z ownerReference). Gdy PVC NIE jest Terminating: odtworz obiekt DataVolume o tej nazwie dla istniejacego PVC (adopcja PVC przez CDI) albo usun z PVC ownerReference na nieistniejacy DataVolume - po weryfikacji z dokumentacja/supportem. Gdy DataVolume istnieje (oc get dv), a blad trwa - nieaktualny cache virt-controller (logi sekcja 7)."
 (( C_ADM > 0 )) && finding 1 "$C_ADM migracji ma odrzucone utworzenie poda docelowego (komunikat w sekcji 3, kwoty w sekcji 5). Najczesciej ResourceQuota w namespace: pod docelowy liczy sie do kwoty RAZEM ze zrodlowym, wiec namespace potrzebuje zapasu na czas migracji (requests/limits pamieci i CPU, liczba podow)."
 (( NQFULL > 0 && C_ADM == 0 )) && finding 2 "W namespace z oczekujacymi migracjami $NQFULL pozycji ResourceQuota jest wykorzystanych w >=90% - pod docelowy migracji moze nie zmiescic sie w kwocie (sekcja 5)."
 (( C_DUP > 0 )) && finding 2 "$C_DUP migracji to duplikaty dla tej samej VM - aktywna moze byc tylko jedna, pozostale czekaja (np. reczna migracja + ewakuacja). Zbedne obiekty VMIM mozna usunac po weryfikacji."
