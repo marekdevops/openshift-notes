@@ -19,7 +19,9 @@
 #      back-off), crio, kernel (OOM killer - limit kontenera czy brak pamieci wezla);
 #   8. logi poprzedniej instancji kontenera (co aplikacja mowila przed smiercia);
 #   9. OS CZASU - wszystko powyzej ulozone chronologicznie;
-#  10. PRZYCZYNY, PROBLEMY i WNIOSKI z podzialem: aplikacja / platforma.
+#  10. ILE ZASOBOW POTRZEBA - wyliczone requesty/limity pamieci i CPU per kontener
+#      (p95 i maksimum z ostatnich -D dni, korekta na OOM, -Xmx, wzrost pamieci);
+#  11. PRZYCZYNY, PROBLEMY i WNIOSKI z podzialem: aplikacja / platforma.
 #
 # TYLKO ODCZYT: oc get / oc whoami / oc logs / oc adm node-logs (journal wezla)
 # + HTTP GET do Prometheusa (thanos-querier). Niczego nie zmienia w klastrze.
@@ -31,7 +33,7 @@
 set -uo pipefail
 export LC_ALL=C
 
-HOURS=24; LOGL=25; NODELOGS=1; MAXNODES=6; TLMAX=120
+HOURS=24; RDAYS=7; LOGL=100; NODELOGS=1; MAXNODES=6; TLMAX=120
 CURL_K=""; OC_K=()
 
 usage() { cat <<EOF
@@ -42,6 +44,7 @@ Uzycie: $0 [opcje] <namespace> <workload>
                DaemonSet, DeploymentConfig, CronJob, Pod)
 
   -H GODZINY   okno analizy wstecz                        (domyslnie: $HOURS)
+  -D DNI       okno do wyliczenia potrzebnych zasobow (sekcja 10) (domyslnie: $RDAYS)
   -l LINIE     ile ostatnich linii logow pokazywac        (domyslnie: $LOGL, 0 = bez logow aplikacji)
   -m N         maks. liczba workerow, z ktorych czytac journal (domyslnie: $MAXNODES)
   -N           nie czytaj logow workerow (oc adm node-logs)
@@ -58,6 +61,7 @@ pos=()
 while (( $# )); do case $1 in
   -H) HOURS=${2:-}; shift 2 || usage 1;;
   -l) LOGL=${2:-}; shift 2 || usage 1;;
+  -D) RDAYS=${2:-}; shift 2 || usage 1;;
   -m) MAXNODES=${2:-}; shift 2 || usage 1;;
   -N) NODELOGS=0; shift;;
   -k|--insecure|--insecure-skip-tls-verify|--insecure-skip-tls-verify=true)
@@ -88,6 +92,7 @@ oc_ro() { case "${1:-}" in
 for c in oc jq curl column awk timeout; do command -v "$c" >/dev/null || die "brak polecenia: $c"; done
 [[ $HOURS =~ ^[0-9]+$ ]] && (( HOURS > 0 )) || die "-H: podaj liczbe godzin"
 [[ $LOGL =~ ^[0-9]+$ ]] || die "-l: podaj liczbe linii"
+[[ $RDAYS =~ ^[0-9]+$ ]] && (( RDAYS > 0 )) || die "-D: podaj liczbe dni"
 [[ $MAXNODES =~ ^[0-9]+$ ]] || die "-m: podaj liczbe"
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -213,7 +218,8 @@ echo "Okno    : ostatnie ${HOURS}h ($(fdate "$T0") - $(fdate "$NOW"))   teraz: $
 cat <<'EOF'
 
 Jak czytac: sekcje 1-8 to fakty (konfiguracja, pody i workery, restarty, zuzycie, stan
-workerow, eventy, logi). Sekcja 9 uklada je w czasie, sekcja 10 to przyczyny i wnioski.
+workerow, eventy, logi). Sekcja 9 uklada je w czasie, sekcja 10 wylicza ile pamieci/CPU
+aplikacja potrzebuje, sekcja 11 to przyczyny i wnioski.
 EOF
 
 # =============================================================================
@@ -800,9 +806,103 @@ tail -n "$TLMAX" "$TMP/tls.tsv" | while IFS=$'\t' read -r t s m; do printf '  %s
 (( NTL == 0 )) && echo "  (brak zdarzen)"
 
 # =============================================================================
-# 10. PRZYCZYNY, PROBLEMY, WNIOSKI
+# 10. ILE ZASOBOW POTRZEBA
 # =============================================================================
-hdr "10. PRZYCZYNY, PROBLEMY I WNIOSKI"
+hdr "10. ILE PAMIECI I CPU APLIKACJA POTRZEBUJE (wyliczenie z ${RDAYS} dni - nic nie jest wdrazane)"
+RW="${RDAYS}d"
+OWNR="max by (namespace, pod) (max_over_time(kube_pod_info{$PSEL}[$RW]))"
+WSC="max by (namespace, pod, container) ($WSQ)"
+CPC="max by (namespace, pod, container) (rate(container_cpu_usage_seconds_total{$CSEL}[5m]))"
+THC="max by (namespace, pod, container) (rate(container_cpu_cfs_throttled_periods_total{$CSEL}[5m]) / rate(container_cpu_cfs_periods_total{$CSEL}[5m]))"
+pq r_mp95 "max by (container) (quantile_over_time(0.95, ($WSC $(J "$OWNI"))[$RW:5m]))"
+pq r_mmax "max by (container) (max_over_time($WSQ[$RW]) $(J "$OWNR"))"
+pq r_cp95 "max by (container) (quantile_over_time(0.95, ($CPC $(J "$OWNI"))[$RW:5m]))"
+pq r_cmax "max by (container) (max_over_time(($CPC $(J "$OWNI"))[$RW:5m]))"
+pq r_thr  "max by (container) (max_over_time(($THC $(J "$OWNI"))[$RW:5m])) * 100"
+pq r_oome "sum by (container) (increase(container_oom_events_total{$CSEL}[$RW]) $(J "$OWNR"))"
+pq r_oomk "max by (container) (max_over_time(kube_pod_container_status_last_terminated_reason{namespace=\"$NS\",reason=\"OOMKilled\"}[$RW]) $(J "$OWNR"))"
+pq r_t0   "min(min_over_time(timestamp(max by (namespace) (kube_pod_info{$PSEL}))[$RW:1h]))"
+{ printf '{'; for n in mp95 mmax cp95 cmax thr oome oomk t0; do printf '"%s":' "$n"; cat "$TMP/r_$n.json"; printf ','; done
+  printf '"grow":'; cat "$TMP/c_grow.json"; printf ',"hpa":'; cat "$TMP/hpa.json"; printf ',"pods":'; cat "$TMP/pods.json"
+  printf ',"wl":'; cat "$TMP/wl.json"; printf '}'; } >"$TMP/r_all.json"
+
+# rekomendacja per kontener (wartosci per pod)
+#   request pamieci = p95 working set x 1.2           (zaokr. w gore do 64Mi / 256Mi powyzej 1Gi, min. 64Mi)
+#   limit pamieci   = maks. working set x 1.2, ale nie mniej niz:
+#                     obecny limit x 1.5 gdy byl OOM (szczyt byl ucinany - prawdziwy nieznany),
+#                     -Xmx / 0.7 (JVM potrzebuje ~30% poza heapem), request
+#   request CPU     = p95 zuzycia CPU (zaokr. do 10m, min. 10m)
+#   limit CPU       = bez zmian; "usun lub >= maks. x 1.5" gdy throttling >= 25%
+jq --argjson now "$NOW" "$JQDEF"'
+  def up(s): (. / s) as $x | (if $x == ($x | floor) then $x else ($x | floor) + 1 end) * s;
+  def mup: if . < 1073741824 then up(67108864) else up(268435456) end;
+  def bc(n): (.[n].data.result // []) | map(select(.value[1] | num != null) | {k: (.metric.container // ""), v: (.value[1] | num)})
+             | group_by(.k) | map({key: .[0].k, value: (map(.v) | max)}) | from_entries;
+  . as $a
+  | (bc("mp95")) as $p | (bc("mmax")) as $mx | (bc("cp95")) as $cp | (bc("cmax")) as $cm | (bc("thr")) as $th
+  | (bc("oome")) as $oe | (bc("oomk")) as $ok | (bc("grow")) as $gr
+  | ([$a.t0.data.result[]? | .value[1] | num | select(. != null and . > 0)] | min // $now) as $t0
+  | ($a.wl | if .kind == "DaemonSet" then (.status.desiredNumberScheduled // 1)
+             elif .kind == "Deployment" or .kind == "StatefulSet" or .kind == "DeploymentConfig" then (.spec.replicas // 1) else 1 end) as $rep
+  | {days: (($now - $t0) / 86400), rep: $rep, hmax: ([$a.hpa.items[]?.spec.maxReplicas] | max),
+     c: [$a.wl | podspec | .containers[] | . as $c | .name as $n
+       | ([$a.pods.items[]?.spec.containers[]? | select(.name == $n)] | .[0].resources // {}) as $pr
+       | ([(.env // [])[] | .value // empty] + (.args // []) + (.command // []) | join(" ")) as $all
+       | ([$all | capture("-Xmx(?<n>[0-9]+)(?<u>[kKmMgG]?)")] | .[0]) as $x
+       | (if $x then ($x.n | tonumber) * ({"": 1, "k": 1024, "K": 1024, "m": 1048576, "M": 1048576, "g": 1073741824, "G": 1073741824} | .[$x.u]) else null end) as $xmx
+       | (($c.resources.requests.memory // $pr.requests.memory) | mem) as $rq
+       | (($c.resources.limits.memory // $pr.limits.memory) | mem) as $lm
+       | (($c.resources.requests.cpu // $pr.requests.cpu) | cpu) as $crq
+       | (($c.resources.limits.cpu // $pr.limits.cpu) | cpu) as $clm
+       | $p[$n] as $p95 | $mx[$n] as $max | ($th[$n] // 0) as $thr | ($gr[$n] // 0) as $g
+       | ((($oe[$n] // 0) | round) + (if ($ok[$n] // 0) > 0 then 1 else 0 end)) as $oom
+       | (if $p95 == null then null else ([$p95 * 1.2 | mup, 67108864] | max) end) as $rreq
+       | (if $rreq == null then null
+          else [(if $max then $max * 1.2 else 0 end), (if $oom > 0 and $lm then $lm * 1.5 else 0 end),
+                (if $xmx then $xmx / 0.7 else 0 end), $rreq] | max | mup end) as $rlim
+       | (if $cp[$n] == null then null else ([$cp[$n] * 1000 | up(10), 10] | max) / 1000 end) as $rcreq
+       | {n: $n, rq: $rq, lm: $lm, crq: $crq, clm: $clm, p95: $p95, max: $max, cp95: $cp[$n], cmax: $cm[$n], thr: $thr,
+          oom: $oom, g: $g, xmx: $xmx, rreq: $rreq, rlim: $rlim, rcreq: $rcreq,
+          rclim: (if $clm == null then "-" elif $thr >= 25 then "usun lub >=" + (if $cm[$n] then ([$cm[$n] * 1.5, $clm] | max | fc) else "?" end) else ($clm | fc) end),
+          conf: (if $p95 == null then "BRAK DANYCH" elif $oom > 0 then "NISKA" elif (($now - $t0) / 86400) < 2 then "SREDNIA" else "DOBRA" end)}]}
+  ' "$TMP/r_all.json" >"$TMP/rec.json" 2>"$TMP/err" || { warn "wyliczenie zasobow: $(head -c 300 "$TMP/err")"; echo '{"days":0,"rep":1,"hmax":null,"c":[]}' >"$TMP/rec.json"; }
+
+RDAYS_REAL=$(jq -r '.days * 10 | round / 10' "$TMP/rec.json")
+echo "  Dane: ostatnie $RDAYS_REAL dni$(awk -v a="$RDAYS_REAL" -v b="$RDAYS" 'BEGIN{ if (a+0 < b-0.5) print " (tyle ma Prometheus / tyle istnieje workload; zadano " b ")" }'). Wartosci PER POD (jedna replika)."
+sub "Pamiec"
+{ printf 'KONTENER\tP95\tMAKS\tOOM\tREQUEST\t->ZALECANY\tLIMIT\t->ZALECANY\tPEWNOSC\n'
+  jq -r "$JQDEF"'.c[] | [.n, (.p95 | fb), (.max | fb), (.oom | tostring), (.rq | fb), (.rreq | fb), (.lm | fb), (.rlim | fb), .conf] | @tsv' "$TMP/rec.json"
+} | table
+sub "CPU"
+{ printf 'KONTENER\tP95\tMAKS\tTHROTTLE\tREQUEST\t->ZALECANY\tLIMIT\t->ZALECANY\n'
+  jq -r "$JQDEF"'.c[] | [.n, (.cp95 | fc), (.cmax | fc), (.thr | fp), (.crq | fc), (.rcreq | fc), (.clm | fc), .rclim] | @tsv' "$TMP/rec.json"
+} | table
+jq -r "$JQDEF"'.c[] | .n as $n
+  | (if .oom > 0 then "  \($n): byl OOM (\(.oom)) - zmierzone maksimum jest UCIETE na limicie \(.lm | fb), prawdziwy szczyt jest wyzszy. Zalecany limit (+50%) to punkt startowy - po zmianie uruchom skrypt ponownie i sprawdz, czy MAKS ustabilizowal sie ponizej limitu." else empty end),
+    (if .xmx then "  \($n): JVM -Xmx \(.xmx | fb) - limit musi miec ~30% zapasu poza heapem (metaspace, watki, bufory): min. \(.xmx / 0.7 | fb)." else empty end),
+    (if .g >= 5242880 then "  \($n): pamiec rosnie ok. \(.g / 1048576 | round) MiB/h - jesli to wyciek, wyzszy limit tylko opozni OOM; najpierw zespol aplikacji (heap dump / profil)." else empty end),
+    (if .lm and .rlim and .rlim < .lm * 0.7 and .oom == 0 then "  \($n): obecny limit \(.lm | fb) ma duzy zapas wzgledem maks. \(.max | fb) - mozna obnizyc do \(.rlim | fb), jesli okno \("'"$RDAYS"'") dni obejmuje typowe szczyty (koniec miesiaca, batch)." else empty end)' "$TMP/rec.json"
+jq -r "$JQDEF"'
+  ([.c[] | .rreq // 0] | add // 0) as $nr | ([.c[] | .rq // 0] | add // 0) as $cr
+  | ([.c[] | .rlim // 0] | add // 0) as $nl
+  | "  Lacznie na pod: request \($cr | fb) -> \($nr | fb), limit -> \($nl | fb).",
+    "  Lacznie dla workloadu (replik: \(.rep)): request \($cr * .rep | fb) -> \($nr * .rep | fb)" + (if .hmax then "; przy maks. HPA (replik: \(.hmax)): \($nr * .hmax | fb)" else "" end) + " - tyle pamieci scheduler musi znalezc na workerach."' "$TMP/rec.json"
+echo "  Wzor: request = p95 x 1.2; limit = maks. x 1.2 (min. obecny limit x 1.5 po OOM, min. -Xmx/0.7); CPU request = p95;"
+echo "  limit CPU: zostaw, chyba ze throttling >= 25% (wtedy usun albo podnies). Init-kontenery pominiete."
+echo "  To propozycja z metryk - okno ${RDAYS} dni musi obejmowac typowe szczyty; zmiane wprowadza zespol aplikacji."
+
+while IFS=$'\t' read -r lv sd tx; do finding "$lv" "$sd" "$tx"; done < <(jq -r "$JQDEF"'.c[] | . as $c
+  | (if .lm and .rlim and .rlim > .lm * 1.1 then ["OSTR", "KONFIG", "Kontener \(.n): limit pamieci za niski - teraz \(.lm | fb), potrzeba ok. \(.rlim | fb) (p95 \(.p95 | fb), maks. \(.max | fb)\(if .oom > 0 then ", byl OOM - maks. uciete na limicie" else "" end)). Szczegoly w sekcji 10."] else empty end),
+    (if .lm == null and .rlim then ["INFO", "KONFIG", "Kontener \(.n): brak limitu pamieci - na podstawie zuzycia ustaw ok. \(.rlim | fb)."] else empty end),
+    (if .rq and .p95 and .p95 > .rq * 1.1 then ["OSTR", "KONFIG", "Kontener \(.n): request pamieci \(.rq | fb) ponizej realnego zuzycia (p95 \(.p95 | fb)) - scheduler upycha pody na workerach, ktore nie maja tyle pamieci; zalecane \(.rreq | fb)."] else empty end),
+    (if .rq == null and .rreq then ["INFO", "KONFIG", "Kontener \(.n): brak requestu pamieci - ustaw ok. \(.rreq | fb)."] else empty end),
+    (if .rq and .rreq and .oom == 0 and .rreq * 2 < .rq then ["INFO", "KONFIG", "Kontener \(.n): request pamieci \(.rq | fb) ponad 2x wiekszy niz potrzeba (p95 \(.p95 | fb)) - blokuje pojemnosc workerow; wystarczy ok. \(.rreq | fb)."] else empty end)
+  | @tsv' "$TMP/rec.json")
+
+# =============================================================================
+# 11. PRZYCZYNY, PROBLEMY, WNIOSKI
+# =============================================================================
+hdr "11. PRZYCZYNY, PROBLEMY I WNIOSKI"
 RST=$(fv RST_TOTAL); RST=${RST:-0}
 OOMN=$(( $(fn OOM_KSM) + $(fn OOM_API) + ${F[KO_OURS]} ))
 (( $(fn OOM_EVENTS) > OOMN )) && OOMN=$(fn OOM_EVENTS)
@@ -907,7 +1007,7 @@ else
   best="nieustalona"; why=""
   sc_oom=$(( OOMN * 3 )); sc_liv=$(( LIVK * 2 )); sc_err=$(( ERRN * 2 + F[AL_CONN] / 50 )); sc_node=$NODEP
   max=0
-  (( sc_oom  > max )) && { max=$sc_oom;  best="BRAK PAMIECI W LIMICIE KONTENERA (OOMKilled) - strona APLIKACJI"; why="Kontener zuzywa wiecej pamieci niz pozwala limit. Dzialanie: ustal, czy to wzrost z ruchem (podnies limit/HPA), wyciek (zespol aplikacji, heap dump) czy zle ustawione -Xmx/MaxRAMPercentage."; }
+  (( sc_oom  > max )) && { max=$sc_oom;  best="BRAK PAMIECI W LIMICIE KONTENERA (OOMKilled) - strona APLIKACJI"; why="Kontener zuzywa wiecej pamieci niz pozwala limit. Dzialanie: ustal, czy to wzrost z ruchem (podnies limit/HPA), wyciek (zespol aplikacji, heap dump) czy zle ustawione -Xmx/MaxRAMPercentage. Ile pamieci potrzeba - sekcja 10."; }
   (( sc_liv  > max )) && { max=$sc_liv;  best="ZABIJANIE PRZEZ KUBELET PO NIEUDANEJ PROBE LIVENESS/STARTUP - strona APLIKACJI/KONFIGURACJI probe"; why="Aplikacja nie odpowiada na probe w zadanym czasie. Dzialanie: sprawdz co ja blokuje (throttling CPU, GC, zaleznosci), dodaj startupProbe, zwieksz timeoutSeconds/failureThreshold; liveness nie powinna sprawdzac zaleznosci zewnetrznych."; }
   (( sc_err  > max )) && { max=$sc_err;  best="PROCES APLIKACJI KONCZY SIE BLEDEM - strona APLIKACJI"; why="Kontener sam sie zamyka z kodem bledu. Dzialanie: logi poprzedniej instancji (sekcja 8) - wyjatek, brak zaleznosci, konfiguracja."; }
   (( sc_node > max )) && { max=$sc_node; best="PROBLEM WORKERA (brak pamieci wezla / reboot / NotReady / ewikcja) - strona PLATFORMY"; why="Pody gina z powodu stanu workera, nie aplikacji. Dzialanie: sekcja 5 i 7 - pamiec i rezerwacje workera, requesty podow na nim, przyczyna rebootu/NotReady."; }
