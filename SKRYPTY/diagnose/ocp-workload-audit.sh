@@ -149,6 +149,11 @@ JQDEF='
       elif . == 126 or . == 127 then "nie da sie uruchomic polecenia" elif . == 134 then "SIGABRT (abort)"
       elif . == 137 then "SIGKILL (OOM albo zabicie przez kubelet)" elif . == 139 then "SIGSEGV (naruszenie pamieci)"
       elif . == 143 then "SIGTERM (zatrzymanie na zadanie)" elif . > 128 then "sygnal \(. - 128)" else "blad aplikacji" end;
+  # opis zakonczenia z uwzglednieniem powodu: OOMKilled ustawia tylko kernel (OOM killer), kubelet nigdy
+  def termdesc($r): if $r == "OOMKilled" then "kernel OOM killer - przekroczony limit pamieci kontenera (lub brak pamieci wezla - patrz sekcja 7)"
+      elif . == 137 and ($r == "Error" or $r == null) then "SIGKILL od kubeleta/CRI-O - nieudana probe liveness/startup albo przekroczony terminationGracePeriod"
+      elif $r == "ContainerStatusUnknown" or $r == "Unknown" then "kontener zginal razem z workerem/kubeletem (reboot, awaria)"
+      else exitdesc end;
   def podspec: if .kind == "CronJob" then .spec.jobTemplate.spec.template.spec
       elif .kind == "Pod" then .spec else .spec.template.spec end;'
 
@@ -496,11 +501,11 @@ sub "Ostatnie zakonczenia kontenerow (API, biezace pody)"
 { printf 'POD\tKONTENER\tZAKONCZONY\tPOWOD\tEXIT\tZNACZENIE\tDZIALAL\n'
   jq -r "$JQDEF"'.items[] | .metadata.name as $p | .status.containerStatuses[]? | select(.lastState.terminated != null)
     | .lastState.terminated as $t | ($t.finishedAt | ts) as $f | ($t.startedAt | ts) as $s
-    | [$p, .name, ($f | ft), ($t.reason // "-"), ($t.exitCode | tostring), ($t.exitCode | exitdesc),
+    | [$p, .name, ($f | ft), ($t.reason // "-"), ($t.exitCode | tostring), ($t.exitCode | termdesc($t.reason)),
        (if $f != null and $s != null then (($f - $s) | if . >= 3600 then "\(. / 3600 | r1)h" elif . >= 60 then "\(. / 60 | round)min" else "\(.)s" end) else "-" end)] | @tsv' "$TMP/pods.json"
 } | table
 jq -r "$JQDEF"'.items[] | .metadata.name as $p | .status.containerStatuses[]? | select(.lastState.terminated != null)
-  | .lastState.terminated as $t | "\($t.finishedAt | ts | floor)\tKONTENER\t\($p)/\(.name) zakonczony: \($t.reason // "-") exit \($t.exitCode) (\($t.exitCode | exitdesc))"' \
+  | .lastState.terminated as $t | "\($t.finishedAt | ts | floor)\tKONTENER\t\($p)/\(.name) zakonczony: \($t.reason // "-") exit \($t.exitCode) (\($t.exitCode | termdesc($t.reason)))"' \
   "$TMP/pods.json" >>"$TMP/tl.tsv"
 echo "  API pamieta tylko OSTATNIE zakonczenie kazdego kontenera; wczesniejsze - patrz eventy, logi workera i os czasu."
 echo "  Restarty w oknie: $(fv RST_TOTAL) (metryki)   lacznie od startu biezacych podow: $(fn RST_API) (API)"
