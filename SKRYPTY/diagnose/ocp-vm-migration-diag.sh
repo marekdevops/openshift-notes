@@ -17,10 +17,15 @@
 #     tainty, nody z kubevirt.io/schedulable=false (virt-handler niegotowy).
 # Dalsze fazy = problem z startem poda docelowego, siecia migracyjna albo virt-handlerem.
 #
-# Skrypt dla kazdej oczekujacej migracji ustala PRZYCZYNE i DOWOD, liczy wolne miejsce
-# dla VM na nodach, pokazuje blokady drainu (PDB, VM niemigrowalne, MCP), kwoty
-# w namespace, historie z Prometheusa, logi virt-controller / virt-handler
-# i na koncu PODSUMOWANIE z dzialaniami.
+# Running bez konca / Failed = VM zmienia pamiec szybciej, niz siec ja przesyla (timeout),
+#   pod docelowy padl, siec migracyjna, przerwanie (anulowanie, drain).
+#
+# Skrypt dla kazdej oczekujacej migracji ustala PRZYCZYNE i DOWOD; dla trwajacych sprawdza,
+# czy sie zbiegaja (pozostala pamiec vs tempo zmian pamieci i przesylu); dla nieudanych
+# grupuje powody wg przyczyny, noda i VM; sprawdza siec migracyjna, cechy VM blokujace
+# migracje (GPU, PCI, SR-IOV, dyski RWO, host-passthrough...), wolne miejsce na nodach,
+# blokady drainu (PDB, MCP), kwoty, historie z Prometheusa, logi virt-controller /
+# virt-handler i na koncu PODSUMOWANIE z dzialaniami.
 #
 # TYLKO ODCZYT: oc get / oc whoami / oc logs + HTTP GET do Prometheusa (thanos-querier).
 # Niczego nie zmienia (nie anuluje migracji, nie zmienia konfiguracji).
@@ -137,10 +142,11 @@ echo "Klaster : $(oc_ro whoami --show-server)   uzytkownik: $(oc_ro whoami)"
 echo "Czas    : $(date '+%F %T %Z')   zakres: ${SCOPE_NS:-wszystkie namespace}"
 cat <<'EOF'
 
-Jak czytac: sekcja 1 - konfiguracja i stan platformy (limity kolejki, virt-handler, MCP),
-sekcja 2 - ile migracji i w jakich fazach, sekcja 3 - PRZYCZYNA dla kazdej oczekujacej
-migracji, sekcje 4-7 - dowody (miejsce na nodach, blokady, historia, logi).
-Wnioski i dzialania: PODSUMOWANIE na koncu.
+Jak czytac: sekcja 1 - konfiguracja i stan platformy (limity kolejki, virt-handler, siec
+migracyjna, MCP), sekcja 2 - ile migracji i w jakich fazach, sekcja 3 - PRZYCZYNA dla kazdej
+oczekujacej migracji, sekcja 4 - czy trwajace migracje zdaza sie skonczyc, sekcja 5 - dlaczego
+migracje koncza sie bledem i jak dlugo trwaja udane, sekcje 6-9 - dowody (miejsce na nodach,
+blokady i cechy VM, historia, logi). Wnioski i dzialania: PODSUMOWANIE na koncu.
 EOF
 
 # =============================================================================
@@ -162,6 +168,7 @@ getj "$TMP/mcp.json"   machineconfigpools
 getj "$TMP/handler.json" pods -n "$CNV_NS" -l kubevirt.io=virt-handler
 getj "$TMP/pdb.json"   pdb "${SC[@]}"
 getj "$TMP/quota.json" resourcequota "${SC[@]}"
+getj "$TMP/pvcall.json" pvc "${SC[@]}"
 # eventy: migracje, VMI, problemy z podami (tylko istotne rodzaje - eventy calego klastra bywaja ogromne)
 { getj "$TMP/ev1.json" events "${SC[@]}" --field-selector involvedObject.kind=VirtualMachineInstanceMigration
   getj "$TMP/ev2.json" events "${SC[@]}" --field-selector involvedObject.kind=VirtualMachineInstance
@@ -229,13 +236,46 @@ sub "Limity i ustawienia migracji ($LIM_SRC)"
          "batchEvictionSize / Interval\t\(.batchEvictionSize // "-") / \(.batchEvictionInterval // "-")\tile VM naraz i co ile przy aktualizacji"' "$TMP/hco.json"
 } | table
 MIGNET=$(jq -r '.items[0].spec.liveMigrationConfig.network // empty' "$TMP/hco.json")
-if [[ -n $MIGNET ]]; then
-  if oc_ro get network-attachment-definitions.k8s.cni.cncf.io "$MIGNET" -n "$CNV_NS" -o name >/dev/null 2>&1; then
-    echo "  Dedykowana siec migracyjna: $MIGNET (NetworkAttachmentDefinition istnieje)"
+# adresy virt-handlera w sieci migracyjnej (adnotacja Multus network-status); null = brak adnotacji
+MIGIPS='def migips($net; $ns): ((.metadata.annotations // {})["k8s.v1.cni.cncf.io/network-status"] // null) as $a
+  | if $a == null then null else ($a | fromjson? // [])
+    | [.[] | select(.name == "\($ns)/\($net)" or .name == $net or .interface == "migration0") | .ips[]?] end;'
+NMIG_NOIP=0; NMA_MIG=0; NMA_POD=0; NMA_UNK=0
+sub "Siec migracyjna"
+if [[ -z $MIGNET ]]; then
+  echo "  Brak dedykowanej sieci migracyjnej (HyperConverged spec.liveMigrationConfig.network). Pamiec VM jest"
+  echo "  przesylana siecia podow i dzieli lacze z ruchem aplikacji - przy duzych VM lub VM mocno zmieniajacych"
+  echo "  pamiec migracje moga sie nie zbiegac (sekcja 4) i konczyc timeoutem (sekcja 5)."
+else
+  if oc_ro get network-attachment-definitions.k8s.cni.cncf.io "$MIGNET" -n "$CNV_NS" -o json >"$TMP/nad.json" 2>/dev/null; then
+    jq -r '(.spec.config // "{}" | fromjson? // {}) as $c | ($c.plugins[0]? // $c) as $p
+      | "  Dedykowana siec migracyjna: \(.metadata.name) (NetworkAttachmentDefinition istnieje)",
+        "    typ \($p.type // "-"), interfejs na nodzie \($p.master // $p.bridge // $p.device // "-"), MTU \($p.mtu // "domyslne interfejsu"),"
+        + " IPAM \($p.ipam.type // "-")\(if ($p.ipam.range // "") != "" then ", pula /\($p.ipam.range | split("/")[1] // "?")" else "" end)"' "$TMP/nad.json"
   else
     echo "  Dedykowana siec migracyjna: $MIGNET - NIE ZNALEZIONO NetworkAttachmentDefinition w $CNV_NS!"
     finding 1 "HyperConverged wskazuje siec migracyjna '$MIGNET', ale nie ma takiej NetworkAttachmentDefinition w $CNV_NS - migracje nie moga zestawic polaczenia."
   fi
+  { printf 'NODE\tVIRT_HANDLER\tADRES_W_SIECI_MIGRACYJNEJ\n'
+    jq -r --arg net "$MIGNET" --arg ns "$CNV_NS" "$MIGIPS"'.items[] | migips($net; $ns) as $ip
+      | [(.spec.nodeName // "-" | split(".")[0]), (.status.phase // "-"),
+         (if $ip == null then "? (brak adnotacji network-status)" elif ($ip | length) > 0 then "tak" else "BRAK" end)] | @tsv' "$TMP/handler.json"
+  } | table
+  NMIG_NOIP=$(jq --arg net "$MIGNET" --arg ns "$CNV_NS" "$MIGIPS"'[.items[] | migips($net; $ns) | select(. != null and length == 0)] | length' "$TMP/handler.json")
+  # ktora siecia poszly migracje: adres celu (migrationState.targetNodeAddress) vs adresy virt-handlera na nodzie docelowym
+  read -r NMA_MIG NMA_POD NMA_UNK < <(jq -r --slurpfile h "$TMP/handler.json" --arg net "$MIGNET" --arg ns "$CNV_NS" "$MIGIPS"'
+    ([$h[0].items[] | {key: (.spec.nodeName // "-"), value: {mig: (migips($net; $ns) // []),
+        pod: ([.status.podIPs[]?.ip, .status.podIP] | map(select(. != null)))}}] | from_entries) as $hm
+    | [.items[] | .status.migrationState // empty | select((.targetNodeAddress // "") != "")
+       | (.targetNodeAddress | if test("^[0-9.]+:[0-9]+$") then sub(":[0-9]+$"; "") else . end) as $ip
+       | $hm[.targetNode // ""] as $x
+       | if $x == null then "u" elif ($x.mig | index($ip)) != null then "m" elif ($x.pod | index($ip)) != null then "p" else "u" end]
+    | "\(map(select(. == "m")) | length) \(map(select(. == "p")) | length) \(map(select(. == "u")) | length)"' "$TMP/vmimall.json")
+  if (( NMA_MIG + NMA_POD + NMA_UNK > 0 )); then
+    echo "  Migracje widoczne w obiektach VMIM - adres celu: w sieci migracyjnej $NMA_MIG, w sieci podow $NMA_POD, nieustalony $NMA_UNK."
+  fi
+  (( NMIG_NOIP > 0 )) && finding 1 "$NMIG_NOIP podow virt-handler nie ma adresu w sieci migracyjnej '$MIGNET' (sekcja 1) - migracje z udzialem tych nodow nie zestawia polaczenia. Sprawdz NAD (interfejs na nodzie, IPAM/pula adresow) i eventy podow virt-handler."
+  (( NMA_POD > 0 )) && finding 1 "Skonfigurowano siec migracyjna '$MIGNET', ale $NMA_POD migracji uzylo adresu z sieci podow (sekcja 1) - siec migracyjna nie dziala na czesci nodow albo virt-handler nie zostal zrestartowany po zmianie konfiguracji."
 fi
 
 sub "MigrationPolicy (nadpisuja limity dla wybranych VM)"
@@ -415,7 +455,7 @@ jq -c --argjson now "$NOW" --argjson lcl "$LIM_CL" --argjson lpn "$LIM_PN" --arg
      elif ($ph | pending) and ($outb[$src] // 0) >= $lpn then {c: "KOLEJKA_NODE", d: "z noda \($src | split(".")[0]) migruje juz \($outb[$src]) >= limit \($lpn) (parallelOutboundMigrationsPerNode)"}
      elif ($ph | pending) and $freeok and ($cand | length) == 0 then {c: "BRAK_PASUJACEGO_NODA", d: "zaden inny node nie spelnia nodeSelector/affinity/taintow VM (np. model CPU) - przewidywanie skryptu"}
      elif ($ph | pending) and $freeok and ($fit | length) == 0 then {c: "BRAK_MIEJSCA", d: "pasujace nody: \($cand | length), zaden nie ma wolnych \($rqm | gi) GiB pamieci requestu - przewidywanie skryptu"}
-     elif ($ph | pending) then {c: "CZEKA_NA_KONTROLER", d: "brak poda docelowego i brak widocznej blokady\(if $lastw then " - ostatni event: \($lastw.reason) \($lastw.msg[0:100])" else "" end) - logi virt-controller (sekcja 7)"}
+     elif ($ph | pending) then {c: "CZEKA_NA_KONTROLER", d: "brak poda docelowego i brak widocznej blokady\(if $lastw then " - ostatni event: \($lastw.reason) \($lastw.msg[0:100])" else "" end) - logi virt-controller (sekcja 9)"}
      else {c: "INNA", d: "faza \($ph)"} end) as $cause
   | {ns: $ns, mig: $m.metadata.name, vmi: $vn, ph: $ph, age: $age, ages: ($age | age), src: ($src | split(".")[0]), srcfull: $src,
      origin: ($m.metadata.name | origin), c: $cause.c, d: $cause.d, rqm: $rqm, rqc: $rqc,
@@ -463,9 +503,176 @@ NBLOCK=$(jq '[.[] | select(.c == "BRAK_MIEJSCA" or .c == "BRAK_PASUJACEGO_NODA" 
 cnt() { jq --arg c "$1" '[.[] | select(.c == $c)] | length' "$TMP/cls.json"; }
 
 # =============================================================================
-# 4. MIEJSCE NA NODACH DLA VM
+# 4. MIGRACJE W TOKU - CZY SIE ZBIEGAJA
 # =============================================================================
-hdr "4. MIEJSCE DLA VM NA NODACH (requesty vs allocatable)"
+hdr "4. MIGRACJE W TOKU - CZY ZDAZA SIE SKONCZYC (pamiec do przeslania vs tempo zmian)"
+cat <<'TXT'
+  Migracja (PreCopy) kopiuje pamiec VM w rundach; w tym czasie VM dalej ja zmienia. Konczy sie, gdy
+  przesyl jest szybszy niz zmiany (tempo zmian "dirty rate"). Gdy nie jest - pozostala pamiec nie maleje
+  i migracja konczy sie timeoutem: completionTimeoutPerGiB x GiB pamieci VM (albo progressTimeout,
+  gdy brak postepu). Ratunek: auto-converge (spowalnia CPU VM), post-copy (VM przechodzi na cel,
+  reszta pamieci dociagana na zadanie), wieksze bandwidthPerMigration, dedykowana siec migracyjna.
+TXT
+NRUN=$(jq '[.items[] | select(.status.phase == "Running")] | length' "$TMP/vmim.json")
+: >"$TMP/conv.jsonl"
+if (( NRUN == 0 )); then
+  echo "  Brak migracji w fazie Running (przesylanie pamieci) - nic do oceny."
+else
+  NSF=""; [[ -n $SCOPE_NS ]] && NSF="{namespace=\"$SCOPE_NS\"}"
+  prom query "$TMP/c_rem.json"   "query=kubevirt_vmi_migration_data_remaining_bytes$NSF" || true
+  prom query "$TMP/c_proc.json"  "query=kubevirt_vmi_migration_data_processed_bytes$NSF" || true
+  prom query "$TMP/c_dirty.json" "query=kubevirt_vmi_migration_dirty_memory_rate_bytes$NSF" || true
+  prom query "$TMP/c_xfer.json"  "query=kubevirt_vmi_migration_memory_transfer_rate_bytes$NSF or kubevirt_vmi_migration_disk_transfer_rate_bytes$NSF" || true
+  prom query "$TMP/c_drem.json"  "query=deriv(kubevirt_vmi_migration_data_remaining_bytes${NSF}[5m])" || true
+  jq '.items[0].spec.configuration.migrations // {}' "$TMP/kv.json" >"$TMP/kvmig.json"
+  jq -c --argjson now "$NOW" --slurpfile v "$TMP/vmi.json" --slurpfile kvm "$TMP/kvmig.json" \
+     --slurpfile r "$TMP/c_rem.json" --slurpfile p "$TMP/c_proc.json" --slurpfile d "$TMP/c_dirty.json" \
+     --slurpfile x "$TMP/c_xfer.json" --slurpfile dr "$TMP/c_drem.json" "$JQDEF"'
+    def pm: [.data.result[]? | {key: "\(.metric.namespace // "")/\(.metric.name // .metric.vmi // "")", value: (.value[1] | tonumber)}] | from_entries;
+    def mib: if . == null then "-" else (. / 1048576 | round | tostring) end;
+    ($r[0] | pm) as $R | ($p[0] | pm) as $P | ($d[0] | pm) as $D | ($x[0] | pm) as $X | ($dr[0] | pm) as $DR | $kvm[0] as $k
+    | ($v[0].items | map({key: "\(.metadata.namespace)/\(.metadata.name)", value: .}) | from_entries) as $V
+    | .items[] | select(.status.phase == "Running") | "\(.metadata.namespace)/\(.spec.vmiName)" as $key | $V[$key] as $vmi
+    | (.status.migrationState // $vmi.status.migrationState // {}) as $s | ($s.migrationConfiguration // {}) as $mc
+    | (($vmi.spec.domain.memory.guest // $vmi.spec.domain.resources.requests.memory) | mem) as $mem
+    | (($mc.completionTimeoutPerGiB // $k.completionTimeoutPerGiB // 150) | tonumber? // 150) as $ctg
+    | (([$mem / 1073741824, 1] | max) * $ctg) as $tmo
+    | ($now - (($s.startTimestamp | ts) // $now)) as $el
+    | ($mc.allowAutoConverge // $k.allowAutoConverge // false) as $ac | ($mc.allowPostCopy // $k.allowPostCopy // false) as $pc
+    | (($mc.bandwidthPerMigration // $k.bandwidthPerMigration // null) | if . == null or . == "0" or . == 0 then null else mem end) as $bw
+    | $R[$key] as $rem | $X[$key] as $xf | $D[$key] as $dirty | $DR[$key] as $drem
+    | ($bw != null and $xf != null and $xf >= 0.9 * $bw) as $bwlim
+    | (if ($s.mode // "PreCopy") == "PostCopy" then {w: "POST_COPY", d: "VM dziala juz na celu, reszta pamieci dociagana na zadanie - zakonczy sie (ryzyko: zerwanie sieci = utrata VM)"}
+       elif $rem == null and $xf == null then {w: "BRAK_METRYK", d: "brak metryk kubevirt_vmi_migration_* dla tej VM\(if $el > 0.8 * $tmo then "; trwa juz \($el | age) z ok. \($tmo | age) dozwolonych - blisko timeoutu" else "" end)"}
+       elif $xf != null and $dirty != null and $xf > 0 and $dirty >= 0.9 * $xf then
+         {w: "NIE_ZBIEGA_SIE", d: "VM zmienia \($dirty | mib) MiB/s pamieci, przesyl \($xf | mib) MiB/s\(if $bwlim then " (= limit bandwidthPerMigration)" else "" end)\(if $ac then "; auto-converge wlaczone - spowalnia CPU VM" else "" end)"}
+       elif $drem != null and $drem >= 0 and ($rem // 0) > 0 and $el > 300 then
+         {w: "BRAK_SPADKU", d: "pozostala pamiec (\($rem | mib) MiB) nie maleje od 5 min\(if $bwlim then "; przesyl na limicie bandwidthPerMigration" else "" end)"}
+       elif $xf != null and $rem != null and $xf > ($dirty // 0) then
+         (($rem / ($xf - ($dirty // 0)))) as $eta
+         | if $el + $eta > $tmo then {w: "NIE_ZDAZY", d: "szacowany koniec za ok. \($eta | age), a timeout za ok. \(([$tmo - $el, 0] | max) | age)"}
+           else {w: "ZBIEGA_SIE", d: "szacowany koniec za ok. \([$eta, 60] | max | age)"} end
+       else {w: "BRAK_DANYCH", d: "niepelne metryki (pozostalo \($rem | mib) MiB, przesyl \($xf | mib) MiB/s)"} end) as $verd
+    | {ns: .metadata.namespace, vm: .spec.vmiName, src: ($s.sourceNode // $vmi.status.nodeName // "-" | split(".")[0]),
+       dst: ($s.targetNode // "-" | split(".")[0]), mode: ($s.mode // "PreCopy"), el: $el, els: ($el | age), tmos: ($tmo | age),
+       memg: ($mem | gi), rem: ($rem | mib), xf: ($xf | mib), dirty: ($dirty | mib), ac: $ac, pc: $pc, bwlim: $bwlim, w: $verd.w, d: $verd.d}' \
+    "$TMP/vmim.json" >"$TMP/conv.jsonl" 2>"$TMP/conv.err"
+  [[ -s $TMP/conv.err ]] && warn "zbieznosc: $(head -c 300 "$TMP/conv.err")"
+  { printf 'NAMESPACE\tVM\tZ_NODA->NA\tPAMIEC\tTRYB\tTRWA/TIMEOUT\tPOZOSTALO_MiB\tPRZESYL_MiB/s\tZMIANY_MiB/s\tAUTOCONV/POSTCOPY\tWERDYKT\n'
+    jq -s -r --argjson n "$TOPN" 'sort_by(-.el) | .[:$n][] | [.ns, .vm, "\(.src)->\(.dst)", "\(.memg)Gi", .mode, "\(.els)/\(.tmos)",
+       .rem, .xf, .dirty, "\(if .ac then "tak" else "nie" end)/\(if .pc then "tak" else "nie" end)", .w] | @tsv' "$TMP/conv.jsonl"
+  } | table
+  jq -s -r 'sort_by(-.el)[] | select(.w != "ZBIEGA_SIE") | "  \(.ns)/\(.vm): \(.w) - \(.d)"' "$TMP/conv.jsonl" | head -n "$TOPN"
+  echo "  TIMEOUT liczony jako completionTimeoutPerGiB x pamiec VM (bez dyskow kopiowanych blokowo) - wartosc orientacyjna."
+fi
+jq -s '.' "$TMP/conv.jsonl" >"$TMP/conv.json"
+cntw() { jq --arg w "$1" '[.[] | select(.w == $w)] | length' "$TMP/conv.json"; }
+V_NZ=$(cntw NIE_ZBIEGA_SIE); V_BS=$(cntw BRAK_SPADKU); V_ND=$(cntw NIE_ZDAZY); V_NM=$(cntw BRAK_METRYK); V_PC=$(cntw POST_COPY)
+V_DATA=$(jq '[.[] | select(.w != "BRAK_METRYK" and .w != "POST_COPY")] | length' "$TMP/conv.json")
+V_BW=$(jq '[.[] | select(.bwlim)] | length' "$TMP/conv.json")
+V_NOAC=$(jq '[.[] | select((.w == "NIE_ZBIEGA_SIE" or .w == "BRAK_SPADKU" or .w == "NIE_ZDAZY") and (.ac | not))] | length' "$TMP/conv.json")
+V_NOPC=$(jq '[.[] | select((.w == "NIE_ZBIEGA_SIE" or .w == "BRAK_SPADKU" or .w == "NIE_ZDAZY") and (.pc | not))] | length' "$TMP/conv.json")
+
+# =============================================================================
+# 5. MIGRACJE ZAKONCZONE - NIEUDANE I CZAS TRWANIA
+# =============================================================================
+hdr "5. MIGRACJE ZAKONCZONE - DLACZEGO SIE NIE UDAJA I JAK DLUGO TRWAJA UDANE"
+echo "  Zrodlo: obiekty VMIM (KubeVirt trzyma tylko kilka ostatnich zakonczonych migracji kazdej VM - to"
+echo "  probka ostatnich dni, nie pelna historia) i eventy z ostatnich godzin."
+jq -c --argjson now "$NOW" --slurpfile v "$TMP/vmi.json" --slurpfile ev "$TMP/ev.json" "$JQDEF"'
+  def fcls($r; $s; $pp):
+    if ($r | test("not completed after|completion timeout|acceptable completion"; "i")) then "TIMEOUT_ZAKONCZENIA"
+    elif ($r | test("stuck for|no progress|progress timeout"; "i")) then "BRAK_POSTEPU"
+    elif ($s.abortRequested == true) or (($s.abortStatus // "") == "Succeeded") or ($r | test("abort|cancel"; "i")) then "PRZERWANA"
+    elif ($r | test("unschedul|pending.*timeout|timeout.*pending|insufficient"; "i"))
+         or (($s.startTimestamp // null) == null and ($pp | index("Running")) == null and ($pp | index("TargetReady")) == null) then "NIE_WYSTARTOWALA"
+    elif ($r | test("connect|network|dial|refused|tls|reset by peer|broken pipe|no route|i/o timeout|unreachable"; "i")) then "SIEC"
+    elif ($r | test("target|virt-launcher|pod .*(fail|terminat|delet)|exited|killed"; "i")) then "CEL_PADL"
+    elif ($r | test("disk|volume|storage|block|pvc"; "i")) then "STORAGE"
+    elif ($r | test("libvirt|qemu|domain|cpu|feature"; "i")) then "QEMU_LIBVIRT"
+    elif $r == "" then "BEZ_POWODU" else "INNA" end;
+  ($v[0].items | map({key: "\(.metadata.namespace)/\(.metadata.name)", value: .}) | from_entries) as $V
+  | .items[] | select(.status.phase == "Succeeded" or .status.phase == "Failed") | . as $m
+  | (.status.migrationState // {}) as $s | [.status.phaseTransitionTimestamps[]?.phase] as $pp
+  | ([$ev[0].items[] | select(.involvedObject.name == $m.metadata.name and .involvedObject.namespace == $m.metadata.namespace and .type == "Warning")
+      | (.message // "")] | last // "") as $evw
+  | (($s.failureReason // "") | if . == "" then $evw else . end | gsub("[\n\t]"; " ")) as $r
+  | ([.status.phaseTransitionTimestamps[]? | select(.phase == $m.status.phase) | .phaseTransitionTimestamp | ts] | last) as $pt
+  | (($s.endTimestamp | ts) // $pt // (.metadata.creationTimestamp | ts)) as $t
+  | (if ($s.startTimestamp // null) != null and ($s.endTimestamp // null) != null then ($s.endTimestamp | ts) - ($s.startTimestamp | ts) else null end) as $dur
+  | $V["\(.metadata.namespace)/\(.spec.vmiName)"] as $vmi
+  | {ns: .metadata.namespace, vm: .spec.vmiName, ph: .status.phase, t: $t, dur: $dur, mode: ($s.mode // "-"),
+     src: ($s.sourceNode // "-"), dst: ($s.targetNode // "-"), origin: (.metadata.name | origin),
+     mem: (if $vmi then (($vmi.spec.domain.memory.guest // $vmi.spec.domain.resources.requests.memory) | mem) else null end),
+     c: (if .status.phase == "Failed" then fcls($r; $s; $pp) else "-" end), r: ($r | .[0:160])}' "$TMP/vmim.json" >"$TMP/fin.jsonl" 2>"$TMP/fin.err"
+[[ -s $TMP/fin.err ]] && warn "migracje zakonczone: $(head -c 300 "$TMP/fin.err")"
+jq -s '.' "$TMP/fin.jsonl" >"$TMP/fin.json"
+read -r F_OK F_FAIL < <(jq -r '"\([.[] | select(.ph == "Succeeded")] | length) \([.[] | select(.ph == "Failed")] | length)"' "$TMP/fin.json")
+desc_fail() { case $1 in
+  TIMEOUT_ZAKONCZENIA) echo "przekroczony czas (completionTimeoutPerGiB) - pamiec zmieniala sie szybciej niz przesyl";;
+  BRAK_POSTEPU) echo "brak postepu kopiowania (progressTimeout)";;
+  PRZERWANA) echo "przerwana: anulowanie (usuniety VMIM) lub abort";;
+  NIE_WYSTARTOWALA) echo "nie ruszyla - pod docelowy nie powstal/nie zmiescil sie (timeout Pending)";;
+  SIEC) echo "blad polaczenia miedzy nodami (siec migracyjna/firewall/MTU)";;
+  CEL_PADL) echo "pod docelowy (virt-launcher) padl lub zostal usuniety";;
+  STORAGE) echo "problem z dyskami/wolumenami";;
+  QEMU_LIBVIRT) echo "blad QEMU/libvirt (np. niezgodne CPU/funkcje na celu)";;
+  BEZ_POWODU) echo "brak failureReason i eventow - patrz logi virt-handler";;
+  *) echo "inny - patrz komunikat";; esac; }
+F_TOT=$(( F_OK + F_FAIL ))
+if (( F_TOT == 0 )); then
+  echo "  Brak zakonczonych migracji w obiektach VMIM${SCOPE_NS:+ w $SCOPE_NS}."
+else
+  echo
+  echo "  Zakonczone: $F_TOT   udane: $F_OK   nieudane: $F_FAIL ($(( F_FAIL * 100 / F_TOT ))%)"
+fi
+if (( F_FAIL > 0 )); then
+  sub "Nieudane wg przyczyny"
+  { printf 'PRZYCZYNA\tLICZBA\tOPIS\tOSTATNIA\n'
+    jq -r 'map(select(.ph == "Failed")) | group_by(.c) | sort_by(-length)[] | [.[0].c, (length | tostring), (map(.t) | max | strftime("%Y-%m-%d %H:%M"))] | @tsv' "$TMP/fin.json" \
+    | while IFS=$'\t' read -r c n t; do printf '%s\t%s\t%s\t%s\n' "$c" "$n" "$(desc_fail "$c")" "$t"; done
+  } | table
+  sub "Nody w migracjach: nieudane / udane (zrodlo i cel)"
+  { printf 'NODE\tNIEUDANE_ZRODLO\tNIEUDANE_CEL\tUDANE_ZRODLO\tUDANE_CEL\n'
+    jq -r '[.[] | select(.ph == "Failed" or .ph == "Succeeded")] as $a
+      | ([$a[] | .src, .dst] | map(select(. != "-")) | unique) as $nodes
+      | [$nodes[] as $n | {n: $n, fs: ([$a[] | select(.ph == "Failed" and .src == $n)] | length), fd: ([$a[] | select(.ph == "Failed" and .dst == $n)] | length),
+          os: ([$a[] | select(.ph == "Succeeded" and .src == $n)] | length), od: ([$a[] | select(.ph == "Succeeded" and .dst == $n)] | length)}]
+      | sort_by(-(.fs + .fd))[] | [(.n | split(".")[0]), (.fs | tostring), (.fd | tostring), (.os | tostring), (.od | tostring)] | @tsv' "$TMP/fin.json" | head -n "$TOPN"
+  } | table
+  sub "VM z powtarzajacymi sie porazkami (>= 2)"
+  { printf 'NAMESPACE\tVM\tNIEUDANE\tUDANE\tPAMIEC\tOSTATNIA_PRZYCZYNA\n'
+    jq -r --argjson n "$TOPN" "$JQDEF"'group_by("\(.ns)/\(.vm)") | map({ns: .[0].ns, vm: .[0].vm, f: [.[] | select(.ph == "Failed")], o: ([.[] | select(.ph == "Succeeded")] | length), mem: .[0].mem})
+      | map(select((.f | length) >= 2)) | sort_by(-(.f | length)) | .[:$n][]
+      | [.ns, .vm, (.f | length | tostring), (.o | tostring), (if .mem then "\(.mem | gi)Gi" else "-" end), (.f | sort_by(.t) | last | .c)] | @tsv' "$TMP/fin.json"
+  } | table
+  sub "Ostatnie nieudane (maks. $TOPN)"
+  { printf 'KIEDY\tNAMESPACE\tVM\tZRODLO\tZ_NODA->NA\tTRYB\tTRWALA\tPRZYCZYNA\tKOMUNIKAT\n'
+    jq -r --argjson n "$TOPN" "$JQDEF"'map(select(.ph == "Failed")) | sort_by(-.t) | .[:$n][]
+      | [(.t | strftime("%m-%d %H:%M")), .ns, .vm, .origin, (if .src == "-" and .dst == "-" then "-" else "\(.src | split(".")[0])->\(.dst | split(".")[0])" end), .mode,
+         (if .dur then (.dur | age) else "-" end), .c, (if .r == "" then "-" else .r[0:90] end)] | @tsv' "$TMP/fin.json"
+  } | table
+fi
+if (( F_OK > 0 )); then
+  sub "Czas trwania udanych migracji"
+  jq -r "$JQDEF"'[.[] | select(.ph == "Succeeded" and .dur != null) | .dur] | sort
+    | if length == 0 then "  (brak znacznikow startu/konca w migrationState)"
+      else "  Udanych z czasem: \(length)   mediana: \(.[length / 2 | floor] | age)   90%: \(.[(length * 0.9 | floor)] // .[-1] | age)   maks.: \(.[-1] | age)" end' "$TMP/fin.json"
+  { printf 'NAMESPACE\tVM\tPAMIEC\tCZAS\tGiB/min\tTRYB\tZ_NODA->NA\tKIEDY\n'
+    jq -r "$JQDEF"'map(select(.ph == "Succeeded" and .dur != null)) | sort_by(-.dur) | .[:10][]
+      | [.ns, .vm, (if .mem then "\(.mem | gi)Gi" else "-" end), (.dur | age),
+         (if .mem and .dur > 0 then (.mem / 1073741824 / (.dur / 60) * 10 | round / 10 | tostring) else "-" end), .mode,
+         "\(.src | split(".")[0])->\(.dst | split(".")[0])", (.t | strftime("%m-%d %H:%M"))] | @tsv' "$TMP/fin.json"
+  } | table
+  echo "  Najwolniejsze 10. GiB/min = pamiec VM / czas; znacznie nizsze niz u innych VM = VM intensywnie zmienia pamiec"
+  echo "  albo lacze jest wspoldzielone/ograniczone (bandwidthPerMigration)."
+fi
+cntf() { jq --arg c "$1" '[.[] | select(.ph == "Failed" and .c == $c)] | length' "$TMP/fin.json"; }
+
+# =============================================================================
+# 6. MIEJSCE NA NODACH DLA VM
+# =============================================================================
+hdr "6. MIEJSCE DLA VM NA NODACH (requesty vs allocatable)"
 { printf 'NODE\tREADY\tCORDON\tKV_SCHED\tALLOC_MEM\tREQ_MEM\tWOLNE_MEM\tALLOC_CPU\tREQ_CPU\tWOLNE_CPU\tVM\tMIGRACJE_WYCH\n'
   jq -r --slurpfile v "$TMP/vmi.json" --slurpfile cl "$TMP/cls.json" "$JQDEF"'
     to_entries | map(select(.value.kvs != "-")) | sort_by(.value.fm // 0) | reverse[] | .key as $n | .value as $x
@@ -488,9 +695,9 @@ if [[ $FREE_OK == true && $NCLS -gt 0 ]]; then
 fi
 
 # =============================================================================
-# 5. BLOKADY: QUOTA, PDB, VM NIEMIGROWALNE PRZY DRAINIE, DYSKI RWO
+# 7. BLOKADY: QUOTA, PDB, VM NIEMIGROWALNE PRZY DRAINIE, DYSKI RWO
 # =============================================================================
-hdr "5. BLOKADY: KWOTY, PDB, VM NIEMIGROWALNE, DYSKI"
+hdr "7. BLOKADY: KWOTY, PDB, VM NIEMIGROWALNE, DYSKI"
 sub "ResourceQuota w namespace z niezakonczonymi migracjami (pod docelowy tez sie wlicza!)"
 { printf 'NAMESPACE\tQUOTA\tZASOB\tUZYTE\tLIMIT\tPROCENT\n'
   jq -r --slurpfile cl "$TMP/cls.json" "$JQDEF"'([$cl[0][].ns] | unique) as $nss
@@ -529,22 +736,84 @@ sub "VM blokujace drain: evictionStrategy=LiveMigrate, a LiveMigratable=False"
 NBLKDRAIN=$(jq --slurpfile n "$TMP/nodes.json" '([$n[0].items[] | select(.spec.unschedulable == true) | .metadata.name]) as $cord
   | [.items[] | select((.spec.evictionStrategy // "") == "LiveMigrate" and any(.status.conditions[]?; .type == "LiveMigratable" and .status == "False") and (.status.nodeName as $nn | $cord | index($nn)))] | length' "$TMP/vmi.json")
 
+sub "Cechy VM blokujace lub ograniczajace migracje (wszystkie dzialajace VM w zakresie)"
+# BLOKUJE = migracja niemozliwa; WARUNKOWO = zalezy od wersji CNV / konfiguracji; OGRANICZA = tylko na wybrane nody
+jq -c --slurpfile pv "$TMP/pvcall.json" '
+  ($pv[0].items | map({key: "\(.metadata.namespace)/\(.metadata.name)", value: .}) | from_entries) as $P
+  | .items[] | .metadata.namespace as $ns | .spec as $s | ($s.networks // []) as $nets
+  | ([$s.volumes[]? | (.persistentVolumeClaim.claimName // .dataVolume.name // empty) as $c | $P["\($ns)/\($c)"] as $p
+      | select($p != null and (($p.spec.accessModes // []) | index("ReadWriteMany")) == null) | $c]) as $rwo
+  | [ (if (($s.domain.devices.gpus // []) | length) > 0 then {f: "GPU/vGPU", w: "BLOKUJE"} else empty end),
+      (if (($s.domain.devices.hostDevices // []) | length) > 0 then {f: "hostDevices (PCI passthrough)", w: "BLOKUJE"} else empty end),
+      (if any($s.volumes[]?; .hostDisk != null) then {f: "dysk hostDisk (lokalny na nodzie)", w: "BLOKUJE"} else empty end),
+      (if ($rwo | length) > 0 then {f: "dysk PVC bez RWX (\($rwo | .[0:2] | join(",")))", w: "BLOKUJE"} else empty end),
+      (if any($s.domain.devices.interfaces[]?; .bridge != null and (.name as $n | any($nets[]; .name == $n and .pod != null)))
+       then {f: "interfejs bridge w sieci podow", w: "BLOKUJE"} else empty end),
+      (if $s.domain.launchSecurity != null then {f: "launchSecurity (SEV)", w: "BLOKUJE"} else empty end),
+      (if any($s.domain.devices.disks[]?; .lun.reservation == true) then {f: "dysk LUN z persistent reservation", w: "BLOKUJE"} else empty end),
+      (if any($s.domain.devices.interfaces[]?; .sriov != null) then {f: "SR-IOV", w: "WARUNKOWO"} else empty end),
+      (if (($s.domain.devices.filesystems // []) | length) > 0 then {f: "virtiofs (filesystems)", w: "WARUNKOWO"} else empty end),
+      (if any(.status.volumeStatus[]?; .hotplugVolume != null) then {f: "dyski hotplug", w: "WARUNKOWO"} else empty end),
+      (if ($s.domain.devices.tpm.persistent == true) or ($s.domain.firmware.bootloader.efi.persistent == true)
+       then {f: "trwaly vTPM/EFI", w: "WARUNKOWO"} else empty end),
+      (if ($s.domain.cpu.model // "") == "host-passthrough" then {f: "CPU host-passthrough", w: "OGRANICZA"} else empty end),
+      (if $s.domain.cpu.dedicatedCpuPlacement == true then {f: "dedykowane CPU (CPU manager)", w: "OGRANICZA"} else empty end),
+      (if $s.domain.memory.hugepages != null then {f: "hugepages \($s.domain.memory.hugepages.pageSize // "")", w: "OGRANICZA"} else empty end),
+      (if (($s.evictionStrategy // "") | test("^(None|External)$")) then {f: "evictionStrategy \($s.evictionStrategy)", w: "DRAIN"} else empty end)
+    ] as $f
+  | ([.status.conditions[]? | select(.type == "LiveMigratable")][0]) as $lm
+  | select(($f | length) > 0 or ($lm.status // "True") == "False")
+  | {ns: $ns, vm: .metadata.name, node: (.status.nodeName // "-" | split(".")[0]), ev: ($s.evictionStrategy // "-"),
+     lm: ($lm.status // "?"), lmr: ($lm.reason // ""), f: $f}' "$TMP/vmi.json" >"$TMP/feat.jsonl" 2>"$TMP/feat.err"
+[[ -s $TMP/feat.err ]] && warn "cechy VM: $(head -c 300 "$TMP/feat.err")"
+jq -s '.' "$TMP/feat.jsonl" >"$TMP/feat.json"
+feat_todo() { case $1 in
+  GPU*|hostDevices*) echo "zatrzymaj VM na czas drainu (evictionStrategy: None/External) albo przenies urzadzenie";;
+  "dysk hostDisk"*) echo "przenies dysk na PVC RWX";;
+  "dysk PVC bez RWX"*) echo "sklonuj/przenies dysk na StorageClass z trybem RWX";;
+  "interfejs bridge"*) echo "w sieci podow uzyj masquerade zamiast bridge";;
+  "launchSecurity"*|"dysk LUN"*) echo "migracja niewspierana - zatrzymaj VM na czas drainu";;
+  SR-IOV) echo "migracja tylko gdy wersja CNV ja wspiera i na celu sa wolne VF tej samej sieci";;
+  virtiofs*) echo "starsze CNV nie migruja VM z virtiofs - sprawdz wersje";;
+  "dyski hotplug"*) echo "starsze CNV nie migruja VM z dyskami hotplug - sprawdz wersje";;
+  "trwaly vTPM"*) echo "wymaga StorageClass RWX dla stanu VM (HCO spec.vmStateStorageClass)";;
+  "CPU host-passthrough") echo "migracja tylko na identyczny CPU - rozwaz host-model lub wspolny model";;
+  "dedykowane CPU"*) echo "cel musi miec CPU manager i wolne cale rdzenie";;
+  hugepages*) echo "cel musi miec wolne hugepages tego rozmiaru";;
+  evictionStrategy*) echo "przy drainie VM nie migruje: None = wylaczenie, External = czeka na zewnetrzny kontroler";;
+  *) echo "-";; esac; }
+{ printf 'CECHA\tWPLYW\tLICZBA_VM\tPRZYKLAD\tCO_ZROBIC\n'
+  jq -r '[.[] | . as $v | .f[] | {f: (.f | sub(" \\(.*"; "")), w, x: "\($v.ns)/\($v.vm)"}] | group_by(.f)
+     | sort_by({"BLOKUJE": 0, "WARUNKOWO": 1, "OGRANICZA": 2, "DRAIN": 3}[.[0].w], -length)[] | [.[0].f, .[0].w, (length | tostring), .[0].x] | @tsv' "$TMP/feat.json" \
+  | while IFS=$'\t' read -r f w n x; do printf '%s\t%s\t%s\t%s\t%s\n' "$f" "$w" "$n" "$x" "$(feat_todo "$f")"; done
+} | table
+{ printf 'NAMESPACE\tVM\tNODE\tEVICTION\tLIVE_MIGRATABLE\tCECHY_BLOKUJACE_I_WARUNKOWE\n'
+  jq -r --argjson n "$TOPN" '[.[] | select(.lm == "False" or any(.f[]; .w == "BLOKUJE" or .w == "WARUNKOWO"))]
+     | sort_by(.lm != "False", .ns, .vm) | .[:$n][]
+     | [.ns, .vm, .node, .ev, "\(.lm)\(if .lmr != "" then " (\(.lmr))" else "" end)",
+        ([.f[] | select(.w == "BLOKUJE" or .w == "WARUNKOWO") | .f] | if length == 0 then "- (powod tylko w warunku LiveMigratable)" else join("; ") end)] | @tsv' "$TMP/feat.json"
+} | table
+echo "  WPLYW: BLOKUJE - migracja niemozliwa; WARUNKOWO - zalezy od wersji CNV/konfiguracji; OGRANICZA - tylko na"
+echo "  czesc nodow (moze dawac BRAK_PASUJACEGO_NODA); DRAIN - przy drainie VM nie migruje (wylaczenie/zewnetrzny kontroler)."
+N_FBLK=$(jq '[.[] | select(any(.f[]; .w == "BLOKUJE"))] | length' "$TMP/feat.json")
+CL_EV=$(jq -r '.items[0].spec.evictionStrategy // "LiveMigrate"' "$TMP/hco.json")
+N_FBLK_LM=$(jq --arg cev "$CL_EV" '[.[] | select(any(.f[]; .w == "BLOKUJE") and (.ev == "LiveMigrate" or .ev == "LiveMigrateIfPossible" or (.ev == "-" and $cev != "None")))] | length' "$TMP/feat.json")
+N_FHPT=$(jq '[.[] | select(any(.f[]; .f == "CPU host-passthrough"))] | length' "$TMP/feat.json")
+N_FNOEV=$(jq '[.[] | select(any(.f[]; .w == "DRAIN"))] | length' "$TMP/feat.json")
+
 sub "Dyski VM niemigrowalnych (PVC i tryb dostepu)"
-NSL=$(jq -r '[.items[] | select(any(.status.conditions[]?; .type == "LiveMigratable" and .status == "False" and ((.reason // "") | test("Disk|Volume|Storage"; "i")))) | .metadata.namespace] | unique | .[]' "$TMP/vmi.json")
-: >"$TMP/pvc.jsonl"
-for ns in $NSL; do oc_ro get pvc -n "$ns" -o json 2>/dev/null | jq -c '.items[]' >>"$TMP/pvc.jsonl"; done
 { printf 'NAMESPACE\tVM\tPVC\tTRYB\tSTORAGECLASS\tVOLUMEMODE\n'
   jq -s -r --slurpfile v "$TMP/vmi.json" '(map({key: "\(.metadata.namespace)/\(.metadata.name)", value: .}) | from_entries) as $p
     | $v[0].items[] | select(any(.status.conditions[]?; .type == "LiveMigratable" and .status == "False" and ((.reason // "") | test("Disk|Volume|Storage"; "i"))))
     | .metadata.namespace as $ns | .metadata.name as $vm
     | .spec.volumes[]? | (.persistentVolumeClaim.claimName // .dataVolume.name // empty) as $c | $p["\($ns)/\($c)"] as $pc
-    | [$ns, $vm, $c, ($pc.spec.accessModes // ["?"] | join(",")), ($pc.spec.storageClassName // "-"), ($pc.spec.volumeMode // "-")] | @tsv' "$TMP/pvc.jsonl" | head -n "$TOPN"
+    | [$ns, $vm, $c, ($pc.spec.accessModes // ["?"] | join(",")), ($pc.spec.storageClassName // "-"), ($pc.spec.volumeMode // "-")] | @tsv' <(jq -c '.items[]' "$TMP/pvcall.json") | head -n "$TOPN"
 } | table
 
 # =============================================================================
-# 6. HISTORIA I ALERTY (Prometheus)
+# 8. HISTORIA I ALERTY (Prometheus)
 # =============================================================================
-hdr "6. HISTORIA MIGRACJI I ALERTY (Prometheus, $HDAYS dni)"
+hdr "8. HISTORIA MIGRACJI I ALERTY (Prometheus, $HDAYS dni)"
 STEP=3600; T1=$(( NOW / STEP * STEP )); T0=$(( T1 - HDAYS * 86400 ))
 for p in pending scheduling running; do
   prom query_range "$TMP/h_$p.json" "query=sum(kubevirt_vmi_migrations_in_${p}_phase) or vector(0)" "start=$T0" "end=$T1" "step=$STEP" || true
@@ -572,9 +841,9 @@ prom query "$TMP/al.json" "query=ALERTS{alertstate=\"firing\",namespace=\"$CNV_N
 NVMCBE=$(jq '[.data.result[] | select(.metric.alertname == "VMCannotBeEvicted")] | length' "$TMP/al.json")
 
 # =============================================================================
-# 7. LOGI virt-controller / virt-handler
+# 9. LOGI virt-controller / virt-handler
 # =============================================================================
-hdr "7. LOGI virt-controller / virt-handler (ostatnie ${LOGH}h)"
+hdr "9. LOGI virt-controller / virt-handler (ostatnie ${LOGH}h)"
 if (( ! LOGS )); then echo "  Pominiete (-L)."
 else
   norm() { sed -E 's/"(ts|timestamp|time)":"[^"]*",?//g; s/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<uid>/g;
@@ -599,9 +868,9 @@ else
 fi
 
 # =============================================================================
-# 8. PODSUMOWANIE
+# 10. PODSUMOWANIE
 # =============================================================================
-hdr "8. PODSUMOWANIE - DLACZEGO MIGRACJE STOJA I CO ZROBIC"
+hdr "10. PODSUMOWANIE - DLACZEGO MIGRACJE STOJA I CO ZROBIC"
 C_QCL=$(cnt KOLEJKA_KLASTER); C_QN=$(cnt KOLEJKA_NODE); C_MEM=$(cnt BRAK_MIEJSCA); C_NODE=$(cnt BRAK_PASUJACEGO_NODA)
 C_NM=$(cnt NIEMIGROWALNA); C_ADM=$(cnt ODRZUCONE_PRZY_TWORZENIU); C_DUP=$(cnt DUPLIKAT); C_ORF=$(( $(cnt VMI_BRAK) + $(cnt VMI_NIE_DZIALA) ))
 C_TS=$(( $(cnt POD_DOCELOWY_STARTUJE) + $(cnt POD_DOCELOWY_PADL) + $(cnt STORAGE) )); C_HS=$(cnt HANDSHAKE); C_UNK=$(cnt CZEKA_NA_KONTROLER)
@@ -614,28 +883,64 @@ if (( C_QCL + C_QN > 0 )); then
   msg+=" Gdy nody maja zapas, a siec przepustowosc, mozna podniesc parallelMigrationsPerCluster / parallelOutboundMigrationsPerNode w HyperConverged (spec.liveMigrationConfig)."
   finding 1 "$msg"
 fi
-(( C_MEM > 0 )) && finding 1 "$C_MEM migracji nie ma DOKAD pojsc - pasujace nody nie maja wolnych requestow pamieci/CPU dla VM (sekcja 4). Pod docelowy wymaga tyle samo co zrodlowy (pamiec VM + narzut virt-launchera); przy drainie ubywa calego noda pojemnosci. Dzialania: dodaj/odblokuj nody (uncordon zakonczonych), zatrzymaj zbedne VM, migruj mniejszymi partiami, rozwaz overcommit pamieci VM (memoryOvercommitPercentage w HCO) zgodnie z dokumentacja."
+(( C_MEM > 0 )) && finding 1 "$C_MEM migracji nie ma DOKAD pojsc - pasujace nody nie maja wolnych requestow pamieci/CPU dla VM (sekcja 6). Pod docelowy wymaga tyle samo co zrodlowy (pamiec VM + narzut virt-launchera); przy drainie ubywa calego noda pojemnosci. Dzialania: dodaj/odblokuj nody (uncordon zakonczonych), zatrzymaj zbedne VM, migruj mniejszymi partiami, rozwaz overcommit pamieci VM (memoryOvercommitPercentage w HCO) zgodnie z dokumentacja."
 (( C_NODE > 0 )) && finding 1 "$C_NODE migracji nie ma PASUJACEGO noda (nodeSelector/affinity/tainty z poda VM; najczesciej model CPU - etykiety cpu-model-migration.node.kubevirt.io/* lub host-model). VM z cpu.model: host-passthrough albo konkretnym modelem moga migrowac tylko na identyczny sprzet. Porownaj nodeSelector poda virt-launcher z etykietami nodow; dla heterogenicznych nodow ustaw wspolny model CPU (HCO spec.defaultCPUModel lub w VM)."
 (( C_NM > 0 )) && finding 1 "$C_NM migracji dotyczy VM, ktorych NIE DA SIE MIGROWAC (LiveMigratable=False; powody w sekcji 2 i 3). Typowo: dysk PVC RWO (potrzebny RWX/ block z RWX), interfejs bridge w sieci podow (uzyj masquerade), urzadzenia PCI/GPU/vGPU, SR-IOV bez obslugi migracji. Te migracje nie przejda nigdy - VM trzeba zatrzymac na czas drainu albo zmienic jej konfiguracje."
 (( C_TERM > 0 )) && finding 1 "UWAGA - RYZYKO UTRATY DYSKU: $C_TERM VM ma dysk PVC w stanie Terminating (usuniety np. kaskadowo razem z DataVolume; trzyma go tylko finalizer pvc-protection, bo VM dziala). NIE zatrzymuj, nie restartuj i nie migruj tych VM - po zniknieciu poda virt-launcher dysk zostanie skasowany. Najpierw zabezpiecz dane (snapshot/klon PVC, backup z wnetrza VM) i zaplanuj odtworzenie dysku; szczegoly w sekcji 3."
-(( C_VOL > 0 )) && finding 1 "$C_VOL migracji stoi, bo wolumen VM nie jest gotowy (sekcja 3). virt-controller przed utworzeniem poda docelowego sprawdza kazdy dysk: PVC z wlascicielem DataVolume wymaga istniejacego DataVolume w fazie Succeeded; komunikat 'unable to find datavolume' = PVC wskazuje na DataVolume, ktorego nie ma (usuniety albo PVC odtworzony z backupu z ownerReference). Gdy PVC NIE jest Terminating: odtworz obiekt DataVolume o tej nazwie dla istniejacego PVC (adopcja PVC przez CDI) albo usun z PVC ownerReference na nieistniejacy DataVolume - po weryfikacji z dokumentacja/supportem. Gdy DataVolume istnieje (oc get dv), a blad trwa - nieaktualny cache virt-controller (logi sekcja 7)."
-(( C_ADM > 0 )) && finding 1 "$C_ADM migracji ma odrzucone utworzenie poda docelowego (komunikat w sekcji 3, kwoty w sekcji 5). Najczesciej ResourceQuota w namespace: pod docelowy liczy sie do kwoty RAZEM ze zrodlowym, wiec namespace potrzebuje zapasu na czas migracji (requests/limits pamieci i CPU, liczba podow)."
-(( NQFULL > 0 && C_ADM == 0 )) && finding 2 "W namespace z oczekujacymi migracjami $NQFULL pozycji ResourceQuota jest wykorzystanych w >=90% - pod docelowy migracji moze nie zmiescic sie w kwocie (sekcja 5)."
+(( C_VOL > 0 )) && finding 1 "$C_VOL migracji stoi, bo wolumen VM nie jest gotowy (sekcja 3). virt-controller przed utworzeniem poda docelowego sprawdza kazdy dysk: PVC z wlascicielem DataVolume wymaga istniejacego DataVolume w fazie Succeeded; komunikat 'unable to find datavolume' = PVC wskazuje na DataVolume, ktorego nie ma (usuniety albo PVC odtworzony z backupu z ownerReference). Gdy PVC NIE jest Terminating: odtworz obiekt DataVolume o tej nazwie dla istniejacego PVC (adopcja PVC przez CDI) albo usun z PVC ownerReference na nieistniejacy DataVolume - po weryfikacji z dokumentacja/supportem. Gdy DataVolume istnieje (oc get dv), a blad trwa - nieaktualny cache virt-controller (logi sekcja 9)."
+(( C_ADM > 0 )) && finding 1 "$C_ADM migracji ma odrzucone utworzenie poda docelowego (komunikat w sekcji 3, kwoty w sekcji 7). Najczesciej ResourceQuota w namespace: pod docelowy liczy sie do kwoty RAZEM ze zrodlowym, wiec namespace potrzebuje zapasu na czas migracji (requests/limits pamieci i CPU, liczba podow)."
+(( NQFULL > 0 && C_ADM == 0 )) && finding 2 "W namespace z oczekujacymi migracjami $NQFULL pozycji ResourceQuota jest wykorzystanych w >=90% - pod docelowy migracji moze nie zmiescic sie w kwocie (sekcja 7)."
 (( C_DUP > 0 )) && finding 2 "$C_DUP migracji to duplikaty dla tej samej VM - aktywna moze byc tylko jedna, pozostale czekaja (np. reczna migracja + ewakuacja). Zbedne obiekty VMIM mozna usunac po weryfikacji."
 (( C_ORF > 0 )) && finding 2 "$C_ORF migracji jest osieroconych (VM nie dziala lub nie istnieje) - nie zakoncza sie; do usuniecia po weryfikacji."
 (( C_TS > 0 )) && finding 2 "$C_TS migracji ma pod docelowy, ktory nie wystartowal (wolumeny, siec, sandbox - komunikat w sekcji 3). Sprawdz eventy poda docelowego: oc describe pod <pod> -n <ns>."
-(( C_HS > 0 )) && finding 2 "$C_HS migracji ma gotowy pod docelowy, ale nie rusza dalej - sprawdz logi virt-handler na zrodle i celu (sekcja 7) oraz siec migracyjna (NAD$([[ -n $MIGNET ]] && echo " $MIGNET"), MTU, firewall miedzy nodami)."
-(( C_RUNOLD > 0 )) && finding 2 "$C_RUNOLD migracji przesyla pamiec dluzej niz 1h - VM zmienia pamiec szybciej, niz siec ja przesyla (nie zbiega sie). Rozwaz allowAutoConverge / allowPostCopy (MigrationPolicy), wieksze bandwidthPerMigration albo dedykowana siec migracyjna; inaczej skonczy sie timeoutem (completionTimeoutPerGiB)."
-(( C_UNK > 0 )) && finding 2 "$C_UNK migracji czeka bez widocznej przyczyny w obiektach - kluczowe sa logi virt-controller (sekcja 7); uruchom skrypt z -H 6."
+(( C_HS > 0 )) && finding 2 "$C_HS migracji ma gotowy pod docelowy, ale nie rusza dalej - sprawdz logi virt-handler na zrodle i celu (sekcja 9) oraz siec migracyjna (NAD$([[ -n $MIGNET ]] && echo " $MIGNET"), MTU, firewall miedzy nodami)."
+(( C_RUNOLD > 0 && V_DATA == 0 )) && finding 2 "$C_RUNOLD migracji przesyla pamiec dluzej niz 1h, a brak metryk postepu (sekcja 4) - prawdopodobnie VM zmienia pamiec szybciej, niz siec ja przesyla. Rozwaz allowAutoConverge / allowPostCopy (MigrationPolicy), wieksze bandwidthPerMigration albo dedykowana siec migracyjna; inaczej skonczy sie timeoutem (completionTimeoutPerGiB)."
+(( C_UNK > 0 )) && finding 2 "$C_UNK migracji czeka bez widocznej przyczyny w obiektach - kluczowe sa logi virt-controller (sekcja 9); uruchom skrypt z -H 6."
 (( NEVAC_NOMIG > 0 )) && finding 2 "$NEVAC_NOMIG VMI ma ustawione evacuationNodeName (node do opuszczenia), a nie ma dla nich migracji - virt-controller jeszcze ich nie utworzyl (kolejka) albo VM nie moga migrowac."
 (( NBLKDRAIN > 0 )) && finding 1 "$NBLKDRAIN VM na nodach w cordonie ma evictionStrategy=LiveMigrate, a nie da sie ich migrowac - drain tych nodow (aktualizacja MCO) bedzie stal w nieskonczonosc (alert VMCannotBeEvicted)."
 (( NVMCBE > 0 && NBLKDRAIN == 0 )) && finding 2 "Aktywny alert VMCannotBeEvicted ($NVMCBE) - sa VM, ktore zablokuja drain noda."
-(( NPDBUSR > 0 )) && finding 2 "$NPDBUSR PDB uzytkownika z disruptionsAllowed=0 w namespace z VM - blokuja ewakuacje podow przy drainie (sekcja 5)."
+(( NPDBUSR > 0 )) && finding 2 "$NPDBUSR PDB uzytkownika z disruptionsAllowed=0 w namespace z VM - blokuja ewakuacje podow przy drainie (sekcja 7)."
 (( NDRAIN > 0 )) && finding 3 "Drain w toku na $NDRAIN nodach (MCO) - stad migracje typu drain/ewakuacja. MCP aktualizuje nody po kolei (maxUnavailable); kazdy drain to nowa fala migracji."
 (( NHNR == 0 && NKVF == 0 )) && finding 3 "virt-handler gotowy na wszystkich nodach, brak nodow z kubevirt.io/schedulable=false."
 (( NCLS == 0 && NVMIM > 0 )) && finding 3 "Wszystkie migracje sa zakonczone (Succeeded/Failed) - nic nie czeka."
 (( NVMIM == 0 )) && finding 3 "Brak obiektow migracji. Jesli VM pokazuja status Pending/Scheduling (a nie migracja), to problem ze startem VM - sprawdz pody virt-launcher w fazie Pending: oc get pods -A -l kubevirt.io=virt-launcher --field-selector=status.phase=Pending"
-(( NFAIL > 0 )) && finding 3 "Nieudanych migracji (obiekty Failed): $NFAIL - powod w .status.migrationState.failureReason (oc get vmim -A -o yaml); powtarzajace sie porazki przy postepie = VM zmienia pamiec szybciej niz siec przesyla (rozwaz allowAutoConverge / allowPostCopy / wieksze bandwidth)."
+# --- migracje w toku (sekcja 4)
+if (( V_NZ + V_BS + V_ND > 0 )); then
+  msg="$(( V_NZ + V_BS + V_ND )) trwajacych migracji sie NIE ZBIEGA (sekcja 4: tempo zmian pamieci >= przesyl: $V_NZ, pozostala pamiec nie maleje: $V_BS, nie zdazy przed timeoutem: $V_ND) - skoncza sie bledem po completionTimeoutPerGiB i beda ponawiane."
+  (( V_BW > 0 )) && msg+=" $V_BW z nich przesyla dokladnie z limitem bandwidthPerMigration ($LIM_BW) - podnies limit, jesli lacze ma zapas."
+  (( V_NOAC > 0 )) && msg+=" $V_NOAC bez auto-converge: wlacz allowAutoConverge (MigrationPolicy dla tych VM lub HCO) - KubeVirt spowolni CPU VM, az migracja sie zbiegnie."
+  (( V_NOPC > 0 )) && msg+=" Post-copy (allowPostCopy) konczy migracje zawsze, ale zerwanie sieci w tej fazie oznacza utrate VM - tylko przy stabilnej, dedykowanej sieci."
+  [[ -z $MIGNET ]] && msg+=" Migracje ida siecia podow - dedykowana siec migracyjna (osobny interfejs) zwykle rozwiazuje problem."
+  msg+=" Doraznie: przenies migracje na czas mniejszego obciazenia VM."
+  finding 1 "$msg"
+fi
+(( V_PC > 0 )) && finding 3 "$V_PC migracji jest w fazie post-copy - VM dziala juz na nodzie docelowym; nie przerywaj sieci miedzy nodami do ich konca."
+(( V_NM > 0 )) && finding 3 "Dla $V_NM trwajacych migracji brak metryk postepu (kubevirt_vmi_migration_*) - zbieznosci nie da sie ocenic; sprawdz: oc get vmim <nazwa> -n <ns> -o yaml i logi virt-handler zrodla."
+# --- nieudane (sekcja 5)
+if (( F_FAIL > 0 )); then
+  F_TO=$(( $(cntf TIMEOUT_ZAKONCZENIA) + $(cntf BRAK_POSTEPU) )); F_NW=$(cntf NIE_WYSTARTOWALA); F_NET=$(cntf SIEC)
+  F_CEL=$(cntf CEL_PADL); F_AB=$(cntf PRZERWANA); F_ST=$(cntf STORAGE); F_QE=$(cntf QEMU_LIBVIRT)
+  pr=2; (( F_FAIL * 100 / (F_TOT > 0 ? F_TOT : 1) >= 20 )) && pr=1
+  msg="Nieudanych migracji: $F_FAIL z $F_TOT zakonczonych widocznych w obiektach (sekcja 5)."
+  (( F_TO > 0 )) && msg+=" $F_TO przez TIMEOUT / brak postepu - VM zmienia pamiec szybciej niz przesyl: auto-converge, post-copy, wieksze bandwidthPerMigration, dedykowana siec migracyjna, ewentualnie wiekszy completionTimeoutPerGiB."
+  (( F_NW > 0 )) && msg+=" $F_NW nie wystartowalo - pod docelowy nie zmiescil sie na zadnym nodzie do timeoutu Pending (miejsce w sekcji 6, dopasowanie nodow w sekcji 3)."
+  (( F_NET > 0 )) && msg+=" $F_NET z bledem sieci - polaczenie miedzy virt-handlerami (siec migracyjna, MTU, firewall; sekcja 1 i logi w sekcji 9)."
+  (( F_CEL > 0 )) && msg+=" $F_CEL - pod docelowy padl (eventy/logi virt-launcher na nodzie docelowym; czesto brak pamieci noda lub zabicie przez OOM)."
+  (( F_AB > 0 )) && msg+=" $F_AB przerwanych (usuniety obiekt VMIM, anulowanie drainu/aktualizacji albo abort) - zwykle nie blad platformy."
+  (( F_ST > 0 )) && msg+=" $F_ST z bledem dyskow - sprawdz PVC/DataVolume VM (sekcja 7)."
+  (( F_QE > 0 )) && msg+=" $F_QE z bledem QEMU/libvirt - czesto niezgodny model/funkcje CPU na celu (sekcja 7: host-passthrough)."
+  finding "$pr" "$msg"
+  BADNODE=$(jq -r --argjson f "$F_FAIL" '[.[] | select(.ph == "Failed") | [.src, .dst] | unique[] | select(. != "-")]
+     | group_by(.) | map({n: .[0], c: length}) | sort_by(-.c) | .[0] // empty
+     | select(.c >= 3 and .c * 2 >= $f) | "\(.n | split(".")[0]) \(.c)"' "$TMP/fin.json")
+  [[ -n $BADNODE ]] && finding 1 "Node ${BADNODE% *} uczestniczy w ${BADNODE#* } z $F_FAIL nieudanych migracji (jako zrodlo lub cel) - co najmniej polowa porazek: sprawdz jego siec (interfejs migracyjny, MTU), virt-handler i obciazenie (sekcja 5)."
+fi
+# --- cechy VM (sekcja 7)
+(( N_FBLK_LM > 0 )) && finding 1 "$N_FBLK_LM VM ma ceche BLOKUJACA migracje (GPU/PCI, dysk bez RWX, bridge w sieci podow...) a strategie eviction LiveMigrate - przy najblizszym drainie noda (aktualizacja klastra) zablokuja go. Lista i co zrobic: sekcja 7."
+(( N_FBLK > N_FBLK_LM )) && finding 3 "$(( N_FBLK - N_FBLK_LM )) VM z cecha blokujaca migracje ma evictionStrategy None/External - przy drainie zostana wylaczone albo czekaja na zewnetrzny kontroler (sekcja 7)."
+(( N_FHPT > 0 && C_NODE > 0 )) && finding 2 "$N_FHPT VM uzywa CPU host-passthrough - moga migrowac tylko na nody z identycznym CPU; to moze tlumaczyc BRAK_PASUJACEGO_NODA (sekcja 3, 7)."
+(( N_FNOEV > 0 )) && finding 3 "$N_FNOEV VM ma evictionStrategy None/External - przy drainie nie migruja (sekcja 7)."
+(( F_TOT > 0 && F_FAIL == 0 )) && finding 3 "Wszystkie $F_TOT zakonczone migracje widoczne w obiektach VMIM sie udaly."
 
 for p in 1 2 3; do
   case $p in 1) t="NAJWAZNIEJSZE";; 2) t="DO SPRAWDZENIA";; 3) t="INFORMACYJNIE";; esac
