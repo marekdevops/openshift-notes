@@ -1,1 +1,5 @@
 oc get pod <pod-na-worker4> -o jsonpath='{.spec.containers[*].image}{"\n"}{.status.containerStatuses[*].imageID}{"\n"}'
+
+cat > /tmp/policy.json <<'EOF'
+{ "default": [ { "type": "insecureAcceptAnything" } ] }
+EOF
