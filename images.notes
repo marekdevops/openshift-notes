@@ -3,3 +3,14 @@ oc get pod <pod-na-worker4> -o jsonpath='{.spec.containers[*].image}{"\n"}{.stat
 cat > /tmp/policy.json <<'EOF'
 { "default": [ { "type": "insecureAcceptAnything" } ] }
 EOF
+
+
+
+oc login https://api.klaster.pl:6443 -u <user>
+SRC_TOKEN=$(oc whoami -t)
+
+skopeo copy \
+  --src-tls-verify=false \
+  --src-creds "<user>:${SRC_TOKEN}" \
+  docker://default-route-openshift-image-registry.apps.klaster.pl/<ns>/<app>:<tag> \
+  oci-archive:/var/tmp/app.tar:<app>:<tag>
