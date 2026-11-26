@@ -17,3 +17,13 @@ skopeo copy \
 
   REPO=$(oc get is <app> -n <ns> -o jsonpath='{.status.publicDockerImageRepository}')
 echo "docker://${REPO}:<tag>"
+
+################################# calosc
+SRC="docker://$(oc get is <app> -n <ns> -o jsonpath='{.status.publicDockerImageRepository}'):<tag>"
+echo "$SRC"
+
+skopeo copy \
+  --src-tls-verify=false \
+  --src-creds "<user>:$(oc whoami -t)" \
+  "$SRC" \
+  oci-archive:/var/tmp/app.tar:<app>:<tag>
