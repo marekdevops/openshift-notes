@@ -14,3 +14,6 @@ skopeo copy \
   --src-creds "<user>:${SRC_TOKEN}" \
   docker://default-route-openshift-image-registry.apps.klaster.pl/<ns>/<app>:<tag> \
   oci-archive:/var/tmp/app.tar:<app>:<tag>
+
+  REPO=$(oc get is <app> -n <ns> -o jsonpath='{.status.publicDockerImageRepository}')
+echo "docker://${REPO}:<tag>"
