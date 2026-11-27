@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+# chain-check.sh — sprawdza łańcuch TLS do podanego URL z perspektywy poda w namespace
+#                  i przygotowuje LOKALNIE poprawiony secret z CA bundle.
+#
+# NA KLASTRZE NIC NIE ZMIENIA. Używa wyłącznie:
+#   oc get (pods, secrets, configmaps, CR-y AAP, rs), oc exec (cat/ls — odczyt trust store w podzie)
+# Wynik (manifesty, bundle, polecenia) ląduje w lokalnym katalogu ./cert-fix-<ns>-<data>/
+#
+# Algorytm:
+#   1. pobiera łańcuch serwowany przez serwer (openssl s_client -showcerts)
+#   2. czyta trust store z poda (ten sam plik, którego używa git/curl/python w kontenerze)
+#   3. idzie od leaf w górę: issuer zaufany w podzie? podany przez serwer? jeśli nie — BRAK
+#   4. brakujący cert szuka w: --ca-file, AIA (caIssuers), secretach/CM w ns,
+#      openshift-config/user-ca-bundle, trust store bastiona
+#   5. ustala secret odpowiedzialny za zaufanie (bundle_cacert_secret w CR AAP / montaż w anchors)
+#   6. buduje nowy bundle (stara zawartość + brakujące), weryfikuje go openssl verify
+#      i zapisuje manifest + polecenia do ręcznego zastosowania
+#
+# Wymagania: oc (zalogowany), jq, openssl, curl (dla AIA), GNU coreutils
+
+set -uo pipefail
+
+URL=""; NS=""; POD=""; CONTAINER=""; SELECTOR=""; PROXY=""; NOEXEC=0; OUT=""
+CAFILES=()
+
+usage() {
+  cat <<EOF
+Użycie: $0 -u <url> -n <namespace> [opcje]
+
+  -u, --url URL          adres docelowy, np. https://gitlab.firma.pl (port opcjonalny)
+  -n, --namespace NS     namespace, z którego łączy się aplikacja (np. aap)
+  -p, --pod POD          pod, z perspektywy którego sprawdzać (domyślnie: *-task-* lub pierwszy Running)
+  -c, --container NAME   kontener w podzie (domyślnie: zawierający "task" albo pierwszy)
+  -l, --selector SEL     wybór poda po label selectorze
+      --ca-file PLIK     dodatkowe źródło brakujących certów (np. łańcuch od zespołu PKI); można powtarzać
+      --proxy HOST:PORT  proxy dla openssl s_client z bastiona (openssl 1.1.1+)
+      --no-exec          nie czytaj trust store z poda — przybliżenie: trust bastiona + zamontowane secrety
+  -o, --out KATALOG      katalog wyników (domyślnie ./cert-fix-<ns>-<data>)
+  -h, --help
+
+Kod wyjścia: 0 = łańcuch OK, 1 = brak certu, poprawka przygotowana, 3 = brak certu, nie udało się go znaleźć, 2 = błąd
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|--url) URL="${2:-}"; shift 2 ;;
+    -n|--namespace) NS="${2:-}"; shift 2 ;;
+    -p|--pod) POD="${2:-}"; shift 2 ;;
+    -c|--container) CONTAINER="${2:-}"; shift 2 ;;
+    -l|--selector) SELECTOR="${2:-}"; shift 2 ;;
+    --ca-file) CAFILES+=("${2:-}"); shift 2 ;;
+    --proxy) PROXY="${2:-}"; shift 2 ;;
+    --no-exec) NOEXEC=1; shift ;;
+    -o|--out) OUT="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Nieznana opcja: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+[[ -z "$URL" || -z "$NS" ]] && { usage >&2; exit 2; }
+for b in oc jq openssl awk sha256sum; do
+  command -v "$b" >/dev/null 2>&1 || { echo "Brak narzędzia: $b" >&2; exit 2; }
+done
+
+hp=${URL#*://}; hp=${hp%%/*}; hp=${hp##*@}
+HOST=${hp%%:*}; PORT=443
+[[ "$hp" == *:* ]] && PORT=${hp##*:}
+
+if [[ -t 1 ]]; then R=$'\e[31m'; Y=$'\e[33m'; G=$'\e[32m'; B=$'\e[1m'; D=$'\e[2m'; N=$'\e[0m'
+else R=""; Y=""; G=""; B=""; D=""; N=""; fi
+
+TMP=$(mktemp -d); chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
+OUT=${OUT:-./cert-fix-$NS-$(date +%Y%m%d-%H%M%S)}
+
+step() { echo; echo "${B}[$1] $2${N}"; }
+info() { echo "    $*"; }
+warn() { echo "    ${Y}! $*${N}"; }
+
+# ---------------------------------------------------------------- helpery certów
+split_certs() {   # stdin PEM -> $1/c001.pem...; wypisuje liczbę
+  mkdir -p "$1"
+  awk -v d="$1" '
+    /-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/c%03d.pem", d, n); p = 1 }
+    p { print > f }
+    /-----END CERTIFICATE-----/ { if (p) close(f); p = 0 }
+    END { print n + 0 }'
+}
+subj_of()  { openssl x509 -in "$1" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject= *//'; }
+iss_of()   { openssl x509 -in "$1" -noout -issuer  -nameopt RFC2253 2>/dev/null | sed 's/^issuer= *//'; }
+ski_of()   { openssl x509 -in "$1" -noout -ext subjectKeyIdentifier 2>/dev/null | sed -n '2p' | tr -d ' :' | tr 'a-f' 'A-F'; }
+aki_of()   { openssl x509 -in "$1" -noout -ext authorityKeyIdentifier 2>/dev/null | sed -n '2p' | sed 's/keyid://' | tr -d ' :' | tr 'a-f' 'A-F'; }
+fp_of()    { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+end_of()   { openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2; }
+aia_of()   { openssl x509 -in "$1" -noout -ext authorityInfoAccess 2>/dev/null | grep -i 'CA Issuers' | sed 's/.*URI://' | head -1; }
+is_self()  { [[ "$(subj_of "$1")" == "$(iss_of "$1")" ]]; }
+cn_of()    { subj_of "$1" | sed -n 's/.*CN=\([^,]*\).*/\1/p'; }
+
+# indeksuje PEM (stdin) do pliku indeksu: plik \t subject \t ski \t etykieta
+SEQ=0
+index_pem() {   # $1 = plik indeksu, $2 = etykieta
+  local idx=$1 label=$2 dir n f
+  SEQ=$((SEQ+1)); dir="$TMP/pool$SEQ"
+  n=$(split_certs "$dir")
+  (( n == 0 )) && return 0
+  for f in "$dir"/c*.pem; do
+    printf '%s\t%s\t%s\t%s\n' "$f" "$(subj_of "$f")" "$(ski_of "$f")" "$label" >> "$idx"
+  done
+}
+
+# szuka wystawcy: najpierw AKI==SKI i subject, potem samo AKI, potem sam subject
+lookup() {   # $1 idx, $2 subject issuera, $3 AKI -> "plik\tetykieta"
+  local idx=$1 s=$2 a=$3 r=""
+  [[ -s "$idx" ]] || return 0
+  if [[ -n "$a" ]]; then
+    r=$(awk -F'\t' -v s="$s" -v a="$a" '$3==a && $2==s {print $1"\t"$4; exit}' "$idx")
+    [[ -z "$r" ]] && r=$(awk -F'\t' -v a="$a" '$3==a {print $1"\t"$4; exit}' "$idx")
+  fi
+  [[ -z "$r" ]] && r=$(awk -F'\t' -v s="$s" '$2==s {print $1"\t"$4; exit}' "$idx")
+  printf '%s' "$r"
+}
+
+describe() {  # krótki opis certu
+  local f=$1
+  echo "${B}$(subj_of "$f")${N}"
+  echo "        issuer: $(iss_of "$f")   ważny do: $(end_of "$f")"
+}
+
+echo "${B}chain-check: $URL  (ns: $NS, klaster: $(oc whoami --show-server 2>/dev/null || echo '?'))${N}"
+oc get namespace "$NS" >/dev/null 2>&1 || { echo "${R}Brak namespace $NS lub brak dostępu${N}" >&2; exit 2; }
+
+# ---------------------------------------------------------------- 1. łańcuch z serwera
+step 1/6 "Łańcuch serwowany przez $HOST:$PORT"
+proxy_args=()
+[[ -n "$PROXY" ]] && proxy_args=(-proxy "$PROXY")
+sc=$(timeout 15 openssl s_client -connect "$HOST:$PORT" -servername "$HOST" -showcerts "${proxy_args[@]}" </dev/null 2>&1)
+n_served=$(split_certs "$TMP/served" <<<"$sc")
+if (( n_served == 0 )); then
+  echo "${R}Nie udało się pobrać certyfikatu z $HOST:$PORT z tego hosta.${N}"
+  tail -5 <<<"$sc" | sed 's/^/    /'
+  echo "    Jeśli bastion wychodzi przez proxy — użyj --proxy host:port."
+  exit 2
+fi
+LEAF="$TMP/served/c001.pem"
+: > "$TMP/idx_served"
+k=0
+for f in "$TMP/served"/c*.pem; do
+  k=$((k+1))
+  printf '%s\t%s\t%s\t%s\n' "$f" "$(subj_of "$f")" "$(ski_of "$f")" "serwer" >> "$TMP/idx_served"
+  echo "    [$k] $(describe "$f")"
+done
+if openssl x509 -in "$LEAF" -noout -checkhost "$HOST" 2>/dev/null | grep -q 'does match'; then
+  info "${G}hostname $HOST zgadza się z certyfikatem${N}"
+else
+  warn "hostname $HOST NIE zgadza się z SAN/CN certyfikatu (osobny problem niż łańcuch)"
+fi
+(( n_served == 1 )) && ! is_self "$LEAF" && warn "serwer wysyła tylko leaf — bez certyfikatów pośrednich"
+
+# ---------------------------------------------------------------- 2. trust store poda
+step 2/6 "Trust store z perspektywy poda"
+oc get pods -n "$NS" -o json > "$TMP/pods.json" 2>/dev/null || echo '{"items":[]}' > "$TMP/pods.json"
+if [[ -z "$POD" ]]; then
+  if [[ -n "$SELECTOR" ]]; then
+    POD=$(oc get pods -n "$NS" -l "$SELECTOR" --field-selector=status.phase=Running \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  else
+    POD=$(jq -r '[.items[] | select(.status.phase=="Running")] as $r
+                 | (([$r[] | select(.metadata.name | test("-task-"))] + $r)[0].metadata.name) // ""' "$TMP/pods.json")
+  fi
+fi
+[[ -z "$POD" ]] && warn "nie znaleziono działającego poda — przechodzę w tryb przybliżony" && NOEXEC=1
+if [[ -n "$POD" && -z "$CONTAINER" ]]; then
+  CONTAINER=$(jq -r --arg p "$POD" '.items[] | select(.metadata.name==$p) | [.spec.containers[].name]
+                | (([.[] | select(test("task"))] + .)[0]) // ""' "$TMP/pods.json")
+fi
+[[ -n "$POD" ]] && info "pod: $POD  kontener: $CONTAINER  ${D}(zmień przez -p / -c)${N}"
+
+# proxy w podzie = możliwa inspekcja TLS (inny łańcuch niż widzi bastion)
+if [[ -n "$POD" ]]; then
+  jq -r --arg p "$POD" --arg c "$CONTAINER" '.items[] | select(.metadata.name==$p) | .spec.containers[]
+        | select(.name==$c) | (.env // [])[] | select(.name|test("^(HTTPS?_PROXY|https?_proxy)$")) | "\(.name)=\(.value // "<ref>")"' \
+        "$TMP/pods.json" > "$TMP/proxyenv"
+  if [[ -s "$TMP/proxyenv" ]]; then
+    warn "kontener ma ustawione proxy: $(tr '\n' ' ' < "$TMP/proxyenv")"
+    warn "jeśli proxy robi inspekcję TLS, pod widzi INNY łańcuch niż bastion — do bundle trzeba dodać CA proxy"
+  fi
+fi
+
+: > "$TMP/trust.pem"; : > "$TMP/anchors.pem"; TRUST_SRC=""
+if (( NOEXEC == 0 )); then
+  # wyłącznie odczyt plików w kontenerze
+  read -r -d '' INPOD <<'EOS'
+for f in "${GIT_SSL_CAINFO:-}" "${SSL_CERT_FILE:-}" /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/certs/ca-certificates.crt; do
+  [ -n "$f" ] && [ -f "$f" ] && { echo "##BUNDLE $f"; cat "$f"; break; }
+done
+echo "##ANCHORS"
+for f in /etc/pki/ca-trust/source/anchors/*; do [ -f "$f" ] && { echo "##FILE $f"; cat "$f"; }; done
+echo "##GIT"
+git config --system --get-regexp '^http\.' 2>/dev/null; git config --global --get-regexp '^http\.' 2>/dev/null
+echo "##END"
+EOS
+  if oc exec -n "$NS" "$POD" -c "$CONTAINER" -- sh -c "$INPOD" > "$TMP/inpod.txt" 2>"$TMP/inpod.err"; then
+    awk -v t="$TMP" '
+      /^##BUNDLE /  { sect="b"; print substr($0,10) > (t "/bundlepath"); next }
+      /^##ANCHORS/  { sect="a"; next }
+      /^##FILE /    { print substr($0,8) >> (t "/anchorfiles"); next }
+      /^##GIT/      { sect="g"; next }
+      /^##END/      { sect=""; next }
+      sect=="b" { print > (t "/trust.pem") }
+      sect=="a" { print > (t "/anchors.pem") }
+      sect=="g" { print > (t "/git.txt") }' "$TMP/inpod.txt"
+    TRUST_SRC="pod $POD: $(cat "$TMP/bundlepath" 2>/dev/null || echo '?')"
+    info "trust store: $(cat "$TMP/bundlepath" 2>/dev/null) ($(grep -c 'BEGIN CERTIFICATE' "$TMP/trust.pem") certów)"
+    [[ -s "$TMP/anchorfiles" ]] && info "anchors: $(tr '\n' ' ' < "$TMP/anchorfiles")" || info "anchors: brak (tylko publiczne CA z obrazu)"
+    if [[ -s "$TMP/git.txt" ]]; then
+      info "git config http.*: $(tr '\n' ' ' < "$TMP/git.txt")"
+      grep -qi 'sslverify false' "$TMP/git.txt" && warn "git ma wyłączoną weryfikację SSL"
+    fi
+  else
+    warn "oc exec nie powiódł się ($(head -1 "$TMP/inpod.err")) — tryb przybliżony"
+    NOEXEC=1
+  fi
+fi
+
+# CR-y AAP i montaże — potrzebne do przybliżenia i do wskazania winnego secretu
+oc get secrets -n "$NS" -o json > "$TMP/secrets.json" 2>/dev/null || echo '{"items":[]}' > "$TMP/secrets.json"
+: > "$TMP/crrefs"
+for kind in ansibleautomationplatform automationcontroller eda automationhub; do
+  oc get "$kind" -n "$NS" -o json 2>/dev/null | jq -r '.items[]? | (.kind+"/"+.metadata.name) as $id | .spec as $s
+     | [$s | paths(scalars)][] as $p | select($p[-1]=="bundle_cacert_secret")
+     | [$id, ($p|map(tostring)|join(".")), ($s|getpath($p))] | @tsv' >> "$TMP/crrefs"
+  oc get "$kind" -n "$NS" -o json 2>/dev/null | jq -r '.items[]? | "\(.kind)\t\(.metadata.name)"' >> "$TMP/crlist"
+done
+: > "$TMP/mounts"
+if [[ -n "$POD" ]]; then
+  jq -r --arg p "$POD" --arg c "$CONTAINER" '.items[] | select(.metadata.name==$p) | (.spec.volumes // []) as $v
+     | .spec.containers[] | select(.name==$c) | (.volumeMounts // [])[] | . as $m
+     | select($m.mountPath | test("ca-trust|/pki/|cert|/ssl"))
+     | ($v[] | select(.name==$m.name)) as $vol
+     | if $vol.secret then ["secret", $vol.secret.secretName, $m.mountPath, ($m.subPath // ($vol.secret.items[0].key // ""))]
+       elif $vol.configMap then ["cm", $vol.configMap.name, $m.mountPath, ($m.subPath // ($vol.configMap.items[0].key // ""))]
+       else empty end | @tsv' "$TMP/pods.json" > "$TMP/mounts"
+fi
+
+secret_certs() {  # $1 secret, $2 klucz (pusty = wszystkie z certami) -> PEM na stdout
+  jq -r --arg n "$1" --arg k "${2:-}" '.items[] | select(.metadata.name==$n) | (.data // {}) | to_entries[]
+     | select($k=="" or .key==$k) | .value | @base64d | select(contains("BEGIN CERTIFICATE"))' "$TMP/secrets.json"
+}
+
+if (( NOEXEC == 1 )); then
+  warn "PRZYBLIŻENIE: trust = publiczne CA z bastiona + secrety montowane/wskazane w CR"
+  for bb in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt; do
+    [[ -f "$bb" ]] && { cat "$bb" >> "$TMP/trust.pem"; break; }
+  done
+  while IFS=$'\t' read -r _ _ s; do secret_certs "$s" >> "$TMP/trust.pem"; secret_certs "$s" >> "$TMP/anchors.pem"; done < "$TMP/crrefs"
+  while IFS=$'\t' read -r kind name _ key; do
+    [[ "$kind" == secret ]] && { secret_certs "$name" "$key" >> "$TMP/trust.pem"; secret_certs "$name" "$key" >> "$TMP/anchors.pem"; }
+  done < "$TMP/mounts"
+  TRUST_SRC="przybliżenie (bastion + secrety)"
+fi
+: > "$TMP/idx_trust"
+index_pem "$TMP/idx_trust" "trust poda" < "$TMP/trust.pem"
+
+# anchors nieobecne w wyekstrahowanym bundle = secret zmieniony, pod nie zrestartowany
+if (( NOEXEC == 0 )) && [[ -s "$TMP/anchors.pem" ]]; then
+  awk -F'\t' '{print $1}' "$TMP/idx_trust" | while read -r f; do fp_of "$f"; done | sort -u > "$TMP/trust.fps"
+  na=$(split_certs "$TMP/anch" < "$TMP/anchors.pem")
+  if (( na > 0 )); then
+    for f in "$TMP/anch"/c*.pem; do
+      grep -qx "$(fp_of "$f")" "$TMP/trust.fps" || \
+        warn "cert z anchors nie jest w aktywnym bundle (secret zmieniony bez restartu poda?): $(subj_of "$f")"
+    done
+  fi
+fi
+
+# ---------------------------------------------------------------- 3. pula źródeł brakujących certów
+: > "$TMP/idx_pool"
+for cf in "${CAFILES[@]}"; do
+  [[ -f "$cf" ]] && index_pem "$TMP/idx_pool" "--ca-file $cf" < "$cf" || warn "brak pliku $cf"
+done
+while IFS=$'\t' read -r name key; do
+  index_pem "$TMP/idx_pool" "secret $NS/$name [$key]" < <(secret_certs "$name" "$key")
+done < <(jq -r '.items[] | select(.type!="kubernetes.io/service-account-token") | .metadata.name as $n | (.data // {}) | to_entries[]
+           | select(.value | @base64d | contains("BEGIN CERTIFICATE")) | [$n, .key] | @tsv' "$TMP/secrets.json")
+oc get configmaps -n "$NS" -o json 2>/dev/null | jq -r '.items[] | .metadata.name as $n | (.data // {}) | to_entries[]
+     | select(.value | contains("BEGIN CERTIFICATE")) | [$n, .key, (.value|@base64)] | @tsv' > "$TMP/cms.tsv"
+while IFS=$'\t' read -r name key val; do
+  index_pem "$TMP/idx_pool" "configmap $NS/$name [$key]" < <(base64 -d <<<"$val")
+done < "$TMP/cms.tsv"
+if uca=$(oc get configmap user-ca-bundle -n openshift-config -o jsonpath='{.data.ca-bundle\.crt}' 2>/dev/null) && [[ -n "$uca" ]]; then
+  index_pem "$TMP/idx_pool" "configmap openshift-config/user-ca-bundle (CA firmowe klastra)" <<<"$uca"
+fi
+for bb in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt; do
+  [[ -f "$bb" ]] && { index_pem "$TMP/idx_pool" "trust store bastiona $bb" < "$bb"; break; }
+done
+
+fetch_aia() {  # $1 cert -> dopisuje pobrany cert issuera do puli
+  local url f
+  url=$(aia_of "$1"); [[ -z "$url" ]] && return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  f="$TMP/aia$SEQ.bin"
+  curl -fsS --max-time 10 -o "$f" "$url" 2>/dev/null || return 1
+  index_pem "$TMP/idx_pool" "AIA $url" < <(openssl x509 -inform DER -in "$f" 2>/dev/null \
+    || openssl x509 -in "$f" 2>/dev/null || openssl pkcs7 -inform DER -in "$f" -print_certs 2>/dev/null)
+  return 0
+}
+
+# ---------------------------------------------------------------- 4. przejście łańcucha
+step 3/6 "Budowanie łańcucha leaf -> root względem trust store poda"
+cur="$LEAF"; hops=0
+TO_ADD=(); TO_ADD_SRC=(); NOT_SERVED=(); UNRESOLVED=""; TRUSTED=0
+echo "    [leaf] $(subj_of "$cur")"
+while (( hops < 10 )); do
+  hops=$((hops+1))
+  s=$(subj_of "$cur"); i=$(iss_of "$cur"); a=$(aki_of "$cur")
+
+  t=$(lookup "$TMP/idx_trust" "$i" "$a")
+  if [[ -n "$t" ]]; then
+    echo "      └─ ${G}[zaufany w podzie]${N} $i"
+    TRUSTED=1; break
+  fi
+
+  if [[ "$s" == "$i" ]]; then
+    # root self-signed, którego pod nie zna
+    echo "      └─ ${R}[BRAK w trust store poda]${N} root $s"
+    already=0
+    for x in "${TO_ADD[@]}"; do [[ "$x" == "$cur" ]] && already=1; done
+    (( already == 0 )) && { TO_ADD+=("$cur"); TO_ADD_SRC+=("łańcuch wysłany przez serwer"); }
+    break
+  fi
+
+  sv=$(lookup "$TMP/idx_served" "$i" "$a")
+  if [[ -n "$sv" ]]; then
+    cur=${sv%%$'\t'*}
+    echo "      └─ [wysłany przez serwer] $i"
+    continue
+  fi
+
+  # wystawca ani zaufany, ani wysłany — szukamy go
+  cand=$(lookup "$TMP/idx_pool" "$i" "$a")
+  if [[ -z "$cand" ]] && fetch_aia "$cur"; then cand=$(lookup "$TMP/idx_pool" "$i" "$a"); fi
+  if [[ -z "$cand" ]]; then
+    echo "      └─ ${R}[BRAK — nie znaleziono]${N} $i"
+    UNRESOLVED="$i (AKI: ${a:-brak}, AIA: $(aia_of "$cur"))"
+    break
+  fi
+  f=${cand%%$'\t'*}; src=${cand#*$'\t'}
+  if is_self "$f"; then
+    echo "      └─ ${R}[BRAK w trust store poda]${N} root $i  ${D}(znaleziony: $src)${N}"
+  else
+    echo "      └─ ${R}[BRAK — serwer go nie wysyła, pod go nie zna]${N} $i  ${D}(znaleziony: $src)${N}"
+    NOT_SERVED+=("$i")
+  fi
+  TO_ADD+=("$f"); TO_ADD_SRC+=("$src")
+  is_self "$f" && break
+  cur="$f"
+done
+
+# weryfikacja stanu obecnego
+: > "$TMP/untrusted.pem"
+for f in "$TMP/served"/c*.pem; do [[ "$f" != "$LEAF" ]] && cat "$f" >> "$TMP/untrusted.pem"; done
+verify() {  # $1 CAfile
+  local u=()
+  [[ -s "$TMP/untrusted.pem" ]] && u=(-untrusted "$TMP/untrusted.pem")
+  openssl verify -CAfile "$1" "${u[@]}" "$LEAF" 2>&1 | tail -2 | tr '\n' ' '
+}
+info "openssl verify teraz: $(verify "$TMP/trust.pem")"
+
+# ---------------------------------------------------------------- 5. odpowiedzialny secret
+step 4/6 "Który obiekt w $NS odpowiada za zaufanie"
+RESP_KIND=""; RESP_NAME=""; RESP_KEY="bundle-ca.crt"; RESP_WHY=""; RESP_EXISTS=0
+if [[ -s "$TMP/crrefs" ]]; then
+  while IFS=$'\t' read -r id path val; do info "$id: $path = $val"; done < "$TMP/crrefs"
+  IFS=$'\t' read -r cr_id cr_path RESP_NAME < "$TMP/crrefs"
+  RESP_KIND=secret; RESP_WHY="$cr_id → $cr_path"
+fi
+if [[ -s "$TMP/mounts" ]]; then
+  while IFS=$'\t' read -r kind name path key; do info "montaż w $POD/$CONTAINER: $path <- $kind/$name ${key:+[$key]}"; done < "$TMP/mounts"
+  if [[ -z "$RESP_NAME" ]]; then
+    IFS=$'\t' read -r RESP_KIND RESP_NAME m_path m_key < "$TMP/mounts"
+    [[ -n "$m_key" ]] && RESP_KEY="$m_key"
+    RESP_WHY="montaż $m_path w $POD/$CONTAINER"
+  fi
+fi
+if [[ -n "$RESP_NAME" ]]; then
+  if [[ "$RESP_KIND" == secret ]] && jq -e --arg n "$RESP_NAME" '.items[] | select(.metadata.name==$n)' "$TMP/secrets.json" >/dev/null; then
+    RESP_EXISTS=1
+  elif [[ "$RESP_KIND" == cm ]] && oc get configmap "$RESP_NAME" -n "$NS" >/dev/null 2>&1; then
+    RESP_EXISTS=1
+  fi
+  info "${B}odpowiada: $RESP_KIND/$RESP_NAME [$RESP_KEY]${N}  ${D}($RESP_WHY)${N}"
+  (( RESP_EXISTS == 0 )) && warn "$RESP_KIND/$RESP_NAME NIE ISTNIEJE w $NS — wskazany, ale nie utworzony"
+  if (( RESP_EXISTS == 1 )) && [[ "$RESP_KIND" == secret ]]; then
+    own=$(jq -r --arg n "$RESP_NAME" '.items[] | select(.metadata.name==$n) | [(.metadata.ownerReferences // [])[] | "\(.kind)/\(.name)"] | join(", ")' "$TMP/secrets.json")
+    [[ -n "$own" ]] && warn "secret ma ownerReferences ($own) — kontroler może nadpisać ręczną zmianę"
+  fi
+else
+  RESP_KIND=secret; RESP_NAME="corp-ca-bundle"; RESP_WHY="nowy — nic w $NS nie dostarcza firmowego CA"
+  info "${Y}brak secretu z CA bundle — pod ufa tylko publicznym CA z obrazu${N}"
+  if jq -e --arg n "$RESP_NAME" '.items[] | select(.metadata.name==$n)' "$TMP/secrets.json" >/dev/null; then
+    RESP_EXISTS=1
+    warn "secret/$RESP_NAME już istnieje, ale nic go nie używa — scalam zawartość zamiast nadpisywać"
+  fi
+  info "proponowany: secret/$RESP_NAME [$RESP_KEY]"
+fi
+
+# ---------------------------------------------------------------- 6. poprawka (lokalnie)
+step 5/6 "Wynik"
+if (( TRUSTED == 1 )) && (( ${#TO_ADD[@]} == 0 )); then
+  echo "    ${G}Łańcuch kompletny — pod $POD ufa $HOST. Problem nie leży w CA.${N}"
+  echo "    Sprawdź: hostname/SAN, proxy z inspekcją TLS, czy aplikacja nie używa innego bundla (GIT_SSL_CAINFO, http.sslCAInfo)."
+  exit 0
+fi
+
+mkdir -p "$OUT"; chmod 700 "$OUT"
+cat "$TMP/served"/c*.pem > "$OUT/served-chain.pem"
+
+if (( ${#TO_ADD[@]} > 0 )); then
+  echo "    ${B}Brakujące certyfikaty:${N}"
+  for idx in "${!TO_ADD[@]}"; do
+    f=${TO_ADD[$idx]}
+    name=$(cn_of "$f" | tr -c 'A-Za-z0-9._-' '_' | sed 's/_*$//')
+    cp "$f" "$OUT/missing-$((idx+1))-${name:-cert}.pem"
+    kind="root CA"; is_self "$f" || kind="intermediate"
+    echo "    $((idx+1)). ${R}$(subj_of "$f")${N}  ($kind)"
+    echo "       SHA256: $(fp_of "$f")"
+    echo "       ważny do: $(end_of "$f")   źródło: ${TO_ADD_SRC[$idx]}"
+  done
+fi
+if (( ${#NOT_SERVED[@]} > 0 )); then
+  echo
+  warn "Serwer $HOST nie wysyła certyfikatu pośredniego: ${NOT_SERVED[*]}"
+  warn "Właściwa poprawka: po stronie serwera (np. GitLab: nginx['ssl_certificate'] = fullchain leaf+intermediate)."
+  warn "Dodanie go do bundle w $NS to obejście, które zadziała, ale trzeba pamiętać o nim przy rotacji."
+fi
+if [[ -n "$UNRESOLVED" ]]; then
+  echo
+  echo "    ${R}Nie znaleziono certu: $UNRESOLVED${N}"
+  echo "    Pobierz go od zespołu PKI i uruchom ponownie z --ca-file <plik.pem>."
+  (( ${#TO_ADD[@]} == 0 )) && exit 3
+fi
+
+# nowy bundle = obecna zawartość obiektu odpowiedzialnego + brakujące (bez duplikatów)
+: > "$TMP/newbundle.pem"
+if (( RESP_EXISTS == 1 )); then
+  if [[ "$RESP_KIND" == secret ]]; then secret_certs "$RESP_NAME" "$RESP_KEY" > "$TMP/old.pem"
+  else oc get configmap "$RESP_NAME" -n "$NS" -o json | jq -r --arg k "$RESP_KEY" '.data[$k] // ""' > "$TMP/old.pem"; fi
+  cp "$TMP/old.pem" "$OUT/current-$RESP_NAME-$RESP_KEY.pem"
+  cat "$TMP/old.pem" >> "$TMP/newbundle.pem"
+fi
+n_old=$(grep -c 'BEGIN CERTIFICATE' "$TMP/newbundle.pem")
+: > "$TMP/new.fps"
+if (( n_old > 0 )); then
+  split_certs "$TMP/oldsplit" < "$TMP/newbundle.pem" >/dev/null
+  for f in "$TMP/oldsplit"/c*.pem; do fp_of "$f" >> "$TMP/new.fps"; done
+fi
+added=0
+for f in "${TO_ADD[@]}"; do
+  grep -qx "$(fp_of "$f")" "$TMP/new.fps" && continue
+  { echo "# $(subj_of "$f")"; cat "$f"; } >> "$TMP/newbundle.pem"
+  fp_of "$f" >> "$TMP/new.fps"; added=$((added+1))
+done
+cp "$TMP/newbundle.pem" "$OUT/$RESP_KEY"
+
+# test: czy trust poda + nowe certy zamyka łańcuch
+cat "$TMP/trust.pem" "${TO_ADD[@]}" > "$TMP/trust-after.pem"
+after=$(verify "$TMP/trust-after.pem")
+if grep -q ': OK' <<<"$after"; then res="${G}OK — poprawka zamyka łańcuch${N}"; else res="${R}$after${N}"; fi
+
+# manifest — tylko lokalnie, z zachowaniem pozostałych kluczy i etykiet
+b64=$(base64 -w0 < "$TMP/newbundle.pem")
+MAN="$OUT/$RESP_KIND-$RESP_NAME.json"
+if [[ "$RESP_KIND" == secret ]]; then
+  if (( RESP_EXISTS == 1 )); then
+    jq --arg n "$RESP_NAME" --arg k "$RESP_KEY" --arg v "$b64" '.items[] | select(.metadata.name==$n)
+       | {apiVersion:"v1", kind:"Secret", type,
+          metadata:{name:.metadata.name, namespace:.metadata.namespace, labels:(.metadata.labels // {}),
+                    annotations:((.metadata.annotations // {}) | del(.["kubectl.kubernetes.io/last-applied-configuration"]))},
+          data:((.data // {}) + {($k):$v})}' "$TMP/secrets.json" > "$MAN"
+  else
+    jq -n --arg n "$RESP_NAME" --arg ns "$NS" --arg k "$RESP_KEY" --arg v "$b64" \
+      '{apiVersion:"v1", kind:"Secret", type:"Opaque", metadata:{name:$n, namespace:$ns}, data:{($k):$v}}' > "$MAN"
+  fi
+else
+  oc get configmap "$RESP_NAME" -n "$NS" -o json 2>/dev/null | jq --rawfile v "$TMP/newbundle.pem" --arg k "$RESP_KEY" \
+    '{apiVersion:"v1", kind:"ConfigMap", metadata:{name:.metadata.name, namespace:.metadata.namespace, labels:(.metadata.labels // {})},
+      data:((.data // {}) + {($k):$v})}' > "$MAN"
+fi
+
+# deployment poda (do restartu po zmianie — update-ca-trust działa przy starcie kontenera)
+DEPLOY=""
+if [[ -n "$POD" ]]; then
+  rs=$(jq -r --arg p "$POD" '.items[] | select(.metadata.name==$p) | (.metadata.ownerReferences // [])[] | select(.kind=="ReplicaSet") | .name' "$TMP/pods.json")
+  [[ -n "$rs" ]] && DEPLOY=$(oc get rs "$rs" -n "$NS" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null)
+fi
+
+STEPN=0; nx() { STEPN=$((STEPN+1)); echo "# $STEPN. $*"; }
+{
+  echo "# Poprawka zaufania dla $URL w namespace $NS — wygenerowane $(date '+%F %T')"
+  echo "# NIC z tego nie zostało wykonane na klastrze. Sprawdź i uruchom ręcznie."
+  echo
+  nx "Zweryfikuj odciski SHA256 brakujących certów z zespołem PKI:"
+  for f in "${TO_ADD[@]}"; do echo "#    $(subj_of "$f")  $(fp_of "$f")"; done
+  echo
+  nx "Podgląd zmian (server-side dry-run, nic nie zapisuje):"
+  echo "oc diff -f $MAN"
+  echo
+  nx "Zastosowanie:"
+  echo "oc apply -f $MAN"
+  if [[ ! -s "$TMP/crrefs" && -s "$TMP/crlist" ]]; then
+    IFS=$'\t' read -r crk crn < "$TMP/crlist"
+    echo
+    nx "CR AAP nie wskazuje bundle_cacert_secret — dodaj wskazanie:"
+    if [[ "$crk" == "AnsibleAutomationPlatform" ]]; then
+      p='{"spec":{"controller":{"bundle_cacert_secret":"'"$RESP_NAME"'"},"eda":{"bundle_cacert_secret":"'"$RESP_NAME"'"}}}'
+    else
+      p='{"spec":{"bundle_cacert_secret":"'"$RESP_NAME"'"}}'
+    fi
+    echo "oc patch $crk $crn -n $NS --type merge -p '$p' --dry-run=server -o yaml | less   # podgląd"
+    echo "oc patch $crk $crn -n $NS --type merge -p '$p'"
+    echo "# (sprawdź pola: oc explain ${crk,,}.spec.controller)"
+  fi
+  echo
+  nx "Restart podów, żeby update-ca-trust przebudował bundle (zmiana samego secretu nie restartuje podów):"
+  if [[ -n "$DEPLOY" ]]; then echo "oc rollout restart deployment/$DEPLOY -n $NS"
+  else echo "oc delete pod $POD -n $NS   # lub rollout restart właściwego deploymentu"; fi
+  echo
+  nx "Weryfikacja po zmianie:"
+  echo "$0 -u $URL -n $NS"
+} > "$OUT/NEXT-STEPS.sh"
+
+echo
+echo "    Odpowiedzialny obiekt: ${B}$RESP_KIND/$RESP_NAME [$RESP_KEY]${N}  ${D}($RESP_WHY)${N}"
+echo "    Nowy bundle: $n_old istniejących + $added dodanych certów"
+echo "    Test lokalny (trust poda + brakujące): $res"
+
+step 6/6 "Przygotowane lokalnie w $OUT  (klaster bez zmian)"
+ls -1 "$OUT" | sed 's/^/    /'
+echo
+echo "    Dalsze kroki: ${B}cat $OUT/NEXT-STEPS.sh${N}"
+
+[[ -n "$UNRESOLVED" ]] && exit 3
+exit 1
