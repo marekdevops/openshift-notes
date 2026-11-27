@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# ns-cert-audit.sh — audyt certyfikatów w namespace OpenShift (TYLKO ODCZYT)
+#
+# Sprawdza:
+#   1. Secrety z certyfikatami (TLS, CA bundle, Strimzi itp.) — subject, issuer, ważność, łańcuch
+#   2. ConfigMapy z certyfikatami (w tym wstrzykiwane trusted-ca / service-ca)
+#   3. Route'y — terminacja, cert inline vs domyślny ingress, opcjonalnie live chain z hosta
+#   4. Ingressy — odwołania do secretów TLS
+#   5. Pody — które secrety/CM z certami są montowane i gdzie, zmienne SSL_* / GIT_SSL_*
+#   6. CR-y AAP (jeśli są) — pola *cacert*, *tls*, *bundle* i czy wskazane secrety istnieją
+#   7. (opcja --exec) wnętrze podów: anchors w ca-trust, rozmiar bundle, test połączenia do URL
+#
+# Nic nie zmienia na klastrze. Klucze prywatne nie są odczytywane ani wypisywane —
+# z secretów brane są wyłącznie bloki "BEGIN CERTIFICATE".
+#
+# Wymagania: oc (zalogowany), jq, openssl, base64, GNU date
+# RBAC: get/list secrets, configmaps, routes, ingresses, pods (+ pods/exec dla --exec)
+
+set -uo pipefail
+
+NS=""
+WARN_DAYS=30
+VERBOSE=0
+LIVE=1
+EXEC=0
+TEST_URL=""
+MATCH=""
+SELECTOR=""
+CONTAINER=""
+BIG_BUNDLE=5
+
+usage() {
+  cat <<EOF
+Użycie: $0 -n <namespace> [opcje]
+
+  -n, --namespace NS     namespace do sprawdzenia (wymagany)
+  -w, --warn-days N      ostrzegaj, gdy cert wygasa w ciągu N dni (domyślnie $WARN_DAYS)
+  -m, --match TEKST      szukaj certu o subject zawierającym TEKST we wszystkich bundle'ach
+                         (np. -m "Firma Root CA") — przydatne, by sprawdzić, gdzie jest firmowe CA
+  -v, --verbose          wypisuj każdy cert także w dużych bundle'ach i secrety SA-token
+      --no-live          nie łącz się z hostami route'ów (openssl s_client)
+      --exec             zajrzyj do działających podów (oc exec, tylko polecenia czytające)
+  -u, --test-url URL     z --exec: sprawdź z wnętrza poda połączenie TLS do URL (curl)
+  -l, --selector SEL     z --exec: ogranicz pody do label selectora (np. app.kubernetes.io/component=controller-task)
+  -c, --container NAME   z --exec: tylko ten kontener (domyślnie wszystkie)
+  -h, --help
+
+Przykład (problem AAP -> GitLab):
+  $0 -n aap -m "Firma" --exec -u https://gitlab.firma.pl -l app.kubernetes.io/component=controller-task
+
+Kod wyjścia: 0 = brak problemów, 1 = znaleziono wygasłe/wygasające certy lub ostrzeżenia, 2 = błąd użycia
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--namespace) NS="${2:-}"; shift 2 ;;
+    -w|--warn-days) WARN_DAYS="${2:-}"; shift 2 ;;
+    -m|--match)     MATCH="${2:-}"; shift 2 ;;
+    -v|--verbose)   VERBOSE=1; shift ;;
+    --no-live)      LIVE=0; shift ;;
+    --exec)         EXEC=1; shift ;;
+    -u|--test-url)  TEST_URL="${2:-}"; shift 2 ;;
+    -l|--selector)  SELECTOR="${2:-}"; shift 2 ;;
+    -c|--container) CONTAINER="${2:-}"; shift 2 ;;
+    -h|--help)      usage; exit 0 ;;
+    *) echo "Nieznana opcja: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ -z "$NS" ]] && { usage >&2; exit 2; }
+[[ "$WARN_DAYS" =~ ^[0-9]+$ ]] || { echo "--warn-days musi być liczbą" >&2; exit 2; }
+
+for b in oc jq openssl base64 date awk; do
+  command -v "$b" >/dev/null 2>&1 || { echo "Brak wymaganego narzędzia: $b" >&2; exit 2; }
+done
+
+if [[ -t 1 ]]; then
+  R=$'\e[31m'; Y=$'\e[33m'; G=$'\e[32m'; B=$'\e[1m'; D=$'\e[2m'; N=$'\e[0m'
+else
+  R=""; Y=""; G=""; B=""; D=""; N=""
+fi
+
+TMP=$(mktemp -d)
+chmod 700 "$TMP"
+trap 'rm -rf "$TMP"' EXIT
+
+CNT_EXPIRED=0
+CNT_SOON=0
+CNT_WARN=0
+MATCH_HITS=()
+CERT_OBJECTS=" "   # lista "secret/x cm/y" obiektów zawierających certy
+
+NOW=$(date +%s)
+
+section() { echo; echo "${B}=== $* ===${N}"; }
+warn()    { echo "    ${Y}! $*${N}"; CNT_WARN=$((CNT_WARN+1)); }
+
+# Dzieli PEM ze stdin na pliki c001.pem, c002.pem... w katalogu $1, wypisuje liczbę certów.
+split_certs() {
+  local dir=$1
+  mkdir -p "$dir"
+  awk -v d="$dir" '
+    /-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/c%03d.pem", d, n); p = 1 }
+    p { print > f }
+    /-----END CERTIFICATE-----/ { if (p) close(f); p = 0 }
+    END { print n + 0 }'
+}
+
+subj_of()   { openssl x509 -in "$1" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject= *//'; }
+issuer_of() { openssl x509 -in "$1" -noout -issuer  -nameopt RFC2253 2>/dev/null | sed 's/^issuer= *//'; }
+
+days_left() {
+  local end ep
+  end=$(openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2)
+  ep=$(date -d "$end" +%s 2>/dev/null) || { echo "?"; return; }
+  echo $(( (ep - NOW) / 86400 ))
+}
+
+expiry_tag() {
+  local d=$1
+  if [[ "$d" == "?" ]]; then echo "${Y}[data?]${N}"
+  elif (( d < 0 )); then echo "${R}[WYGASŁ $(( -d )) dni temu]${N}"
+  elif (( d < WARN_DAYS )); then echo "${Y}[wygasa za $d dni]${N}"
+  else echo "${G}[ważny $d dni]${N}"
+  fi
+}
+
+count_expiry() {
+  local d=$1
+  [[ "$d" == "?" ]] && return
+  if (( d < 0 )); then CNT_EXPIRED=$((CNT_EXPIRED+1))
+  elif (( d < WARN_DAYS )); then CNT_SOON=$((CNT_SOON+1)); fi
+}
+
+print_cert() {
+  local f=$1 idx=$2 s i d san ca=""
+  s=$(subj_of "$f"); i=$(issuer_of "$f"); d=$(days_left "$f")
+  openssl x509 -in "$f" -noout -ext basicConstraints 2>/dev/null | grep -q 'CA:TRUE' && ca=" ${D}(CA)${N}"
+  echo "    [$idx] $(expiry_tag "$d")$ca"
+  echo "        subject: $s"
+  [[ "$s" == "$i" ]] && echo "        issuer:  ${D}(self-signed)${N}" || echo "        issuer:  $i"
+  san=$(openssl x509 -in "$f" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | sed 's/^ *//' | tr -d '\n')
+  [[ -n "$san" ]] && echo "        SAN:     $san"
+}
+
+# Analiza bloba PEM ze stdin. $1 = etykieta, $2 = tryb: "chain" (tls.crt / serwowany łańcuch) lub "bundle"
+inspect_pem() {
+  local label=$1 mode=$2 dir n f idx=0 d s
+  dir="$TMP/$(date +%s%N)$RANDOM"
+  n=$(split_certs "$dir")
+  (( n == 0 )) && return 1
+
+  echo "  ${B}$label${N} — $n cert(ów)"
+
+  local files=("$dir"/c*.pem)
+
+  # liczniki ważności + wyszukiwanie --match zawsze dla wszystkich certów
+  for f in "${files[@]}"; do
+    d=$(days_left "$f"); count_expiry "$d"
+    if [[ -n "$MATCH" ]]; then
+      s=$(subj_of "$f")
+      [[ "${s,,}" == *"${MATCH,,}"* ]] && MATCH_HITS+=("$label  ->  $s  $(expiry_tag "$d")")
+    fi
+  done
+
+  if [[ "$mode" == "bundle" && $n -gt $BIG_BUNDLE && $VERBOSE -eq 0 ]]; then
+    echo "    ${D}(duży bundle — pokazuję tylko certy problematyczne; -v pokaże wszystkie)${N}"
+    for f in "${files[@]}"; do
+      idx=$((idx+1)); d=$(days_left "$f")
+      [[ "$d" == "?" ]] && { print_cert "$f" "$idx"; continue; }
+      (( d < WARN_DAYS )) && print_cert "$f" "$idx"
+    done
+    return 0
+  fi
+
+  for f in "${files[@]}"; do
+    idx=$((idx+1)); print_cert "$f" "$idx"
+  done
+
+  if [[ "$mode" == "chain" ]]; then
+    local leaf_s leaf_i
+    leaf_s=$(subj_of "${files[0]}"); leaf_i=$(issuer_of "${files[0]}")
+    if (( n == 1 )) && [[ "$leaf_s" != "$leaf_i" ]]; then
+      warn "łańcuch zawiera tylko leaf (brak intermediate) — klienci bez AIA (git, curl, python) mogą zwrócić 'unable to get local issuer certificate'"
+    fi
+    local k
+    for (( k=0; k<n-1; k++ )); do
+      if [[ "$(issuer_of "${files[$k]}")" != "$(subj_of "${files[$((k+1))]}")" ]]; then
+        warn "kolejność łańcucha: issuer certu [$((k+1))] != subject certu [$((k+2))]"
+      fi
+    done
+  fi
+  return 0
+}
+
+echo "${B}Audyt certyfikatów — namespace: $NS${N}  (klaster: $(oc whoami --show-server 2>/dev/null || echo '?'), $(date '+%F %T'))"
+oc get namespace "$NS" >/dev/null 2>&1 || { echo "${R}Namespace $NS nie istnieje lub brak dostępu${N}" >&2; exit 2; }
+
+# ---------------------------------------------------------------- 1. Secrety
+section "1. Secrety z certyfikatami"
+if oc get secrets -n "$NS" -o json > "$TMP/secrets.json" 2>"$TMP/err"; then
+  jq -r '.items[].metadata.name' "$TMP/secrets.json" > "$TMP/secret_names"
+  found=0
+  # keystore'y binarne (Strimzi .p12, Java .jks) — tylko informacyjnie
+  jq -r '.items[] | .metadata.name as $n | (.data // {}) | keys[]
+         | select(test("\\.(p12|pfx|jks)$|keystore|truststore";"i")) | "\($n)\t\(.)"' "$TMP/secrets.json" \
+    > "$TMP/keystores"
+
+  while IFS=$'\t' read -r name type key val; do
+    if [[ "$type" == "kubernetes.io/service-account-token" && $VERBOSE -eq 0 ]]; then continue; fi
+    found=1
+    CERT_OBJECTS+="secret/$name "
+    mode=bundle
+    [[ "$key" == "tls.crt" ]] && mode=chain
+    inspect_pem "secret/$name [$key] ${D}($type)${N}" "$mode" < <(printf '%s' "$val" | base64 -d 2>/dev/null)
+  done < <(jq -r '.items[] | .metadata.name as $n | .type as $t | (.data // {}) | to_entries[]
+                  | select((.value | @base64d) | contains("BEGIN CERTIFICATE"))
+                  | "\($n)\t\($t)\t\(.key)\t\(.value)"' "$TMP/secrets.json")
+  (( found == 0 )) && echo "  brak"
+  if [[ -s "$TMP/keystores" ]]; then
+    echo "  ${D}Keystore'y binarne (nie sprawdzane, wymagają hasła):${N}"
+    sed 's/\t/ -> /; s/^/    /' "$TMP/keystores"
+  fi
+  [[ $VERBOSE -eq 0 ]] && echo "  ${D}(pominięto secrety typu service-account-token; -v by je pokazać)${N}"
+else
+  echo "  ${Y}brak dostępu do secretów: $(head -1 "$TMP/err")${N}"
+  : > "$TMP/secret_names"
+fi
+
+# ---------------------------------------------------------------- 2. ConfigMapy
+section "2. ConfigMapy z certyfikatami"
+if oc get configmaps -n "$NS" -o json > "$TMP/cms.json" 2>"$TMP/err"; then
+  found=0
+  while IFS=$'\t' read -r name inj key val; do
+    found=1
+    CERT_OBJECTS+="cm/$name "
+    note=""
+    [[ "$inj" == trusted ]] && note=" ${D}(wstrzykiwany: trusted CA bundle klastra)${N}"
+    [[ "$inj" == service ]] && note=" ${D}(wstrzykiwany: service-ca)${N}"
+    inspect_pem "cm/$name [$key]$note" bundle < <(printf '%s' "$val" | base64 -d 2>/dev/null)
+  done < <(jq -r '.items[] | .metadata.name as $n
+                  | (if (.metadata.labels["config.openshift.io/inject-trusted-cabundle"] // "") == "true" then "trusted"
+                     elif (.metadata.annotations["service.beta.openshift.io/inject-cabundle"] // "") == "true" then "service"
+                     else "-" end) as $inj
+                  | (.data // {}) | to_entries[]
+                  | select(.value | contains("BEGIN CERTIFICATE"))
+                  | "\($n)\t\($inj)\t\(.key)\t\(.value | @base64)"' "$TMP/cms.json")
+  (( found == 0 )) && echo "  brak"
+else
+  echo "  ${Y}brak dostępu do configmap: $(head -1 "$TMP/err")${N}"
+fi
+
+# ---------------------------------------------------------------- 3. Route'y
+section "3. Route'y"
+if oc get routes -n "$NS" -o json > "$TMP/routes.json" 2>/dev/null && [[ $(jq '.items|length' "$TMP/routes.json") -gt 0 ]]; then
+  while IFS=$'\t' read -r name host term insec cert ca dca; do
+    [[ "$term" == "-" ]] && term=""
+    [[ "$host" == "-" ]] && host=""
+    echo "  ${B}route/$name${N}  host=${host:--}  tls=${term:-brak}  insecure=$insec"
+    case "$term" in
+      "") echo "    ${D}bez TLS${N}" ;;
+      passthrough) echo "    ${D}passthrough — certyfikat serwuje pod${N}" ;;
+      *)
+        if [[ "$cert" == "-" ]]; then
+          echo "    ${D}brak certu inline — używa domyślnego certu ingress controllera${N}"
+        else
+          inspect_pem "route/$name spec.tls.certificate" chain < <(printf '%s' "$cert" | base64 -d)
+        fi
+        [[ "$ca"  != "-" ]] && inspect_pem "route/$name spec.tls.caCertificate" bundle < <(printf '%s' "$ca" | base64 -d)
+        [[ "$dca" != "-" ]] && inspect_pem "route/$name spec.tls.destinationCACertificate" bundle < <(printf '%s' "$dca" | base64 -d)
+        ;;
+    esac
+    if [[ $LIVE -eq 1 && -n "$term" && -n "$host" ]]; then
+      out=$(timeout 8 openssl s_client -connect "$host:443" -servername "$host" -showcerts </dev/null 2>&1)
+      if grep -q 'BEGIN CERTIFICATE' <<<"$out"; then
+        inspect_pem "LIVE $host:443 (łańcuch serwowany)" chain <<<"$out"
+        vr=$(grep -m1 'Verify return code' <<<"$out" | sed 's/^ *//')
+        echo "    weryfikacja z tego hosta: ${vr:-?}"
+      else
+        echo "    ${D}LIVE: brak połączenia z $host:443 z tego hosta${N}"
+      fi
+    fi
+  done < <(jq -r '.items[] | [ .metadata.name, (.spec.host // "-"),
+                  (.spec.tls.termination // "-"), (.spec.tls.insecureEdgeTerminationPolicy // "-"),
+                  (if .spec.tls.certificate then (.spec.tls.certificate|@base64) else "-" end),
+                  (if .spec.tls.caCertificate then (.spec.tls.caCertificate|@base64) else "-" end),
+                  (if .spec.tls.destinationCACertificate then (.spec.tls.destinationCACertificate|@base64) else "-" end)
+                ] | @tsv' "$TMP/routes.json")
+else
+  echo "  brak"
+fi
+
+# ---------------------------------------------------------------- 4. Ingressy
+section "4. Ingressy (odwołania do secretów TLS)"
+if oc get ingress -n "$NS" -o json > "$TMP/ing.json" 2>/dev/null && [[ $(jq '.items|length' "$TMP/ing.json") -gt 0 ]]; then
+  while IFS=$'\t' read -r name sec hosts; do
+    if grep -qx "$sec" "$TMP/secret_names"; then st="${G}istnieje${N}"; else st="${R}BRAK secretu${N}"; CNT_WARN=$((CNT_WARN+1)); fi
+    echo "  ingress/$name -> secret/$sec ($st)  hosts: $hosts"
+  done < <(jq -r '.items[] | .metadata.name as $n | (.spec.tls // [])[] | [$n, (.secretName // "-"), ((.hosts // [])|join(","))] | @tsv' "$TMP/ing.json")
+else
+  echo "  brak"
+fi
+
+# ---------------------------------------------------------------- 5. Pody
+section "5. Pody — montowane certy i zmienne TLS"
+if oc get pods -n "$NS" -o json > "$TMP/pods.json" 2>/dev/null && [[ $(jq '.items|length' "$TMP/pods.json") -gt 0 ]]; then
+  echo "  ${D}Montowania secretów/CM zawierających certy (lub ścieżek wyglądających na trust store):${N}"
+  any=0
+  while IFS=$'\t' read -r pod ctr path kind obj sub; do
+    if [[ "$CERT_OBJECTS" == *" $kind/$obj "* ]] || [[ "$path" =~ (pki|ca-trust|cert|tls|/ssl) ]]; then
+      any=1
+      echo "    $pod/$ctr: $path ${sub:+(subPath $sub) }<- $kind/$obj"
+    fi
+  done < <(jq -r '.items[] | .metadata.name as $p | (.spec.volumes // []) as $v
+                  | ((.spec.initContainers // []) + .spec.containers)[] | .name as $c
+                  | (.volumeMounts // [])[] | . as $m
+                  | ($v[] | select(.name == $m.name)) as $vol
+                  | if $vol.secret then [$p, $c, $m.mountPath, "secret", $vol.secret.secretName, ($m.subPath // "")]
+                    elif $vol.configMap then [$p, $c, $m.mountPath, "cm", $vol.configMap.name, ($m.subPath // "")]
+                    else empty end | @tsv' "$TMP/pods.json" | sort -u)
+  (( any == 0 )) && echo "    brak"
+
+  echo "  ${D}Zmienne środowiskowe związane z TLS:${N}"
+  envs=$(jq -r '.items[] | .metadata.name as $p | .spec.containers[] | .name as $c
+                | (.env // [])[]
+                | select(.name | test("SSL|CA_BUNDLE|CAINFO|CERT|TLS|NO_VERIFY|EXTRA_CA";"i"))
+                | "\($p)/\($c): \(.name)=\(.value // ("<z " + ((.valueFrom|keys[0]) // "?") + ">"))"' "$TMP/pods.json" | sort -u)
+  if [[ -n "$envs" ]]; then
+    sed 's/^/    /' <<<"$envs"
+    grep -qiE 'NO_VERIFY=(1|true)|SSL_VERIFY=(0|false)' <<<"$envs" && warn "wykryto wyłączoną weryfikację TLS w zmiennych środowiskowych"
+  else
+    echo "    brak"
+  fi
+else
+  echo "  brak podów"
+fi
+
+# ---------------------------------------------------------------- 6. CR-y AAP
+section "6. Konfiguracja certów w CR-ach AAP (jeśli są)"
+aap_any=0
+for kind in ansibleautomationplatform automationcontroller automationhub eda; do
+  oc get "$kind" -n "$NS" -o json > "$TMP/cr.json" 2>/dev/null || continue
+  [[ $(jq '.items|length' "$TMP/cr.json") -eq 0 ]] && continue
+  while IFS=$'\t' read -r id path val; do
+    aap_any=1
+    line="  $id  $path = $val"
+    if [[ "$path" =~ secret$ ]]; then
+      if grep -qx "$val" "$TMP/secret_names"; then line+="  ${G}(secret istnieje)${N}"
+      else line+="  ${R}(BRAK secretu)${N}"; CNT_WARN=$((CNT_WARN+1)); fi
+    fi
+    echo "$line"
+  done < <(jq -r '.items[] | (.kind + "/" + .metadata.name) as $id | .spec as $s
+                  | [$s | paths(scalars)] [] as $p
+                  | ($p | map(tostring) | join(".")) as $ps
+                  | select($ps | test("cacert|tls|bundle|cert";"i"))
+                  | [$id, $ps, ($s | getpath($p) | tostring)] | @tsv' "$TMP/cr.json")
+  # podpowiedź: brak bundle_cacert_secret
+  jq -r '.items[] | select([.spec | paths(scalars) | map(tostring) | join(".")] | any(test("bundle_cacert_secret")) | not)
+         | "\(.kind)/\(.metadata.name)"' "$TMP/cr.json" | while read -r id; do
+    echo "  ${D}$id: brak bundle_cacert_secret — pody ufają tylko publicznym CA z obrazu (+ ewentualnie innym montażom)${N}"
+  done
+  aap_any=1
+done
+(( aap_any == 0 )) && echo "  brak CR-ów AAP w tym namespace"
+
+# ---------------------------------------------------------------- 7. Wnętrze podów
+if [[ $EXEC -eq 1 ]]; then
+  section "7. Wnętrze podów (oc exec, tylko odczyt)"
+  sel=()
+  [[ -n "$SELECTOR" ]] && sel=(-l "$SELECTOR")
+  # skrypt wykonywany w kontenerze — wyłącznie odczyt
+  read -r -d '' INPOD <<'EOS'
+a=$(ls /etc/pki/ca-trust/source/anchors 2>/dev/null | tr '\n' ' ')
+echo "anchors (ca-trust/source/anchors): ${a:-brak}"
+for b in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt; do
+  [ -f "$b" ] && { echo "bundle: $b ($(grep -c 'BEGIN CERTIFICATE' "$b") certów)"; break; }
+done
+if [ -n "$MATCH" ] && [ -n "$b" ] && command -v openssl >/dev/null 2>&1; then
+  hits=$(awk '/BEGIN CERT/{c=""} {c=c $0 "\n"} /END CERT/{printf "%s", c | "openssl x509 -noout -subject -nameopt RFC2253"; close("openssl x509 -noout -subject -nameopt RFC2253")}' "$b" 2>/dev/null | grep -i -- "$MATCH")
+  if [ -n "$hits" ]; then echo "match '$MATCH' w bundle: TAK"; echo "$hits" | sed 's/^/  /'; else echo "match '$MATCH' w bundle: NIE"; fi
+fi
+if [ -n "$URL" ]; then
+  if command -v curl >/dev/null 2>&1; then
+    r=$(curl -sS -o /dev/null --max-time 10 -w 'HTTP %{http_code}' "$URL" 2>&1); echo "test $URL: $r"
+  elif command -v python3 >/dev/null 2>&1; then
+    r=$(python3 -c 'import sys,urllib.request;print("HTTP",urllib.request.urlopen(sys.argv[1],timeout=10).status)' "$URL" 2>&1 | tail -1); echo "test $URL: $r"
+  else
+    echo "test $URL: brak curl/python3 w kontenerze"
+  fi
+fi
+EOS
+  while read -r pod; do
+    [[ -z "$pod" ]] && continue
+    if [[ -n "$CONTAINER" ]]; then ctrs="$CONTAINER"
+    else ctrs=$(oc get pod "$pod" -n "$NS" -o jsonpath='{.spec.containers[*].name}'); fi
+    for c in $ctrs; do
+      echo "  ${B}$pod/$c${N}"
+      out=$(oc exec -n "$NS" "$pod" -c "$c" -- env MATCH="$MATCH" URL="$TEST_URL" sh -c "$INPOD" 2>&1)
+      sed 's/^/    /' <<<"$out"
+      grep -qiE 'certificate|SSL|issuer' <<<"$(grep '^test ' <<<"$out")" && \
+        warn "$pod/$c: błąd TLS przy połączeniu do $TEST_URL"
+    done
+  done < <(oc get pods -n "$NS" "${sel[@]}" --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+fi
+
+# ---------------------------------------------------------------- Podsumowanie
+section "Podsumowanie"
+if [[ -n "$MATCH" ]]; then
+  if (( ${#MATCH_HITS[@]} > 0 )); then
+    echo "  Certy pasujące do '$MATCH' (obiekty w namespace):"
+    printf '    %s\n' "${MATCH_HITS[@]}" | sort -u
+  else
+    echo "  ${Y}Nie znaleziono certu pasującego do '$MATCH' w żadnym secrecie/CM/route w $NS${N}"
+    CNT_WARN=$((CNT_WARN+1))
+  fi
+fi
+echo "  wygasłe: ${CNT_EXPIRED}   wygasające (<${WARN_DAYS} dni): ${CNT_SOON}   ostrzeżenia: ${CNT_WARN}"
+
+(( CNT_EXPIRED + CNT_SOON + CNT_WARN > 0 )) && exit 1
+exit 0
